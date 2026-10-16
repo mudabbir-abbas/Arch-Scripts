@@ -17,6 +17,12 @@
 #   - compression: zstd if installed, otherwise gzip, otherwise plain tar
 #   - no python, no realpath, no sed/grep, no KDE/GUI tools
 
+# Version (semantic: MAJOR.MINOR.PATCH). Bump it on every change and add a line below.
+#   1.0.0  first versioned release: pure-bash (no python/kdialog), zstd->gzip->tar
+#          fallback, dependency preflight + --check, symlink warnings, sudo offer
+#          on permission errors, --home mode, restore checks archive contents
+VERSION="1.0.0"
+
 set -euo pipefail
 
 if (( BASH_VERSINFO[0] < 4 )); then
@@ -36,8 +42,8 @@ HOME_ONLY=false
 REPLY=""
 
 usage() {
+echo "fbackup v$VERSION - back up chosen files/folders into one archive and restore them later"
 cat <<'EOF'
-fbackup - back up chosen files/folders into one archive and restore them later
 
 Usage:
   fbackup [options]                   drag files/folders into the terminal, Enter to finish
@@ -64,6 +70,7 @@ Options:
   --overwrite      (restore) replace files that already exist
                    (default: existing files are left untouched)
   --check          check that everything fbackup needs is installed
+  -V, --version    print the version and exit
   -h, --help       this help
 
 Examples:
@@ -152,7 +159,7 @@ need_tar() {
 do_check() {
   local bad=0 v h
   row() { printf '  %s %-9s %s\n' "$1" "$2" "$3"; }
-  info "${B}fbackup dependency check${N}"
+  info "${B}fbackup v$VERSION dependency check${N}"
   info "Required:"
   row "${G}✔${N}" bash "${BASH_VERSION%%(*} (need 4+)"
 
@@ -779,6 +786,8 @@ case "${1-}" in restore|list) CMD=$1; shift ;; esac
 while (( $# )); do
   case $1 in
     -h|--help)      usage; exit 0 ;;
+    -V|--version)   echo "fbackup v$VERSION"; exit 0 ;;
+    -V|--version)   echo "fbackup v$VERSION"; exit 0 ;;
     -v|--verbose)   VERBOSE=true ;;
     --overwrite)    OVERWRITE=true ;;
     --home)         HOME_ONLY=true ;;
