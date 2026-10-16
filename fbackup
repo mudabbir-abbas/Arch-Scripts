@@ -787,7 +787,6 @@ while (( $# )); do
   case $1 in
     -h|--help)      usage; exit 0 ;;
     -V|--version)   echo "fbackup v$VERSION"; exit 0 ;;
-    -V|--version)   echo "fbackup v$VERSION"; exit 0 ;;
     -v|--verbose)   VERBOSE=true ;;
     --overwrite)    OVERWRITE=true ;;
     --home)         HOME_ONLY=true ;;
