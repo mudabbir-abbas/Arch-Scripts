@@ -1,0 +1,800 @@
+#!/usr/bin/env bash
+#
+# fbackup - pack chosen files/folders into ONE archive, and put them back
+#           in their original locations later (creating folders as needed).
+#
+# Paths inside your home are stored as "HOME/..." so the archive still
+# restores correctly if your username differs on the new install.
+#
+# Two modes:
+#   default  backup needs root (any path allowed); restore first checks the
+#            archive: home-only archives need no root, archives that contain
+#            items outside your home do
+#   --home   only items INSIDE your home are used; never needs root
+#
+# Requirements: bash >= 4 and GNU tar (plus mv/rm/mkdir). Nothing else is needed.
+#   Run 'fbackup --check' to see what is installed.
+#   - compression: zstd if installed, otherwise gzip, otherwise plain tar
+#   - no python, no realpath, no sed/grep, no KDE/GUI tools
+
+set -euo pipefail
+
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "fbackup needs bash 4 or newer." >&2
+  exit 1
+fi
+
+OUT_DIR=""
+ARGS=()
+PATHS=()
+TMPS=()
+TAR_COMP=()
+EXT="tar"
+VERBOSE=false
+OVERWRITE=false
+HOME_ONLY=false
+REPLY=""
+
+usage() {
+cat <<'EOF'
+fbackup - back up chosen files/folders into one archive and restore them later
+
+Usage:
+  fbackup [options]                   drag files/folders into the terminal, Enter to finish
+  fbackup [options] PATH [PATH...]    back up exactly these paths
+  fbackup restore [options] [ARCHIVE] restore to the original locations
+  fbackup list [-v] ARCHIVE           show what is inside an archive
+  fbackup --check                     check that everything fbackup needs is installed
+
+Modes:
+  default   backup   Any path may be used (e.g. /usr/share/..., /etc/...), so
+                     root is required. Not root? fbackup stops and offers to
+                     re-run itself with sudo.
+            restore  fbackup first checks what the archive contains:
+                       - only home files    -> no root needed
+                       - files outside home -> root needed (sudo offered)
+  --home    Home-only mode, never needs root.
+            backup   only items inside your home are saved; others are skipped
+            restore  only the home part of the archive is restored
+
+Options:
+  --home           home-only mode (see above)
+  -v, --verbose    show every file that is archived / restored / skipped
+  -o, --output DIR save the archive in DIR instead of your home folder
+  --overwrite      (restore) replace files that already exist
+                   (default: existing files are left untouched)
+  --check          check that everything fbackup needs is installed
+  -h, --help       this help
+
+Examples:
+  fbackup --home ~/Documents ~/.config/niri      home files only, no root
+  sudo fbackup /usr/share/wallpapers ~/Pictures  system + home files (needs root)
+  fbackup restore backup.tar.zst                 checks the archive, asks for sudo if needed
+  fbackup restore --home backup.tar.zst          restore only the home part, no root
+
+Notes:
+  * Archives are named fbackup-YYYYMMDD-HHMMSS.tar.zst (or .tar.gz / .tar if
+    zstd / gzip are not installed). Restore works with any of them.
+  * Paths inside your home are stored as HOME/..., so they restore into the
+    current user's home even if the username changed. Other paths are stored
+    and restored at their exact location.
+  * Under sudo, "home" is whatever $HOME is. Use: sudo env HOME="$HOME" fbackup ...
+    (fbackup's own sudo offer already does this).
+  * Symlinks are saved as links (not followed) and fbackup warns about each one;
+    absolute link targets are kept as-is. On restore, an existing symlinked
+    folder is kept and files go through it. Hard links are saved as copies.
+  * Unreadable files are reported and skipped; the rest is still backed up.
+EOF
+}
+
+# ---------- output helpers ----------
+if [[ -t 1 && -t 2 ]]; then B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+else B=''; G=''; Y=''; R=''; N=''; fi
+
+info() { echo "$*"; }
+ok()   { echo "${G}✔${N} $*"; }
+warn() { echo "${Y}!${N} $*" >&2; }
+die()  { echo "${R}✘${N} $*" >&2; exit 1; }
+vlog() { if $VERBOSE; then echo "  $*"; fi; return 0; }
+
+short() {
+  local p=$1
+  if [[ -n ${HOME_DIR:-} && ( $p == "$HOME_DIR" || $p == "$HOME_DIR"/* ) ]]; then
+    p="~${p#"$HOME_DIR"}"
+  fi
+  printf '%s' "$p"
+}
+
+cleanup() {
+  local f
+  if (( ${#TMPS[@]} )); then
+    for f in "${TMPS[@]}"; do rm -f -- "$f"; done
+  fi
+}
+trap cleanup EXIT
+trap 'echo >&2; die "Interrupted."' INT TERM
+
+# ---------- environment checks ----------
+tarc() { LC_ALL=C tar "$@"; }   # C locale: tar's messages stay parseable
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Suggest the install command for the package manager found on this system.
+pkg_hint() {
+  if   have zypper;       then REPLY="sudo zypper install $*"
+  elif have apt-get;      then REPLY="sudo apt install $*"
+  elif have dnf;          then REPLY="sudo dnf install $*"
+  elif have yum;          then REPLY="sudo yum install $*"
+  elif have pacman;       then REPLY="sudo pacman -S $*"
+  elif have apk;          then REPLY="sudo apk add $*"
+  elif have xbps-install; then REPLY="sudo xbps-install -S $*"
+  else                         REPLY="<your package manager> install $*"
+  fi
+}
+
+# Hard requirements. Runs before every command; silent when all is well.
+need_tar() {
+  local missing=() v
+  have tar || missing+=(tar)
+  if ! have mv || ! have rm || ! have mkdir; then missing+=(coreutils); fi
+  if (( ${#missing[@]} )); then
+    pkg_hint "${missing[@]}"
+    die "Missing required tool(s): ${missing[*]}. Install with: $REPLY"
+  fi
+  v=$(tar --version 2>&1 || true)
+  if [[ $v != *"GNU tar"* ]]; then
+    pkg_hint tar
+    die "GNU tar is required, but this 'tar' is a different implementation (macOS/BSD: install gnu-tar; Linux: $REPLY)."
+  fi
+}
+
+# fbackup --check : full report of what is installed and what is missing.
+do_check() {
+  local bad=0 v h
+  row() { printf '  %s %-9s %s\n' "$1" "$2" "$3"; }
+  info "${B}fbackup dependency check${N}"
+  info "Required:"
+  row "${G}✔${N}" bash "${BASH_VERSION%%(*} (need 4+)"
+
+  if have tar; then
+    v=$(tar --version 2>&1 | { read -r first || true; printf '%s' "$first"; })
+    if [[ $v == *"GNU tar"* ]]; then
+      row "${G}✔${N}" tar "$v"
+      h=$(tarc --help 2>&1 || true)
+      if [[ $h == *skip-old-files* ]]; then row "${G}✔${N}" "" "tar supports --skip-old-files (restore without --overwrite)"
+      else row "${Y}!${N}" "" "tar is older than 1.28: restore needs --overwrite"; fi
+    else
+      row "${R}✘${N}" tar "found, but not GNU tar ($v)"; bad=1
+    fi
+  else
+    row "${R}✘${N}" tar "not installed"; bad=1
+  fi
+  local t
+  for t in mv rm mkdir; do
+    if have "$t"; then row "${G}✔${N}" "$t" "found"; else row "${R}✘${N}" "$t" "not installed (package: coreutils)"; bad=1; fi
+  done
+
+  info "Optional:"
+  local want=()
+  if have zstd; then row "${G}✔${N}" zstd "found - archives will be .tar.zst (best compression)"
+  else row "${Y}!${N}" zstd "not found - needed to create/read .tar.zst archives"; want+=(zstd); fi
+  if have gzip; then row "${G}✔${N}" gzip "found$(have zstd || echo ' - used as the fallback')"
+  else row "${Y}!${N}" gzip "not found$(have zstd && echo '' || echo ' - archives would be uncompressed')"; have zstd || want+=(gzip); fi
+  if have du;       then row "${G}✔${N}" du "found"; else row "${Y}!${N}" du "not found - archive size is not shown"; fi
+  if have readlink; then row "${G}✔${N}" readlink "found"; else row "${Y}!${N}" readlink "not found - symlink targets not shown in the pre-backup warning"; fi
+  if have mktemp;   then row "${G}✔${N}" mktemp "found"; else row "${Y}!${N}" mktemp "not found - falls back to /tmp"; fi
+
+  if (( bad )); then
+    local miss=()
+    have tar || miss+=(tar)
+    if ! have mv || ! have rm || ! have mkdir; then miss+=(coreutils); fi
+    if (( ${#miss[@]} )); then pkg_hint "${miss[@]}"; echo; warn "Install the required tools: $REPLY"; fi
+    exit 1
+  fi
+  if (( ${#want[@]} )); then pkg_hint "${want[@]}"; echo; info "Recommended: $REPLY"; fi
+  echo; ok "All required tools are present."
+}
+
+setup_home() {
+  local h=${HOME-}
+  while [[ $h == */ ]]; do h=${h%/}; done
+  [[ -n $h && $h == /* ]] \
+    || die "\$HOME is not set to a real folder (got '${HOME-}'). Set it and try again."
+  HOME_DIR=$h
+}
+
+in_home() { [[ $1 == "$HOME_DIR" || $1 == "$HOME_DIR"/* ]]; }
+
+# Under "sudo fbackup" HOME may point at /root instead of your own home.
+check_sudo_home() {
+  [[ $EUID -eq 0 && -n ${SUDO_USER-} && $SUDO_USER != root ]] || return 0
+  have getent || return 0
+  local uhome=""
+  uhome=$(getent passwd "$SUDO_USER" 2>/dev/null | { IFS=: read -r _ _ _ _ _ h _ || true; printf '%s' "${h-}"; }) || true
+  [[ -n $uhome && $uhome != "$HOME_DIR" ]] || return 0
+  warn "Running under sudo: \"home\" is $HOME_DIR here, not your own home ($uhome)."
+  warn "To use your home:  sudo env HOME=$uhome fbackup ..."
+  return 0
+}
+
+# Prefer zstd, then gzip, then no compression.
+pick_compressor() {
+  if have zstd; then
+    TAR_COMP=(-I 'zstd -T0 -9'); EXT="tar.zst"
+  elif have gzip; then
+    TAR_COMP=(-z); EXT="tar.gz"
+    warn "zstd not found - using gzip instead."
+  else
+    TAR_COMP=(); EXT="tar"
+    warn "neither zstd nor gzip found - archive will be uncompressed."
+  fi
+}
+
+check_decompressor() {
+  case $1 in
+    *.zst|*.zstd)
+      have zstd \
+        || die "This archive is zstd-compressed but 'zstd' is not installed. Install the 'zstd' package and retry." ;;
+    *.gz|*.tgz)
+      have gzip \
+        || die "This archive is gzip-compressed but 'gzip' is not installed." ;;
+  esac
+}
+
+# ---------- small pure-bash string helpers (results in $REPLY) ----------
+stamp() { printf '%(%Y%m%d-%H%M%S)T' -1 2>/dev/null || date +%Y%m%d-%H%M%S; }
+
+trim() {
+  local s=$1
+  s=${s#"${s%%[![:space:]]*}"}
+  s=${s%"${s##*[![:space:]]}"}
+  REPLY=$s
+}
+
+# Make a path absolute and tidy ("." / ".." / "//"), WITHOUT following symlinks.
+abspath() {
+  local p=$1 part
+  local parts=() out=()
+  [[ $p == /* ]] || p=$PWD/$p
+  IFS=/ read -r -d '' -a parts < <(printf '%s' "$p") || true
+  for part in "${parts[@]}"; do
+    case $part in
+      ''|.) ;;
+      ..)   if (( ${#out[@]} )); then unset 'out[${#out[@]}-1]'; fi ;;
+      *)    out+=("$part") ;;
+    esac
+  done
+  REPLY=""
+  for part in ${out[@]+"${out[@]}"}; do REPLY+="/$part"; done
+  [[ -n $REPLY ]] || REPLY="/"
+}
+
+# Escape for the pattern / replacement part of tar --transform "s,PAT,REPL,"
+esc_rx() {
+  local s=$1 c i
+  REPLY=""
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:i:1}
+    case $c in
+      '\'|'.'|'['|']'|'*'|'^'|'$'|',') REPLY+="\\$c" ;;
+      *) REPLY+=$c ;;
+    esac
+  done
+}
+esc_repl() {
+  local s=$1 c i
+  REPLY=""
+  for (( i=0; i<${#s}; i++ )); do
+    c=${s:i:1}
+    case $c in
+      '\'|'&'|',') REPLY+="\\$c" ;;
+      *) REPLY+=$c ;;
+    esac
+  done
+}
+
+# ---------- turning pasted/dropped text into real paths (pure bash) ----------
+# Handles 'single', "double" quotes, backslash escapes (what Konsole pastes),
+# file:// URLs (with %20 etc.) and a leading ~.
+add_token() {
+  local t=$1 pc='%' bs='\' bx='\x'
+  if [[ $t == file://* ]]; then
+    t=${t#file://}; t=${t#localhost}
+    t=${t//"$bs"/"$bs$bs"}
+    t=${t//"$pc"/"$bx"}
+    printf -v t '%b' "$t"
+  fi
+  case $t in
+    '~')   t=$HOME_DIR ;;
+    '~/'*) t=$HOME_DIR/${t#'~/'} ;;
+  esac
+  PATHS+=("$t")
+}
+
+parse_line() {
+  local s=$1 tok='' have=0 q='' c nxt i n=${#1}
+  for (( i=0; i<n; i++ )); do
+    c=${s:i:1}
+    if [[ $q == "'" ]]; then
+      if [[ $c == "'" ]]; then q=''; else tok+=$c; fi
+    elif [[ $q == '"' ]]; then
+      if [[ $c == '"' ]]; then
+        q=''
+      elif [[ $c == '\' ]]; then
+        nxt=${s:i+1:1}
+        case $nxt in
+          '"'|'\'|'$'|'`') tok+=$nxt; i=$((i+1)) ;;
+          *) tok+=$c ;;
+        esac
+      else
+        tok+=$c
+      fi
+    else
+      case $c in
+        "'"|'"') q=$c; have=1 ;;
+        '\')
+          if (( i+1 < n )); then tok+=${s:i+1:1}; i=$((i+1)); else tok+=$c; fi
+          have=1 ;;
+        ' '|$'\t'|$'\r')
+          if (( have )); then add_token "$tok"; tok=''; have=0; fi ;;
+        *) tok+=$c; have=1 ;;
+      esac
+    fi
+  done
+  if [[ -n $q ]]; then warn "unbalanced quote, ignoring: $s"; return 0; fi
+  if (( have )); then add_token "$tok"; fi
+  return 0
+}
+
+add_text() {
+  trim "$1"
+  local line=$REPLY
+  [[ -n $line ]] || return 0
+  # An unescaped path that exists exactly as typed (e.g. with spaces) is taken as-is.
+  if [[ -e $line || -L $line ]]; then PATHS+=("$line"); return 0; fi
+  parse_line "$line"
+}
+
+# tar prints names without the leading "/"; put it back for readability.
+tar_msg() {
+  local m=${1#tar: }
+  [[ ${m%%: *} == */* ]] && m=/$m
+  REPLY=$m
+  return 0
+}
+
+# ---------- sudo help ----------
+SELF=""
+find_self() {
+  local s=${BASH_SOURCE[0]}
+  if [[ $s != */* ]]; then s=$(command -v -- "$s" 2>/dev/null || echo "$s"); fi
+  abspath "$s"; SELF=$REPLY
+}
+
+# offer_sudo ARGS...  - tell the user to re-run fbackup as root with ARGS,
+# and (in a terminal) offer to do it right now. $HOME is kept so that the
+# "HOME/..." items in archives still map to YOUR home folder.
+offer_sudo() {
+  (( EUID != 0 )) || return 0
+  local a q="" line
+  for a in "$@"; do printf -v q '%s %q' "$q" "$a"; done
+  printf -v line 'sudo env HOME=%q %q%s' "$HOME" "$SELF" "$q"
+  if ! have sudo; then
+    warn "'sudo' is not installed. Re-run fbackup as root with:${q}"
+    return 0
+  fi
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    echo "  To fix this, run:  $line" >&2
+    return 0
+  fi
+  local ans=""
+  read -r -p "Re-run with sudo now? [y/N] " ans || true
+  if [[ $ans == [yY]* ]]; then
+    cleanup
+    exec sudo env HOME="$HOME" "$SELF" "$@"
+  fi
+  echo "  You can do it later with:  $line"
+  return 0
+}
+
+# ---------- picker ----------
+pick_cli() {
+  [[ -t 0 ]] || die "No paths given and no terminal to ask in. Pass the paths as arguments."
+  info "${B}Drag files/folders from your file manager into this terminal${N} (several drops are fine)."
+  info "If the terminal asks what to do with the drop, choose 'Paste Location' (or similar)."
+  info "Press Enter on an empty line when finished."
+  local line
+  while IFS= read -r -e -p "> " line; do
+    trim "$line"
+    [[ -n $REPLY ]] || break
+    add_text "$line"
+    info "  ${#PATHS[@]} item(s) selected so far"
+  done
+}
+
+# ---------- backup ----------
+do_backup() {
+  need_tar
+  setup_home
+  check_sudo_home
+  abspath "${OUT_DIR:-$HOME_DIR}"; OUT_DIR=$REPLY
+
+  # Interactive pick and not root: say so now, before asking for files.
+  if ! $HOME_ONLY && (( EUID != 0 && ${#ARGS[@]} == 0 )); then
+    warn "A default backup needs root (it may include files outside your home)."
+    info "Use --home to back up only files inside your home without root."
+    local rr1=()
+    if $VERBOSE; then rr1+=(-v); fi
+    rr1+=(-o "$OUT_DIR")
+    offer_sudo "${rr1[@]}"
+    die "Not running as root - nothing was backed up."
+  fi
+
+  if (( ${#ARGS[@]} )); then PATHS=("${ARGS[@]}"); else pick_cli; fi
+
+  local p q keep abs=() clean=() seen=$'\n'
+  for p in ${PATHS[@]+"${PATHS[@]}"}; do
+    abspath "$p"; p=$REPLY
+    if [[ $p == / ]]; then warn "refusing to back up the whole filesystem ('/'), skipping."; continue; fi
+    if [[ ! -e $p && ! -L $p ]]; then warn "not found, skipping: $p"; continue; fi
+    if [[ $seen == *$'\n'"$p"$'\n'* ]]; then vlog "duplicate, ignoring: $(short "$p")"; continue; fi
+    seen+="$p"$'\n'
+    abs+=("$p")
+    if [[ -L $p ]]; then
+      local tgt=""
+      if have readlink; then tgt=$(readlink -- "$p" 2>/dev/null || true); fi
+      warn "$(short "$p") is a symlink${tgt:+ -> $tgt}: only the link is saved, not what it points to."
+    fi
+  done
+  (( ${#abs[@]} )) || die "Nothing to back up."
+
+  # Where do the selected items live: inside or outside your home?
+  local inside=() outside=()
+  for p in "${abs[@]}"; do
+    if in_home "$p"; then inside+=("$p"); else outside+=("$p"); fi
+  done
+  if $HOME_ONLY; then
+    if (( ${#outside[@]} )); then
+      for p in "${outside[@]}"; do warn "outside your home, skipped (--home): $p"; done
+    fi
+    (( ${#inside[@]} )) || die "Nothing inside your home to back up."
+    abs=("${inside[@]}")
+  elif (( EUID != 0 )); then
+    warn "A default backup needs root (it may include files outside your home)."
+    if (( ${#outside[@]} )); then
+      info "${#outside[@]} selected item(s) are outside your home:"
+      local nshown=0
+      for p in "${outside[@]}"; do
+        if (( nshown >= 5 )); then echo "    ... and $(( ${#outside[@]} - nshown )) more" >&2; break; fi
+        echo "    $p" >&2; nshown=$((nshown+1))
+      done
+      if (( ${#inside[@]} )); then
+        info "Or use --home to back up only the ${#inside[@]} item(s) inside your home (no root needed)."
+      fi
+    else
+      info "Everything you selected is inside your home - add --home to do this without root."
+    fi
+    local rr0=()
+    if $VERBOSE; then rr0+=(-v); fi
+    rr0+=(-o "$OUT_DIR" -- "${abs[@]}")
+    offer_sudo "${rr0[@]}"
+    die "Not running as root - nothing was backed up."
+  fi
+
+  # Drop items that already live inside another selected folder.
+  for p in "${abs[@]}"; do
+    keep=1
+    for q in "${abs[@]}"; do
+      if [[ $q != "$p" && $p == "$q"/* ]]; then keep=0; break; fi
+    done
+    if (( keep )); then
+      clean+=("${p#/}")
+      vlog "selected: $(short "$p")"
+    else
+      vlog "already inside a selected folder: $(short "$p")"
+    fi
+  done
+
+  pick_compressor
+  mkdir -p -- "$OUT_DIR" 2>/dev/null || die "Cannot create output folder: $OUT_DIR"
+  [[ -d $OUT_DIR && -w $OUT_DIR ]] \
+    || die "Cannot write to output folder: $OUT_DIR (choose another one with -o DIR)."
+
+  local base out tmp n=1
+  base="fbackup-$(stamp)"
+  out="$OUT_DIR/$base.$EXT"
+  while [[ -e $out ]]; do out="$OUT_DIR/$base-$n.$EXT"; n=$((n+1)); done
+  tmp="$out.partial"
+  TMPS+=("$tmp")
+
+  local rx
+  esc_rx "${HOME_DIR#/}"; rx=$REPLY
+
+  local args=(-C / -cp --ignore-failed-read --hard-dereference
+              --no-wildcards --anchored --exclude="${tmp#/}")
+  if (( ${#TAR_COMP[@]} )); then args+=("${TAR_COMP[@]}"); fi
+  if $VERBOSE; then args+=(-v); fi
+
+  info "Archiving ${#clean[@]} item(s) to $(short "$out") ..."
+  local rc=0 l berr
+  berr=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/fbackup.$$.berr")
+  TMPS+=("$berr")
+  tarc "${args[@]}" -f "$tmp" \
+      --transform "s,^${rx}/,HOME/," \
+      --transform "s,^${rx}\$,HOME," \
+      -- "${clean[@]}" 2>"$berr" \
+    | while IFS= read -r l; do
+        echo "  $(short "/$l")"
+      done || rc=$?
+  local denied=0
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    tar_msg "$l"; warn "$REPLY"
+    if [[ $l == *"Permission denied"* ]]; then denied=$((denied+1)); fi
+  done <"$berr"
+  (( rc <= 1 )) || die "tar failed (exit $rc). Is the disk full?"   # 1 = "file changed while reading": harmless
+
+  # Verify the archive reads back, and count the files.
+  local listing files=0 links=() nabs=0 rest
+  listing=$(tarc -tvf "$tmp" 2>/dev/null) || die "The new archive failed verification (disk full?). Nothing was saved."
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    if [[ $l != d* ]]; then files=$((files+1)); fi
+    if [[ $l == l* ]]; then
+      read -r _ _ _ _ _ rest <<<"$l" || true       # "name -> target"
+      if [[ $rest == HOME || $rest == HOME/* ]]; then rest="~${rest#HOME}"; else rest="/$rest"; fi
+      links+=("$rest")
+      if [[ $rest == *" -> /"* ]]; then nabs=$((nabs+1)); fi
+    fi
+  done <<<"$listing"
+  (( files > 0 )) || die "Nothing could be archived (all files unreadable?)."
+
+  mv -- "$tmp" "$out" || die "Could not move the finished archive into place."
+  TMPS=()
+  # When run through sudo, hand the archive back to the person who ran it.
+  if (( EUID == 0 )) && [[ -n ${SUDO_USER-} ]] && have chown; then
+    chown "$SUDO_USER:" -- "$out" 2>/dev/null || true
+  fi
+
+  local size="?"
+  if have du; then
+    read -r size _ < <(du -h -- "$out" 2>/dev/null || echo "?") || true
+  fi
+  ok "Done: $files file(s) saved to ${B}$(short "$out")${N} ($size)"
+
+  if (( ${#links[@]} )); then
+    warn "${#links[@]} symlink(s) were saved as links only - what they point to is NOT included."
+    if (( nabs )); then
+      warn "$nabs of them use absolute targets, which are not adjusted if your username changes."
+    fi
+    local shown=0
+    for l in "${links[@]}"; do
+      if ! $VERBOSE && (( shown >= 10 )); then
+        echo "    ... and $(( ${#links[@]} - shown )) more (use -v to list all)" >&2; break
+      fi
+      echo "    $l" >&2; shown=$((shown+1))
+    done
+  fi
+
+  if (( denied > 0 )); then
+    warn "$denied item(s) could not be read (permission denied) and are NOT in this archive."
+    local rr=()
+    if $VERBOSE; then rr+=(-v); fi
+    if $HOME_ONLY; then rr+=(--home); fi
+    rr+=(-o "$OUT_DIR" -- "${abs[@]}")
+    offer_sudo "${rr[@]}"
+  fi
+}
+
+# ---------- restore ----------
+newest_archive() {
+  local f newest=''
+  shopt -s nullglob
+  for f in "$1"/fbackup-*.tar "$1"/fbackup-*.tar.zst "$1"/fbackup-*.tar.gz; do
+    if [[ -z $newest || $f > $newest ]]; then newest=$f; fi
+  done
+  shopt -u nullglob
+  REPLY=$newest
+}
+
+do_restore() {
+  need_tar
+  setup_home
+  check_sudo_home
+  abspath "${OUT_DIR:-$HOME_DIR}"; OUT_DIR=$REPLY
+
+  local archive=${ARGS[0]-}
+  if [[ -z $archive ]]; then
+    [[ -t 0 ]] || die "Give the archive to restore as an argument."
+    local raw prompt="Archive (drag it here, then Enter): "
+    newest_archive "$OUT_DIR"
+    local newest=$REPLY
+    if [[ -n $newest ]]; then prompt="Archive (drag it here, or Enter for newest: $(short "$newest")): "; fi
+    read -r -e -p "$prompt" raw || true
+    PATHS=()
+    add_text "$raw"
+    archive=${PATHS[0]-}
+    if [[ -z $archive ]]; then archive=$newest; fi
+  fi
+  [[ -n $archive && -f $archive ]] || die "Archive not found: ${archive:-<none given>}"
+  check_decompressor "$archive"
+
+  local listing
+  listing=$(tarc -tf "$archive" 2>/dev/null) \
+    || die "Cannot read $archive (damaged, not a tar archive, or a needed decompressor is missing)."
+
+  # Where will the archived items go: inside or outside your home?
+  local l n_in=0 n_out=0 members=()
+  while IFS= read -r l; do
+    [[ -n $l && $l != */ ]] || continue
+    if [[ $l == HOME || $l == HOME/* ]]; then n_in=$((n_in+1)); else n_out=$((n_out+1)); fi
+  done <<<"$listing"
+
+  if (( n_out == 0 )); then
+    info "Archive check: $n_in file(s), all for your home - root not needed."
+  else
+    info "Archive check: $n_in file(s) for your home, $n_out outside it."
+  fi
+
+  if $HOME_ONLY; then
+    (( n_in > 0 )) || die "This archive has no items from a home folder (--home)."
+    if (( n_out > 0 )); then info "  --home: skipping $n_out item(s) stored outside a home folder."; fi
+    members=(-- HOME)
+  elif (( n_out > 0 && EUID != 0 )); then
+    warn "$n_out item(s) in this archive are outside your home, so root is needed to restore them."
+    if (( n_in > 0 )); then
+      info "Or use --home to restore only the $n_in item(s) for your home (no root needed)."
+    fi
+    local rr0=(restore)
+    if $VERBOSE; then rr0+=(-v); fi
+    if $OVERWRITE; then rr0+=(--overwrite); fi
+    abspath "$archive"
+    rr0+=(-- "$REPLY")
+    offer_sudo "${rr0[@]}"
+    die "Not running as root - nothing was restored."
+  fi
+
+  local mode=--skip-old-files
+  if $OVERWRITE; then
+    mode=--overwrite
+  else
+    local h
+    h=$(tarc --help 2>&1 || true)
+    [[ $h == *skip-old-files* ]] \
+      || die "Your tar is too old (needs 1.28+). Use --overwrite, or update tar."
+  fi
+
+  local rp out err rc=0
+  esc_repl "${HOME_DIR#/}"; rp=$REPLY
+  out=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/fbackup.$$.out")
+  err=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/fbackup.$$.err")
+  TMPS+=("$out" "$err")
+
+  info "Restoring $(short "$archive") ..."
+  # -C / + relative names: tar creates any missing parent folders by itself.
+  tarc -C / -xpv "$mode" --keep-directory-symlink -f "$archive" \
+      --transform "s,^HOME/,${rp}/," \
+      --transform "s,^HOME\$,${rp}," \
+      ${members[@]+"${members[@]}"} \
+      >"$out" 2>"$err" || rc=$?
+
+  # Work out which files were skipped because they already exist.
+  local -A skipped=() failed=()
+  local line path real nskip=0 nrest=0 nfail=0 denied=0
+  while IFS= read -r line; do
+    if [[ $line == "tar: "*": skipping existing file" ]]; then
+      path=${line#tar: }; path=${path%: skipping existing file}
+      if [[ -d /$path ]]; then continue; fi        # an existing folder is not interesting
+      skipped["$path"]=1; nskip=$((nskip + 1))
+      vlog "skipped (already exists): /$path"
+    else
+      tar_msg "$line"; warn "$REPLY"
+      if [[ $line == *"Permission denied"* ]]; then denied=$((denied+1)); fi
+      case $line in
+        "tar: "*": Cannot open: "*|"tar: "*": Cannot mkdir: "*|"tar: "*": Cannot create "*|"tar: "*": Cannot make "*)
+          path=${line#tar: }; path=${path%%: Cannot *}
+          failed["$path"]=1; nfail=$((nfail + 1)) ;;
+      esac
+    fi
+  done <"$err"
+
+  while IFS= read -r line; do
+    if [[ $line == */ ]]; then continue; fi        # folders
+    if [[ $line == HOME || $line == HOME/* ]]; then real="${HOME_DIR#/}${line#HOME}"; else real=$line; fi
+    if [[ -n ${skipped["$real"]+x} || -n ${failed["$real"]+x} ]]; then continue; fi
+    nrest=$((nrest + 1))
+    vlog "restored: /$real"
+  done <"$out"
+
+  if (( rc != 0 )); then
+    warn "tar reported errors (exit $rc); some files may not have been restored."
+  fi
+  ok "Restored ${B}$nrest${N} file(s)."
+  if (( nfail > 0 )); then warn "$nfail file(s) could NOT be restored (see errors above)."; fi
+  if (( nskip > 0 )); then
+    info "  $nskip file(s) already existed and were left untouched (use --overwrite to replace them)."
+  fi
+  if (( denied > 0 )); then
+    warn "$denied item(s) could not be written (permission denied)."
+    local rr=(restore)
+    if $VERBOSE; then rr+=(-v); fi
+    if $OVERWRITE; then rr+=(--overwrite); fi
+    if $HOME_ONLY; then rr+=(--home); fi
+    abspath "$archive"
+    rr+=(-- "$REPLY")
+    offer_sudo "${rr[@]}"
+  fi
+  (( rc == 0 )) || exit 1
+}
+
+# ---------- list ----------
+do_list() {
+  need_tar
+  setup_home
+  local archive=${ARGS[0]-} l inhome=0
+  [[ -n $archive ]] || die "give an archive to list"
+  [[ -f $archive ]] || die "Archive not found: $archive"
+  check_decompressor "$archive"
+
+  local listing n_in=0 n_out=0
+  if $VERBOSE; then
+    listing=$(tarc -tvf "$archive" 2>/dev/null) || die "Cannot read $archive."
+    while IFS= read -r l; do
+      [[ -n $l ]] || continue
+      if   [[ $l == *" HOME/"* ]]; then l=${l/" HOME/"/" ~/"}; inhome=1
+      elif [[ $l == *" HOME" ]];   then l="${l% HOME} ~"; inhome=1
+      else inhome=0
+      fi
+      if [[ $l != d* ]]; then
+        if (( inhome )); then n_in=$((n_in+1)); else n_out=$((n_out+1)); fi
+      fi
+      echo "$l"
+    done <<<"$listing"
+  else
+    listing=$(tarc -tf "$archive" 2>/dev/null) || die "Cannot read $archive."
+    while IFS= read -r l; do
+      [[ -n $l ]] || continue
+      if [[ $l == HOME ]]; then
+        echo "~"
+      elif [[ $l == HOME/* ]]; then
+        echo "~${l#HOME}"
+        if [[ $l != */ ]]; then n_in=$((n_in+1)); fi
+      else
+        echo "/$l"
+        if [[ $l != */ ]]; then n_out=$((n_out+1)); fi
+      fi
+    done <<<"$listing"
+  fi
+  echo >&2
+  info "Summary: $n_in file(s) inside a home folder, $n_out outside." >&2
+  if (( n_out > 0 )); then
+    info "Restoring the outside ones needs root; use 'restore --home' for only the home part." >&2
+  fi
+}
+
+# ---------- main ----------
+CMD=backup
+case "${1-}" in restore|list) CMD=$1; shift ;; esac
+
+while (( $# )); do
+  case $1 in
+    -h|--help)      usage; exit 0 ;;
+    -v|--verbose)   VERBOSE=true ;;
+    --overwrite)    OVERWRITE=true ;;
+    --home)         HOME_ONLY=true ;;
+    --check)        CMD=check ;;
+    -o|--output)    (( $# >= 2 )) || die "$1 needs a directory"; OUT_DIR=$2; shift ;;
+    --)             shift; ARGS+=("$@"); break ;;
+    -*)             die "Unknown option: $1 (try --help)" ;;
+    *)              ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+find_self
+case $CMD in
+  backup)  do_backup ;;
+  restore) do_restore ;;
+  list)    do_list ;;
+  check)   do_check ;;
+esac

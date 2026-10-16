@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+# appimgr - minimal AppImage -> app launcher integration (Gearlever-style, terminal only)
+VERSION="1.4.0"
+
+set -euo pipefail
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+APPS_DIR="${APPIMGR_DIR:-$DATA_HOME/AppImages}"
+ICONS_DIR="$APPS_DIR/.icons"
+META_DIR="$APPS_DIR/.meta"
+BACKUP_DIR="$APPS_DIR/.backup"
+DESKTOP_DIR="$DATA_HOME/applications"
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "warning: $*" >&2; }
+info() { echo ":: $*"; }
+
+TMP_DIR=""; STAGE_FILE=""; DL_DIR=""
+SAVED=()
+L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""
+STATUS=""; DL_ETAG=""
+
+cleanup() {
+  if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
+  if [[ -n $STAGE_FILE ]]; then rm -f -- "$STAGE_FILE"; fi
+  if [[ -n $DL_DIR ]]; then rm -rf -- "$DL_DIR"; fi
+}
+trap cleanup EXIT
+
+usage() {
+cat <<EOF
+appimgr v$VERSION - integrate AppImages into your app launcher
+
+Usage:
+  appimgr add <file.AppImage> [options]    Integrate an AppImage into the launcher
+  appimgr update <slug> [--check] [-y]     Update from the saved update source
+  appimgr update --all [--check] [-y]      Same, for every app that has a source
+  appimgr update <slug> <file> [options]   Replace with a local file instead
+  appimgr rollback <slug>                  Swap back to the previous version
+  appimgr source [<slug> [set ...|clear]]  Show/set/clear the update source (no args = how-to)
+  appimgr run <slug> [-d] [args...]        Launch from the terminal (-d = detached)
+  appimgr list [-l]                        List integrated AppImages (-l = details)
+  appimgr remove <slug>                    Remove AppImage, icon, entry and metadata
+  appimgr version
+
+Options for add / update <slug> <file>:
+  -n, --name "Name"     Override the display name
+  -a, --args "ARGS"     Extra args added to Exec (e.g. "--no-sandbox")
+      --no-fuse         Force extract-and-run mode (APPIMAGE_EXTRACT_AND_RUN=1).
+                        Without it, FUSE is checked and this is enabled automatically if needed.
+      --no-move         Keep the original file (default: it is deleted after success)
+
+Options for update <slug|--all>:
+      --check           Only check for updates, install nothing
+  -y, --yes             Don't ask before installing
+
+Layout:
+  $APPS_DIR/<slug>.AppImage
+  $APPS_DIR/.icons/  .meta/  .backup/
+  $DESKTOP_DIR/appimage-<slug>.desktop
+
+Env: APPIMGR_DIR overrides the AppImage dir
+EOF
+}
+
+source_help() {
+cat <<'EOF'
+Update sources let 'appimgr update' find newer versions. appimgr reads one from
+the AppImage itself when you 'add' it; if there is none, set it by hand:
+
+  appimgr source <slug> set github OWNER/REPO 'ASSET_PATTERN' [TAG]
+  appimgr source <slug> set url DIRECT_DOWNLOAD_URL
+  appimgr source <slug> clear
+
+Where to get the values:
+  OWNER/REPO     from the project's GitHub URL: github.com/OWNER/REPO
+  ASSET_PATTERN  the .AppImage file name on the project's Releases page, with the
+                 version replaced by * and the whole thing quoted, e.g.
+                 Foo-1.2.3-x86_64.AppImage  ->  'Foo-*-x86_64.AppImage'
+                 It should match exactly one file.
+  TAG            optional, default 'latest' (newest non-prerelease). Only use a
+                 fixed tag (e.g. nightly) for projects with a rolling release.
+  URL            a link that always serves the newest AppImage (right-click the
+                 download button -> copy link). Checked via its HTTP headers.
+
+Only GitHub releases and direct URLs are supported.
+EOF
+}
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required for this (install: sudo pacman -S ${2:-$1})"; }
+
+confirm() { # <prompt> <default when not interactive: y|n>; Enter = yes
+  local ans
+  if [[ ! -t 0 ]]; then
+    if [[ ${2:-n} == y ]]; then return 0; else return 1; fi
+  fi
+  read -r -p "   $1 [Y/n] " ans || return 1
+  [[ -z $ans || $ans == [Yy] || $ans == [Yy][Ee][Ss] ]]
+}
+
+# ---------- small metadata store: $APPS_DIR/.meta/<slug>.conf (key=value) ----------
+meta_get() { # <slug> <key>
+  local f="$META_DIR/$1.conf"
+  if [[ -f $f ]]; then grep -m1 "^$2=" "$f" | cut -d= -f2- || true; fi
+}
+
+meta_set() { # <slug> <key> <value>   (empty value removes the key)
+  local f="$META_DIR/$1.conf" t
+  mkdir -p "$META_DIR"
+  t=$(mktemp "$META_DIR/.tmp.XXXXXX")
+  if [[ -f $f ]]; then grep -v "^$2=" "$f" > "$t" || true; fi
+  if [[ -n ${3:-} ]]; then printf '%s=%s\n' "$2" "$3" >> "$t"; fi
+  mv -f -- "$t" "$f"
+}
+
+saved_opts() { # <slug> -> fills SAVED with the options used at install time
+  SAVED=()
+  local v
+  v=$(meta_get "$1" name);   if [[ -n $v ]]; then SAVED+=(--name "$v"); fi
+  v=$(meta_get "$1" args);   if [[ -n $v ]]; then SAVED+=(--args "$v"); fi
+  v=$(meta_get "$1" nofuse); if [[ $v == 1 ]]; then SAVED+=(--no-fuse); fi
+}
+
+desktop_path() { grep -m1 '^X-AppImage-Path=' "$1" | cut -d= -f2- || true; }
+
+slugify() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+# "Obsidian-1.5.3-x86_64.AppImage" -> "Obsidian"
+name_from_file() {
+  local n
+  n=$(basename "$1"); n=${n%.[Aa]pp[Ii]mage}
+  sed -E \
+    -e 's/[-_.]?v?[0-9]+(\.[0-9]+)+.*$//' \
+    -e 's/[-_.]+$//' \
+    -e 's/[-_.](x86_64|x86-64|amd64|linux|linux64|64bit)$//I' \
+    -e 's/[-_.]+$//' <<<"$n"
+}
+
+refresh() {
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+  fi
+}
+
+# AppImages do NOT detect/fall back on missing FUSE by themselves, so we check.
+# Old runtimes link libfuse.so.2 dynamically; new static runtimes only need fusermount(3).
+fuse_ready() { # 0 = this AppImage can be mounted normally on this system
+  local f=$1 off n
+  off=$("$f" --appimage-offset 2>/dev/null || true)
+  [[ $off =~ ^[0-9]+$ ]] || return 0
+  if grep -qa 'libfuse\.so\.2' < <(head -c "$off" "$f"); then
+    n=$(ldconfig -p 2>/dev/null | grep -c 'libfuse\.so\.2' || true)
+    if (( ${n:-0} > 0 )) || [[ -e /usr/lib/libfuse.so.2 ]]; then
+      command -v fusermount >/dev/null 2>&1
+    else
+      return 1
+    fi
+  else
+    command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1
+  fi
+}
+
+find_icon() { # <extracted root> <icon name>
+  local root=$1 name=$2 c=""
+  if [[ -n $name ]]; then
+    c=$(find "$root" -type f -name "$name.svg" 2>/dev/null | head -n1 || true)
+    if [[ -z $c ]]; then
+      c=$(find "$root" -type f -name "$name.png" -printf '%s %p\n' 2>/dev/null \
+          | sort -rn | head -n1 | cut -d' ' -f2- || true)
+    fi
+  fi
+  if [[ -z $c && -e $root/.DirIcon ]]; then
+    c=$(readlink -f "$root/.DirIcon" 2>/dev/null || true)
+    if [[ $c != "$(readlink -f "$root")"/* || ! -f $c ]]; then c=""; fi
+  fi
+  printf '%s' "$c"
+}
+
+# ---------- update sources ----------
+# Canonical forms stored in metadata:
+#   github|OWNER/REPO|TAG|ASSET_PATTERN
+#   url|https://direct/download/link
+
+source_describe() {
+  local type=${1%%|*} rest=${1#*|} repo tag pat
+  case $type in
+    github) IFS='|' read -r repo tag pat <<<"$rest"; echo "GitHub $repo (tag: $tag, asset: $pat)" ;;
+    url)    echo "URL $rest" ;;
+    *)      echo "$1" ;;
+  esac
+}
+
+# Reads the update info embedded in the AppImage; prints a canonical source,
+# "unsupported|<raw>" or nothing.
+detect_source() { # <appimage>
+  local raw owner repo tag pat url
+  raw=$("$1" --appimage-updateinformation 2>/dev/null) || raw=""
+  raw=${raw%%$'\n'*}
+  [[ $raw =~ ^[a-z0-9-]+\| ]] || raw=""      # ignore anything that doesn't look like update info
+  case $raw in
+    gh-releases-zsync\|*)
+      IFS='|' read -r _ owner repo tag pat <<<"$raw"
+      pat=${pat%.zsync}
+      printf 'github|%s/%s|%s|%s\n' "$owner" "$repo" "${tag:-latest}" "$pat" ;;
+    zsync\|*)
+      url=${raw#zsync|}; url=${url%.zsync}
+      printf 'url|%s\n' "$url" ;;
+    "") ;;
+    *) printf 'unsupported|%s\n' "$raw" ;;
+  esac
+}
+
+offer_source() { # <slug> <appimage>
+  local found
+  found=$(detect_source "$2")
+  case $found in
+    "")
+      info "no update source found in this AppImage (add one: appimgr source $1 set ...)" ;;
+    unsupported\|*)
+      info "update info found, but its type is not supported: ${found#unsupported|}"
+      info "add one manually: appimgr source $1 set ..." ;;
+    *)
+      info "update source found: $(source_describe "$found")"
+      if confirm "Save it for 'appimgr update'?" y; then
+        meta_set "$1" source "$found"; info "update source saved"
+      else
+        info "not saved (add it later: appimgr source $1 set ...)"
+      fi ;;
+  esac
+}
+
+parse_source_args() { # <type> <args...> -> canonical source on stdout
+  local kind=${1:-} repo pat tag
+  case $kind in
+    github)
+      repo=${2:-}; pat=${3:-}; tag=${4:-latest}; pat=${pat%.zsync}
+      [[ $repo =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { warn "github needs OWNER/REPO (e.g. PrismLauncher/PrismLauncher)"; return 1; }
+      [[ -n $pat ]] || { warn "github needs an asset pattern (e.g. 'Foo-*-x86_64.AppImage')"; return 1; }
+      printf 'github|%s|%s|%s\n' "$repo" "$tag" "$pat" ;;
+    url)
+      [[ ${2:-} =~ ^https?://[^[:space:]]+$ ]] || { warn "url needs a full http(s) link"; return 1; }
+      printf 'url|%s\n' "$2" ;;
+    *) warn "unknown source type '$kind' (use: github or url)"; return 1 ;;
+  esac
+}
+
+# Pulls tag + assets out of GitHub's release JSON without needing jq.
+# Output lines: TAG<TAB>tag   and   ASSET<TAB>name<TAB>size<TAB>digest<TAB>url   ('-' = empty)
+gh_parse() {
+  awk '
+    function val(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/"?,?[ \t\r]*$/, "", s); return s }
+    /"tag_name"[ \t]*:/ && !gottag { gottag=1; print "TAG\t" val($0); next }
+    /^[ \t]*"name"[ \t]*:/   { name=val($0); next }
+    /^[ \t]*"size"[ \t]*:/   { size=val($0); next }
+    /^[ \t]*"digest"[ \t]*:/ { digest=val($0); next }
+    /^[ \t]*"browser_download_url"[ \t]*:/ {
+      print "ASSET\t" (name==""?"-":name) "\t" (size==""?"-":size) "\t" (digest==""||digest=="null"?"-":digest) "\t" val($0)
+      name=""; size=""; digest=""; next
+    }'
+}
+
+hdr_last() { # <header block> <name> -> value of the last such header
+  printf '%s\n' "$1" | awk -v k="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]'):" \
+    'index(tolower($0), k)==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}'
+}
+
+# Fills L_* for the given canonical source. Returns 1 (after a message) on failure.
+latest_info() { # <canonical source>
+  local type=${1%%|*} rest=${1#*|}
+  L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""
+  case $type in
+    github)
+      local repo tag pat api json lines kind a b c d n=0 names=()
+      IFS='|' read -r repo tag pat <<<"$rest"
+      if [[ $tag == latest ]]; then api="https://api.github.com/repos/$repo/releases/latest"
+      else api="https://api.github.com/repos/$repo/releases/tags/$tag"; fi
+      json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api") \
+        || { warn "could not query GitHub for $repo (tag: $tag): network, rate limit, or wrong repo/tag"; return 1; }
+      lines=$(printf '%s\n' "$json" | wc -l)
+      if (( lines < 5 )); then   # compact JSON -> one key per line
+        json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
+      fi
+      while IFS=$'\t' read -r kind a b c d; do
+        case $kind in
+          TAG) L_VERSION=$a ;;
+          ASSET)
+            names+=("$a")
+            # shellcheck disable=SC2053
+            if [[ $a == $pat ]]; then
+              n=$((n+1))
+              if [[ -z $L_URL ]]; then
+                L_NAME=$a; L_URL=$d
+                if [[ $b != - ]]; then L_SIZE=$b; fi
+                if [[ $c == sha256:* ]]; then L_DIGEST=${c#sha256:}; fi
+              fi
+            fi ;;
+        esac
+      done < <(printf '%s\n' "$json" | gh_parse)
+      if [[ -z $L_VERSION ]]; then warn "unexpected response from GitHub for $repo"; return 1; fi
+      if [[ -z $L_URL ]]; then
+        warn "no asset in release '$L_VERSION' matches '$pat'"
+        if ((${#names[@]})); then warn "assets found: ${names[*]}"; else warn "this release has no assets"; fi
+        return 1
+      fi
+      if (( n > 1 )); then warn "pattern matches $n assets, using $L_NAME - make the pattern more specific"; fi ;;
+    url)
+      local hdr lm
+      hdr=$(curl -fsSIL "$rest") || { warn "could not reach $rest"; return 1; }
+      hdr=$(printf '%s\n' "$hdr" | tr -d '\r')
+      L_URL=$rest
+      L_NAME=${rest%%\?*}; L_NAME=${L_NAME##*/}
+      if [[ -z $L_NAME ]]; then L_NAME="download.AppImage"; fi
+      L_ETAG=$(hdr_last "$hdr" etag)
+      L_SIZE=$(hdr_last "$hdr" content-length)
+      lm=$(hdr_last "$hdr" last-modified)
+      L_VERSION=${lm:-$L_ETAG} ;;
+    *) warn "unsupported update source type: $type"; return 1 ;;
+  esac
+}
+
+# Sets STATUS to uptodate | update | unknown by comparing the installed file with L_*.
+check_status() { # <slug> <path> <canonical source>
+  local slug=$1 path=$2 type=${3%%|*} sver size sum petag
+  sver=$(meta_get "$slug" version)
+  size=$(stat -c %s -- "$path")
+  STATUS=unknown
+  case $type in
+    github)
+      if [[ -n $L_DIGEST ]]; then
+        sum=$(sha256sum -- "$path" | cut -d' ' -f1)
+        if [[ $sum == "$L_DIGEST" ]]; then STATUS=uptodate; else STATUS=update; fi
+      elif [[ -n $sver ]]; then
+        if [[ $sver == "$L_VERSION" ]]; then STATUS=uptodate; else STATUS=update; fi
+      elif [[ -n $L_SIZE ]]; then
+        if [[ $L_SIZE == "$size" ]]; then STATUS=uptodate; else STATUS=update; fi
+      fi ;;
+    url)
+      petag=$(meta_get "$slug" etag)
+      if [[ -n $petag && -n $L_ETAG ]]; then
+        if [[ $petag == "$L_ETAG" ]]; then STATUS=uptodate; else STATUS=update; fi
+      elif [[ -n $L_SIZE ]]; then
+        if [[ $L_SIZE == "$size" ]]; then STATUS=uptodate; else STATUS=update; fi
+      fi ;;
+  esac
+}
+
+download() { # <url> <outfile>   (sets DL_ETAG)
+  local hdr
+  hdr=$(mktemp)
+  if ! curl -fL --retry 2 --progress-bar -D "$hdr" -o "$2" "$1"; then
+    rm -f -- "$hdr" "$2"; warn "download failed: $1"; return 1
+  fi
+  DL_ETAG=$(tr -d '\r' <"$hdr" | awk 'index(tolower($0), "etag:")==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}')
+  rm -f -- "$hdr"
+}
+
+# ---------- add ----------
+cmd_add() {
+  local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force=""
+  while (($#)); do
+    case $1 in
+      -n|--name)  name=${2:?missing value for $1}; shift 2 ;;
+      -a|--args)  extra=${2:?missing value for $1}; shift 2 ;;
+      --slug)     slug_force=${2:?}; shift 2 ;;
+      --move)     move=1; shift ;;
+      --no-move)  move=0; shift ;;
+      --no-fuse)  nofuse=1; forced=1; shift ;;
+      -*)         die "unknown option: $1" ;;
+      *)          src=$1; shift ;;
+    esac
+  done
+  [[ -n $src ]] || { usage; exit 1; }
+  [[ -f $src ]] || die "file not found: $src"
+  [[ $(head -c4 "$src" | tail -c3) == ELF ]] || die "not an ELF/AppImage file: $src"
+
+  mkdir -p "$APPS_DIR" "$ICONS_DIR" "$DESKTOP_DIR"
+  TMP_DIR=$(mktemp -d)
+  STAGE_FILE="$APPS_DIR/.appimgr-stage.$$"
+  local tmp=$TMP_DIR stage=$STAGE_FILE
+
+  cp -- "$src" "$stage"
+  chmod +x "$stage"
+
+  # --- extract only what we need (extraction does not require FUSE) ---
+  local work="$tmp/x" root="$tmp/x/squashfs-root" full=0
+  mkdir -p "$work"
+  run_extract() { (cd "$work" && "$stage" --appimage-extract "$@" >/dev/null 2>&1) || true; }
+  full_extract() { rm -rf "$work"; mkdir -p "$work"; run_extract; full=1; }
+
+  run_extract '*.desktop'
+  local deskfile=""
+  find_desktop() {
+    [[ -d $root ]] || return 0
+    find "$root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -n1 || true
+  }
+  deskfile=$(find_desktop)
+  if [[ -z $deskfile ]]; then
+    full_extract; deskfile=$(find_desktop)
+  elif [[ ! -e $deskfile ]]; then
+    # root entry is a symlink into usr/share/applications - extract its target too
+    local target
+    target=$(readlink "$deskfile" || true); target=${target#./}
+    if [[ -n $target && $target != /* ]]; then run_extract "$target"; fi
+    if [[ ! -e $deskfile ]]; then full_extract; deskfile=$(find_desktop); fi
+  fi
+  [[ -d $root ]] || die "extraction failed - is this a valid type-2 AppImage?"
+
+  local iconname="" dname=""
+  if [[ -n $deskfile ]]; then
+    iconname=$(grep -m1 '^Icon=' "$deskfile" | cut -d= -f2- || true)
+    dname=$(grep -m1 '^Name=' "$deskfile" | cut -d= -f2- || true)
+  fi
+
+  local icon_src=""
+  if (( ! full )) && [[ -n $iconname ]]; then
+    local p
+    for p in '.DirIcon' "$iconname.svg" "$iconname.png" 'usr/share/icons/*'; do run_extract "$p"; done
+  fi
+  icon_src=$(find_icon "$root" "$iconname")
+  if [[ -z $icon_src ]] && (( ! full )); then
+    full_extract
+    icon_src=$(find_icon "$root" "$iconname")
+  fi
+
+  # --- FUSE check ---
+  if (( ! nofuse )) && ! fuse_ready "$stage"; then
+    nofuse=1
+    info "FUSE not usable for this AppImage -> extract-and-run mode (install fuse2 for normal, faster launching)"
+  fi
+
+  # --- names / paths ---
+  local display slug dest
+  display="${name:-${dname:-$(name_from_file "$src")}}"
+  slug="${slug_force:-$(slugify "$display")}"
+  [[ -n $slug ]] || slug="app"
+  dest="$APPS_DIR/$slug.AppImage"
+  local src_real dest_real
+  src_real=$(readlink -f -- "$src"); dest_real="$(readlink -f -- "$APPS_DIR")/$slug.AppImage"
+  if [[ -e $dest ]]; then
+    info "replacing existing $dest (previous version kept for: appimgr rollback $slug)"
+    mkdir -p "$BACKUP_DIR"
+    mv -f -- "$dest" "$BACKUP_DIR/$slug.AppImage"
+  fi
+  mv -f "$stage" "$dest"
+
+  # --- icon (stored next to the AppImages, referenced by absolute path) ---
+  local icon_id="application-x-executable"
+  find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+  if [[ -n $icon_src ]]; then
+    local mime ext=""
+    mime=$(file -b --mime-type "$icon_src" 2>/dev/null || echo unknown)
+    case $mime in
+      image/svg+xml) ext=svg ;;
+      image/png)     ext=png ;;
+      *) info "icon type '$mime' not supported, using generic icon" ;;
+    esac
+    if [[ -n $ext ]]; then
+      install -m644 "$icon_src" "$ICONS_DIR/$slug.$ext"
+      icon_id="$ICONS_DIR/$slug.$ext"
+    fi
+  else
+    info "no icon found in AppImage, using generic icon"
+  fi
+
+  # --- desktop entry ---
+  local exec_cmd="\"$dest\""
+  if (( nofuse )); then exec_cmd="env APPIMAGE_EXTRACT_AND_RUN=1 $exec_cmd"; fi
+  local out="$DESKTOP_DIR/appimage-$slug.desktop"
+
+  if [[ -n $deskfile ]]; then
+    EXEC_CMD="$exec_cmd" EXTRA="$extra" ICON="$icon_id" APPPATH="$dest" NAME_OVR="$name" \
+    awk '
+      BEGIN { cmd=ENVIRON["EXEC_CMD"]; extra=ENVIRON["EXTRA"]; icon=ENVIRON["ICON"]
+              p=ENVIRON["APPPATH"]; nm=ENVIRON["NAME_OVR"] }
+      /^\[Desktop Entry\]/ && !seen { print; print "X-AppImage-Managed=appimgr"; print "X-AppImage-Path=" p; seen=1; main=1; next }
+      /^\[/ && !/^\[Desktop Entry\]/ { main=0 }
+      /^(TryExec|X-AppImage-Integrate|X-AppImage-Managed|X-AppImage-Path)=/ { next }
+      /^Name=/ && nm != "" && main { print "Name=" nm; next }
+      /^Icon=/ { print "Icon=" icon; next }
+      /^Exec=/ {
+        rest=$0; sub(/^Exec=[ \t]*/, "", rest)
+        if (rest ~ /^"/) sub(/^"[^"]*"[ \t]*/, "", rest); else sub(/^[^ \t]+[ \t]*/, "", rest)
+        o="Exec=" cmd
+        if (extra != "") o = o " " extra
+        if (rest != "") o = o " " rest
+        print o; next
+      }
+      { print }
+    ' "$deskfile" > "$out"
+  else
+    info "no .desktop file inside AppImage, generating one"
+    cat > "$out" <<EOF
+[Desktop Entry]
+X-AppImage-Managed=appimgr
+X-AppImage-Path=$dest
+Type=Application
+Name=$display
+Exec=$exec_cmd${extra:+ $extra}
+Icon=$icon_id
+Terminal=false
+Categories=Utility;
+EOF
+  fi
+  chmod 644 "$out"
+
+  refresh
+  if (( move )) && [[ $src_real != "$dest_real" ]]; then rm -f -- "$src"; fi
+
+  # --- remember how it was installed (reused by 'update') ---
+  meta_set "$slug" name "$name"
+  meta_set "$slug" args "$extra"
+  if (( forced )); then meta_set "$slug" nofuse 1; else meta_set "$slug" nofuse ""; fi
+  meta_set "$slug" installed "$(date +%F)"
+  meta_set "$slug" version ""
+  meta_set "$slug" etag ""
+
+  info "integrated: $display"
+  echo "   slug:    $slug"
+  echo "   binary:  $dest"
+  if (( nofuse )); then echo "   mode:    extract-and-run (no FUSE)"; else echo "   mode:    normal (FUSE)"; fi
+  echo "   entry:   $out"
+
+  if [[ -z $(meta_get "$slug" source) ]]; then offer_source "$slug" "$dest"; fi
+
+  rm -rf -- "$TMP_DIR"; TMP_DIR=""; STAGE_FILE=""
+}
+
+# ---------- update ----------
+update_one() { # <slug> <check_only 0|1> <yes 0|1> <quiet_if_no_source 0|1>
+  local slug=$1 check=$2 yes=$3 quiet=$4
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" src path saved sum type
+  [[ -f $df ]] || { warn "not integrated: $slug (see: appimgr list)"; return 1; }
+  src=$(meta_get "$slug" source)
+  if [[ -z $src ]]; then
+    if (( ! quiet )); then info "$slug: no update source saved (see: appimgr source)"; fi
+    return 0
+  fi
+  path=$(desktop_path "$df")
+  [[ -f $path ]] || { warn "$slug: binary missing: $path"; return 1; }
+  need_cmd curl
+
+  latest_info "$src" || return 1
+  check_status "$slug" "$path" "$src"
+  saved=$(meta_get "$slug" version)
+  case $STATUS in
+    uptodate) info "$slug: up to date${L_VERSION:+ ($L_VERSION)}"; return 0 ;;
+    update)   info "$slug: update available: ${saved:-installed} -> ${L_VERSION:-latest}  [$L_NAME]" ;;
+    *)        info "$slug: cannot tell if this is newer (latest: ${L_VERSION:-?}  [$L_NAME])" ;;
+  esac
+  if (( check )); then return 0; fi
+  if (( ! yes )); then
+    if ! confirm "Download and install it?" n; then info "$slug: skipped"; return 0; fi
+  fi
+
+  mkdir -p "$APPS_DIR"
+  DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
+  info "downloading $L_NAME"
+  download "$L_URL" "$DL_DIR/$L_NAME" || return 1
+  if [[ -n $L_DIGEST ]]; then
+    sum=$(sha256sum -- "$DL_DIR/$L_NAME" | cut -d' ' -f1)
+    if [[ $sum != "$L_DIGEST" ]]; then warn "$slug: checksum mismatch - aborting, nothing changed"; return 1; fi
+    info "sha256 verified"
+  fi
+
+  saved_opts "$slug"
+  cmd_add --slug "$slug" "${SAVED[@]}" "$DL_DIR/$L_NAME"
+  meta_set "$slug" version "$L_VERSION"
+  type=${src%%|*}
+  if [[ $type == url ]]; then meta_set "$slug" etag "${DL_ETAG:-$L_ETAG}"; fi
+  rm -rf -- "$DL_DIR"; DL_DIR=""
+}
+
+cmd_update() {
+  local slug="" file="" all=0 check=0 yes=0 pass=() f
+  while (($#)); do
+    case $1 in
+      --all)      all=1; shift ;;
+      --check)    check=1; shift ;;
+      -y|--yes)   yes=1; shift ;;
+      -n|--name|-a|--args) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
+      --no-fuse|--no-move|--move) pass+=("$1"); shift ;;
+      -*)         die "unknown option: $1" ;;
+      *)
+        if (( all )); then die "unexpected argument: $1"
+        elif [[ -z $slug ]]; then slug=$1
+        elif [[ -z $file ]]; then file=$1
+        else die "unexpected argument: $1"; fi
+        shift ;;
+    esac
+  done
+
+  if (( all )); then
+    for f in "$DESKTOP_DIR"/appimage-*.desktop; do
+      [[ -f $f ]] || continue
+      grep -q '^X-AppImage-Managed=appimgr' "$f" || continue
+      slug=${f##*/appimage-}; slug=${slug%.desktop}
+      update_one "$slug" "$check" "$yes" 1 || true
+    done
+    return 0
+  fi
+
+  [[ -n $slug ]] || { usage; exit 1; }
+  [[ -f $DESKTOP_DIR/appimage-$slug.desktop ]] || die "not integrated: $slug (see: appimgr list)"
+  if [[ -n $file ]]; then
+    saved_opts "$slug"
+    cmd_add --slug "$slug" "${SAVED[@]}" "${pass[@]}" "$file"
+  else
+    update_one "$slug" "$check" "$yes" 0
+  fi
+}
+
+cmd_rollback() {
+  local slug=${1:-}
+  [[ -n $slug ]] || { usage; exit 1; }
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" dest bak="$BACKUP_DIR/$slug.AppImage"
+  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+  [[ -f $bak ]] || die "no previous version stored for $slug"
+  dest=$(desktop_path "$df")
+  [[ -f $dest ]] || die "AppImage binary missing: $dest"
+  mv -f -- "$dest" "$dest.swap"
+  mv -f -- "$bak" "$dest"
+  mv -f -- "$dest.swap" "$bak"
+  meta_set "$slug" version ""
+  meta_set "$slug" etag ""
+  info "$slug: swapped with the previous version (run 'appimgr rollback $slug' again to undo)"
+}
+
+# ---------- source ----------
+cmd_source() {
+  local slug=${1:-} action=${2:-} cur new
+  if [[ -z $slug ]]; then source_help; return 0; fi
+  [[ -f $DESKTOP_DIR/appimage-$slug.desktop ]] || die "not integrated: $slug (see: appimgr list)"
+  case $action in
+    "")
+      cur=$(meta_get "$slug" source)
+      if [[ -n $cur ]]; then echo "$slug: $(source_describe "$cur")"
+      else echo "$slug: no update source saved (see: appimgr source)"; fi ;;
+    clear)
+      meta_set "$slug" source ""; info "$slug: update source removed" ;;
+    set)
+      shift 2
+      new=$(parse_source_args "$@") || { echo >&2; source_help >&2; exit 1; }
+      need_cmd curl
+      info "checking source ..."
+      latest_info "$new" || die "source check failed - not saved"
+      info "OK: found $L_NAME (${L_VERSION:-version unknown})"
+      meta_set "$slug" source "$new"
+      info "$slug: saved update source: $(source_describe "$new")" ;;
+    *) die "unknown action '$action' (use: set | clear)" ;;
+  esac
+}
+
+# ---------- run / remove / list ----------
+cmd_run() {
+  local slug=${1:-} detach=0
+  [[ -n $slug ]] || { usage; exit 1; }
+  shift
+  if [[ ${1:-} == -d || ${1:-} == --detach ]]; then detach=1; shift; fi
+
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" path line rest
+  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+  path=$(desktop_path "$df")
+  [[ -n $path && -x $path ]] || die "AppImage binary missing: ${path:-unknown}"
+
+  # reuse launcher settings: extract-and-run mode and extra args from the Exec line
+  local cmd=()
+  line=$(grep -m1 '^Exec=' "$df" || true)
+  if [[ $line == *APPIMAGE_EXTRACT_AND_RUN=1* ]]; then cmd=(env APPIMAGE_EXTRACT_AND_RUN=1); fi
+  cmd+=("$path")
+  rest=${line#*\"$path\"}
+  if [[ $rest != "$line" ]]; then
+    rest=${rest//%[UuFfDdNnickvm]/}      # drop desktop-entry field codes
+    local extra=()
+    read -ra extra <<<"$rest" || true
+    cmd+=("${extra[@]}")
+  fi
+  cmd+=("$@")
+
+  if (( detach )); then
+    setsid -f "${cmd[@]}" >/dev/null 2>&1 </dev/null
+  else
+    exec "${cmd[@]}"
+  fi
+}
+
+cmd_remove() {
+  local slug=${1:-}
+  [[ -n $slug ]] || { usage; exit 1; }
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" path=""
+  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+  path=$(desktop_path "$df")
+  if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then rm -f -- "$path"; fi
+  rm -f -- "$df" "$BACKUP_DIR/$slug.AppImage" "$META_DIR/$slug.conf"
+  find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+  refresh
+  info "removed: $slug"
+}
+
+print_long() { # <slug> <name> <path> <desktop file>
+  local slug=$1 name=$2 path=$3 f=$4 size mode ver inst src args bak=no
+  size=$(du -h -- "$path" 2>/dev/null | cut -f1 || true)
+  if grep -q '^Exec=env APPIMAGE_EXTRACT_AND_RUN=1' "$f"; then mode="extract-and-run (no FUSE)"; else mode="normal (FUSE)"; fi
+  ver=$(meta_get "$slug" version)
+  inst=$(meta_get "$slug" installed)
+  if [[ -z $inst && -f $path ]]; then inst=$(date -r "$path" +%F 2>/dev/null || true); fi
+  args=$(meta_get "$slug" args)
+  src=$(meta_get "$slug" source)
+  if [[ -n $src ]]; then src=$(source_describe "$src"); else src="none (see: appimgr source)"; fi
+  if [[ -f $BACKUP_DIR/$slug.AppImage ]]; then
+    bak="yes ($(du -h -- "$BACKUP_DIR/$slug.AppImage" | cut -f1))"
+  fi
+  printf '%s  (%s)\n' "$slug" "$name"
+  printf '   %-10s %s\n' "binary"    "$path${size:+  [$size]}"
+  printf '   %-10s %s\n' "installed" "${inst:--}"
+  printf '   %-10s %s\n' "version"   "${ver:--}"
+  printf '   %-10s %s\n' "mode"      "$mode"
+  printf '   %-10s %s\n' "args"      "${args:--}"
+  printf '   %-10s %s\n' "source"    "$src"
+  printf '   %-10s %s\n' "rollback"  "$bak"
+  printf '   %-10s %s\n' "entry"     "$f"
+}
+
+cmd_list() {
+  local long=0 f slug name path n=0
+  if [[ ${1:-} == -l || ${1:-} == --long ]]; then long=1; fi
+  for f in "$DESKTOP_DIR"/appimage-*.desktop; do
+    [[ -f $f ]] || continue
+    grep -q '^X-AppImage-Managed=appimgr' "$f" || continue
+    slug=${f##*/appimage-}; slug=${slug%.desktop}
+    name=$(grep -m1 '^Name=' "$f" | cut -d= -f2- || true)
+    path=$(desktop_path "$f")
+    if (( long )); then
+      print_long "$slug" "$name" "$path" "$f"
+    else
+      printf '%-22s %-28s %s\n' "$slug" "$name" "$path"
+    fi
+    n=$((n+1))
+  done
+  if (( n == 0 )); then echo "No integrated AppImages."; fi
+}
+
+case "${1:-}" in
+  add)               shift; cmd_add "$@" ;;
+  update)            shift; cmd_update "$@" ;;
+  rollback)          shift; cmd_rollback "$@" ;;
+  source)            shift; cmd_source "$@" ;;
+  run)               shift; cmd_run "$@" ;;
+  remove|rm)         shift; cmd_remove "$@" ;;
+  list|ls)           shift; cmd_list "$@" ;;
+  version|-v|--version) echo "appimgr v$VERSION" ;;
+  ""|-h|--help|help) usage ;;
+  *)                 die "unknown command: $1 (try --help)" ;;
+esac
