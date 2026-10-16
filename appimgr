@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # appimgr - minimal AppImage -> app launcher integration (Gearlever-style, terminal only)
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 set -euo pipefail
 
@@ -40,7 +40,8 @@ Usage:
   appimgr source [<slug> [set ...|clear]]  Show/set/clear the update source (no args = how-to)
   appimgr run <slug> [-d] [args...]        Launch from the terminal (-d = detached)
   appimgr list [-l]                        List integrated AppImages (-l = details)
-  appimgr remove <slug>                    Remove AppImage, icon, entry and metadata
+  appimgr remove <slug> [-y] [--purge]     Remove the app; the AppImage goes to the Trash
+                                           (-y = no prompt, --purge = delete permanently)
   appimgr version
 
 Options for add / update <slug> <file>:
@@ -685,17 +686,73 @@ cmd_run() {
   fi
 }
 
+urlencode_path() { # percent-encode a path for .trashinfo
+  local LC_ALL=C s=$1 out="" c h i
+  for ((i=0; i<${#s}; i++)); do
+    c=${s:i:1}
+    case $c in
+      [A-Za-z0-9/._~-]) out+=$c ;;
+      *) printf -v h '%%%02X' "'$c"; out+=$h ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Moves a file into the freedesktop.org home Trash (restorable from file managers
+# or with trash-cli). Prints the name it has in the Trash.
+trash_file() { # <file>
+  local f=$1 tdir="$DATA_HOME/Trash" base target n=1
+  mkdir -p "$tdir/files" "$tdir/info"
+  base=$(basename -- "$f"); target=$base
+  while [[ -e $tdir/files/$target || -e $tdir/info/$target.trashinfo ]]; do
+    n=$((n+1)); target="${base%.*}.$n.${base##*.}"
+  done
+  printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' \
+    "$(urlencode_path "$(readlink -f -- "$f")")" "$(date +%Y-%m-%dT%H:%M:%S)" > "$tdir/info/$target.trashinfo"
+  if ! mv -- "$f" "$tdir/files/$target"; then
+    rm -f -- "$tdir/info/$target.trashinfo"; return 1
+  fi
+  printf '%s' "$target"
+}
+
 cmd_remove() {
-  local slug=${1:-}
+  local slug="" yes=0 purge=0
+  while (($#)); do
+    case $1 in
+      -y|--yes) yes=1; shift ;;
+      --purge)  purge=1; shift ;;
+      -*)       die "unknown option: $1" ;;
+      *)        if [[ -z $slug ]]; then slug=$1; else die "unexpected argument: $1"; fi; shift ;;
+    esac
+  done
   [[ -n $slug ]] || { usage; exit 1; }
-  local df="$DESKTOP_DIR/appimage-$slug.desktop" path=""
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" path="" name has_file=0 trashed=""
   [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
   path=$(desktop_path "$df")
-  if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then rm -f -- "$path"; fi
+  name=$(grep -m1 '^Name=' "$df" | cut -d= -f2- || true)
+  if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then has_file=1; fi
+
+  if (( ! yes )); then
+    info "remove '${name:-$slug}' ($slug)?"
+    echo "   - launcher entry, icon and update settings are deleted"
+    if (( has_file && purge )); then echo "   - the AppImage is deleted PERMANENTLY"
+    elif (( has_file )); then echo "   - the AppImage is moved to the Trash (restorable)"; fi
+    if [[ -f $BACKUP_DIR/$slug.AppImage ]]; then echo "   - the previous version (rollback copy) is deleted"; fi
+    if ! confirm "Continue?" n; then info "cancelled (non-interactive? use -y)"; return 0; fi
+  fi
+
+  if (( has_file )); then
+    if (( purge )); then
+      rm -f -- "$path"
+    else
+      trashed=$(trash_file "$path") || die "could not move $path to the Trash (use --purge to delete it)"
+    fi
+  fi
   rm -f -- "$df" "$BACKUP_DIR/$slug.AppImage" "$META_DIR/$slug.conf"
   find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
   refresh
   info "removed: $slug"
+  if [[ -n $trashed ]]; then info "AppImage moved to Trash as '$trashed' (restore it from your file manager)"; fi
 }
 
 print_long() { # <slug> <name> <path> <desktop file>
