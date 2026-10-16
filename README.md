@@ -1,4 +1,4 @@
-# bin-scripts
+# Arch-Scripts
 
 Personal scripts from `~/.local/bin` on Arch Linux.
 
