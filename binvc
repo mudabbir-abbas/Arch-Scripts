@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# binvc v1.0.0 - friendly git helper for the ~/.local/bin scripts repo
+VERSION="1.0.0"
+REPO="${BINVC_REPO:-$HOME/.local/bin}"
+
+if [ -t 1 ]; then
+  B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+else
+  B=''; G=''; Y=''; R=''; N=''
+fi
+
+info() { printf '%s==>%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+confirm() { local a; read -r -p "$1 [y/N] " a; [[ $a =~ ^[Yy]$ ]]; }
+
+command -v git >/dev/null || die "git is not installed (sudo pacman -S git)"
+cd "$REPO" 2>/dev/null || die "folder not found: $REPO"
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "$REPO is not a git repo yet (run: git init)"
+
+has_remote()  { [ -n "$(git remote)" ]; }
+has_changes() { [ -n "$(git status --porcelain)" ]; }
+has_upstream() { git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; }
+
+SECRET_PAT='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|(password|passwd|secret|api[_-]?key|token)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+
+secret_hits() {
+  git diff --cached -U0 | grep -E '^\+[^+]' | grep -Ei "$SECRET_PAT" || true
+}
+
+check_exec() {
+  local f
+  git ls-files -c -o --exclude-standard | while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    if [ "$(head -c2 "$f" 2>/dev/null)" = '#!' ] && [ ! -x "$f" ]; then
+      warn "$f has a shebang but is not executable (fix: chmod +x $f)"
+    fi
+  done
+}
+
+# ---------- commands ----------
+
+cmd_status() {
+  info "Branch and changes"
+  git status -sb
+  has_changes || info "Working folder is clean."
+  check_exec
+}
+
+cmd_diff() {
+  info "Untracked (new) files:"
+  git ls-files -o --exclude-standard | sed 's/^/  /'
+  info "Changes to tracked files:"
+  git diff HEAD "$@"
+}
+
+cmd_commit() {
+  has_changes || { info "Nothing to commit."; return 0; }
+  check_exec
+  git add -A
+  git status --short
+  local hits msg
+  hits=$(secret_hits)
+  if [ -n "$hits" ]; then
+    warn "possible secrets in this commit:"
+    printf '%s\n' "$hits" | cut -c1-160
+    confirm "Commit anyway?" || { git reset -q; info "Cancelled, nothing committed."; return 1; }
+  fi
+  msg="$*"
+  [ -n "$msg" ] || read -r -p "Commit message: " msg
+  [ -n "$msg" ] || { git reset -q; die "empty message, cancelled"; }
+  git commit -q -m "$msg" && info "Committed: $msg"
+}
+
+cmd_push() {
+  has_remote || die "no remote configured (GitHub link missing)"
+  if has_upstream; then git push; else git push -u origin HEAD; fi
+  git push --tags -q 2>/dev/null || true
+  info "Pushed."
+}
+
+cmd_pull() {
+  has_remote || die "no remote configured"
+  git pull --rebase --autostash
+}
+
+cmd_sync() {
+  cmd_commit "$@" || return 1
+  if has_remote; then
+    has_upstream && git pull --rebase --autostash
+    cmd_push
+  else
+    warn "no remote, committed locally only"
+  fi
+}
+
+cmd_log() {
+  git log --oneline --decorate -n "${1:-15}"
+}
+
+cmd_show() {
+  [ -n "${1:-}" ] || die "usage: binvc show <commit>"
+  git show --stat "$1"
+}
+
+cmd_restore() {
+  local f="${1:-}"
+  [ -n "$f" ] || read -r -p "File to discard changes in: " f
+  [ -n "$f" ] || die "no file given"
+  git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || die "$f is not tracked by git"
+  git diff --stat HEAD -- "$f"
+  confirm "Discard ALL uncommitted changes in $f? This cannot be undone." || return 0
+  git restore --staged --worktree -- "$f" && info "Restored $f to last commit."
+}
+
+cmd_fetchfile() {
+  local f="${1:-}" c="${2:-}"
+  [ -n "$f" ] || read -r -p "File name: " f
+  [ -n "$f" ] || die "no file given"
+  if [ -z "$c" ]; then
+    info "History of $f:"
+    git log --oneline -n 15 -- "$f"
+    read -r -p "Commit to restore from: " c
+  fi
+  [ -n "$c" ] || die "no commit given"
+  confirm "Overwrite $f with its version from $c?" || return 0
+  git restore --source="$c" -- "$f" && info "Done. Review with 'binvc diff', then commit."
+}
+
+cmd_undo() {
+  git rev-parse HEAD~1 >/dev/null 2>&1 || die "no earlier commit to go back to"
+  if has_upstream && [ "$(git rev-list --count '@{u}..HEAD')" = 0 ]; then
+    die "last commit is already pushed. Use: git revert HEAD"
+  fi
+  git log --oneline -n 1
+  confirm "Undo this commit (your file changes are kept)?" || return 0
+  git reset --soft HEAD~1 && info "Commit undone, changes are staged again."
+}
+
+cmd_tag() {
+  local t="${1:-}" m="${2:-}"
+  if [ -z "$t" ]; then
+    info "Existing tags:"; git tag -l --sort=-v:refname | head -10
+    read -r -p "New version (e.g. 1.2.0): " t
+  fi
+  [ -n "$t" ] || die "no version given"
+  [[ $t == v* ]] || t="v$t"
+  [ -n "$m" ] || read -r -p "Tag message: " m
+  [ -n "$m" ] || m="Release $t"
+  git tag -a "$t" -m "$m" || return 1
+  info "Created tag $t"
+  has_remote && confirm "Push tag to GitHub?" && git push origin "$t"
+}
+
+cmd_tags() { git tag -n --sort=-v:refname; }
+
+cmd_scan() {
+  info "Scanning all tracked files for possible secrets..."
+  local out
+  out=$(git ls-files -z | xargs -0 grep -nEIi "$SECRET_PAT" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out" | cut -c1-160; warn "review the lines above"
+  else info "Nothing suspicious found."; fi
+}
+
+cmd_ignore() {
+  if [ -e .gitignore ]; then info ".gitignore already exists:"; cat .gitignore; return 0; fi
+  printf '%s\n' '*~' '*.bak' '*.swp' '*.log' '.env' > .gitignore
+  info "Created .gitignore (backup, swap, log and .env files are now skipped)."
+}
+
+cmd_where() {
+  git remote -v
+  echo "Folder: $REPO"
+}
+
+usage() {
+  cat <<EOF
+${B}binvc v$VERSION${N} - git helper for $REPO
+
+Run with no arguments for an interactive menu.
+
+  status               what changed, and any script missing chmod +x
+  diff [file]          show new files and edits since last commit
+  commit ["message"]   stage everything and commit (asks if no message)
+  push                 upload commits (and tags) to GitHub
+  pull                 download changes from GitHub
+  sync ["message"]     commit + pull + push in one go
+  log [n]              last n commits (default 15)
+  show <commit>        files changed in one commit
+  restore [file]       discard uncommitted edits in a file
+  fetchfile [file] [commit]
+                       bring back an older version of a file
+  undo                 undo the last commit (unpushed only), keep edits
+  tag [ver] [msg]      create a version tag, e.g. binvc tag 1.2.0
+  tags                 list tags
+  scan                 look for passwords/tokens in tracked files
+  ignore               create a starter .gitignore
+  where                show the GitHub link
+  help                 this text
+EOF
+}
+
+menu() {
+  local c
+  while true; do
+    echo
+    echo "${B}binvc v$VERSION${N}  ($REPO)"
+    cat <<'EOF'
+  1) Status           7) Restore a file
+  2) Show changes     8) Get older version of a file
+  3) Commit           9) Undo last commit
+  4) Push            10) Tag a version
+  5) Sync (all-in-1) 11) Scan for secrets
+  6) Log             12) Create .gitignore
+  q) Quit
+EOF
+    read -r -p "Choose: " c || break
+    echo
+    case "$c" in
+      1) cmd_status ;;
+      2) cmd_diff ;;
+      3) cmd_commit ;;
+      4) cmd_push ;;
+      5) cmd_sync ;;
+      6) cmd_log ;;
+      7) cmd_restore ;;
+      8) cmd_fetchfile ;;
+      9) cmd_undo ;;
+      10) cmd_tag ;;
+      11) cmd_scan ;;
+      12) cmd_ignore ;;
+      q|Q) break ;;
+      *) warn "unknown choice" ;;
+    esac
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    "")                menu ;;
+    status|st|s)       cmd_status ;;
+    diff|d)            cmd_diff "$@" ;;
+    commit|c)          cmd_commit "$@" ;;
+    push|p)            cmd_push ;;
+    pull)              cmd_pull ;;
+    sync)              cmd_sync "$@" ;;
+    log|l)             cmd_log "$@" ;;
+    show)              cmd_show "$@" ;;
+    restore)           cmd_restore "$@" ;;
+    fetchfile|old)     cmd_fetchfile "$@" ;;
+    undo)              cmd_undo ;;
+    tag)               cmd_tag "$@" ;;
+    tags)              cmd_tags ;;
+    scan)              cmd_scan ;;
+    ignore)            cmd_ignore ;;
+    where)             cmd_where ;;
+    version|-v|--version) echo "binvc v$VERSION" ;;
+    help|-h|--help)    usage ;;
+    *) warn "unknown command: $cmd"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
