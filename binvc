@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# binvc v1.0.1 - friendly git helper for the ~/.local/bin scripts repo
+# binvc v1.0.2 - friendly git helper for the ~/.local/bin scripts repo
 #   1.0.2  accept -V as well as -v for the version
 #   1.0.1  push/sync now report failures instead of printing "Pushed." anyway
 #   1.0.0  first release
