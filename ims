@@ -2,10 +2,11 @@
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
 # CHANGELOG (newest first)
+# 2.1.0 (2026-10-18): list and default run now only consider scripts (shebang or known extension), so files like readme.md are ignored; added list --all.
 # 2.0.1 (2026-10-18): Atomic installs (safe self-update, incl. --copy/restore); tidied --help layout.
 # 2.0.0 (2026-10-18): New scripts installed by name now drop known extensions (.sh, .py ...); added --keep-ext.
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 NAME="ims"
 
 set -uo pipefail
@@ -42,12 +43,14 @@ Usage:
                          (new scripts install without .sh/.py etc.)
   $NAME list               List scripts in ~/.local/bin with version, date
                          and any update waiting in ~/Downloads
+                         (-a/--all also shows non-script files)
   $NAME restore <name>     Roll back <name> to its latest backup
                          (run again to toggle back)
   $NAME -h, --help         Show this help
   $NAME -v, --version      Show version
 
 Options:
+  -a, --all              With list: include non-script files too
   -n, --dry-run          Show what would happen, change nothing
   -c, --copy             Copy instead of move (keep file in ~/Downloads)
       --no-backup        Don't back up the script being replaced
@@ -59,6 +62,10 @@ Matching:
   where <ext> is one of: ${KNOWN_EXT//|/ }.
   A browser duplicate suffix such as "foo (1).sh" is fine. The newest
   match wins. Identical files are skipped; .part/.crdownload are ignored.
+
+Scripts:
+  Only files that start with #! or have a known extension are considered;
+  other files in ~/.local/bin (readme.md, binaries, ...) are left alone.
 
 Notes:
   $NAME can safely update itself (installs are atomic renames).
@@ -72,6 +79,17 @@ get_ver() {
     v=$(grep -m1 -E '^[[:space:]]*(readonly[[:space:]]+)?VERSION=' "$1" 2>/dev/null) || { printf '%s' "-"; return; }
     v=${v#*=}; v=${v//[\"\']/}; v=${v%%[[:space:]#]*}
     printf '%s' "${v:--}"
+}
+
+# is_script <path> -> 0 if it starts with a shebang or has a known script extension
+is_script() {
+    local ext
+    [[ $(head -c2 -- "$1" 2>/dev/null) == "#!" ]] && return 0
+    if [[ ${1##*/} == *.* ]]; then
+        ext=${1##*.}
+        [[ ${ext,,} =~ ^($KNOWN_EXT)$ ]] && return 0
+    fi
+    return 1
 }
 
 # matches_name <file> <scriptname>  -> 0 if the Downloads file is a candidate for that script
@@ -183,6 +201,7 @@ cmd_default() {
     local f name src found=0
     for f in "$BIN_DIR"/*; do
         [[ -f $f ]] || continue
+        is_script "$f" || continue
         name=${f##*/}
         src=$(find_match "$name")
         [[ -n $src ]] || continue
@@ -218,10 +237,11 @@ cmd_named() {
 
 cmd_list() {
     [[ -d $BIN_DIR ]] || { err "$BIN_DIR does not exist"; return 1; }
-    local f name src n=0 flags
+    local f name src n=0 hidden=0 flags
     printf '%s\n' "${B}$(printf '%-30s %-10s %-11s %s' NAME VERSION MODIFIED NOTES)${X}"
     for f in "$BIN_DIR"/*; do
         [[ -f $f || -L $f ]] || continue
+        if ! ((ALL)) && ! is_script "$f"; then ((hidden++)); continue; fi
         name=${f##*/}; flags=""
         [[ -x $f ]] || flags+="not-executable "
         src=$(find_match "$name")
@@ -231,6 +251,7 @@ cmd_list() {
     done
     ((n)) || note "No scripts in $BIN_DIR"
     ((n)) && printf '%s\n' "${D}$n script(s) in $BIN_DIR${X}"
+    ((hidden)) && note "$hidden non-script file(s) hidden (use: $NAME list --all)"
     return 0
 }
 
@@ -250,7 +271,7 @@ cmd_restore() {
 }
 
 # ---- argument parsing ----
-DRY=0; COPY=0; BACKUP=1; KEEP_EXT=0
+DRY=0; COPY=0; BACKUP=1; KEEP_EXT=0; ALL=0
 pos=()
 while (($#)); do
     case $1 in
@@ -260,6 +281,7 @@ while (($#)); do
         -c|--copy)    COPY=1 ;;
         --no-backup)  BACKUP=0 ;;
         --keep-ext)   KEEP_EXT=1 ;;
+        -a|--all)     ALL=1 ;;
         --)           shift; pos+=("$@"); break ;;
         -*)           err "Unknown option: $1 (try $NAME --help)"; exit 2 ;;
         *)            pos+=("$1") ;;
