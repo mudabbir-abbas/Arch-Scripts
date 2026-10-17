@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
+#
+# CHANGELOG (newest first)
+# 2.0.0 (2026-10-18): New scripts installed by name now drop known extensions (.sh, .py ...); added --keep-ext.
+
+VERSION="2.0.0"
+NAME="ims"
+
+set -uo pipefail
+shopt -s nullglob
+
+BIN_DIR="${IMS_BIN_DIR:-$HOME/.local/bin}"
+DL_DIR="${IMS_DL_DIR:-$HOME/Downloads}"
+BACKUP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ims/backups"
+KEEP_BACKUPS=3
+KNOWN_EXT="sh|bash|zsh|fish|py|pl|rb|js|lua"
+
+if [[ -t 1 ]]; then
+    G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; B=$'\e[1m'; X=$'\e[0m'
+else
+    G=""; Y=""; R=""; D=""; B=""; X=""
+fi
+
+ok()   { printf '%s\n' "${G}✓${X} $*"; }
+note() { printf '%s\n' "${D}·${X} $*"; }
+warn() { printf '%s\n' "${Y}!${X} $*" >&2; }
+err()  { printf '%s\n' "${R}✗${X} $*" >&2; }
+
+usage() {
+    cat <<EOF
+${B}$NAME $VERSION${X} - Install My Scripts
+
+Moves scripts from ~/Downloads into ~/.local/bin, replacing the old copy
+and running chmod +x on it.
+
+Usage:
+  $NAME                    Update every script in ~/.local/bin that has a
+                           matching file in ~/Downloads
+  $NAME <scriptname>       Only look for <scriptname> in ~/Downloads
+                           (installs it as new, without .sh/.py etc., if not installed yet)
+  $NAME list               List scripts in ~/.local/bin (version, date,
+                           and whether an update is waiting in ~/Downloads)
+  $NAME restore <name>     Roll back <name> to its latest backup
+                           (run again to toggle back)
+  $NAME -h, --help         Show this help
+  $NAME -v, --version      Show version
+
+Options:
+  -n, --dry-run            Show what would happen, change nothing
+  -c, --copy               Copy instead of move (keep the file in ~/Downloads)
+      --no-backup          Don't back up the script being replaced
+      --keep-ext           When installing a NEW script by name, keep its
+                           extension (default: "ims foo.sh" installs as "foo")
+
+Matching:
+  Downloads file matches a script "foo" if it is named foo, foo.sh, foo.py ...
+  (extensions: ${KNOWN_EXT//|/, }) and may carry a browser duplicate suffix,
+  e.g. "foo (1).sh". If several match, the newest one wins.
+  Identical files are skipped. Partial downloads (.part/.crdownload) are ignored.
+
+Backups:  $BACKUP_DIR (last $KEEP_BACKUPS per script)
+Env:      IMS_BIN_DIR, IMS_DL_DIR override the default directories.
+EOF
+}
+
+get_ver() {
+    local v
+    v=$(grep -m1 -E '^[[:space:]]*(readonly[[:space:]]+)?VERSION=' "$1" 2>/dev/null) || { printf '%s' "-"; return; }
+    v=${v#*=}; v=${v//[\"\']/}; v=${v%%[[:space:]#]*}
+    printf '%s' "${v:--}"
+}
+
+# matches_name <file> <scriptname>  -> 0 if the Downloads file is a candidate for that script
+matches_name() {
+    local b=${1##*/} n=$2 stem ext
+    local re_dup='^(.*[^ ])[ ]?\([0-9]+\)(\.[^.]+)?$'
+    [[ $b == *.part || $b == *.crdownload ]] && return 1
+    [[ $b == "$n" ]] && return 0
+    if [[ $b =~ $re_dup ]]; then
+        b="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+        [[ $b == "$n" ]] && return 0
+    fi
+    if [[ $b == *.* ]]; then
+        stem=${b%.*}; ext=${b##*.}
+        case ${ext,,} in
+            sh|bash|zsh|fish|py|pl|rb|js|lua) [[ $stem == "$n" ]] && return 0 ;;
+        esac
+    fi
+    return 1
+}
+
+# find_match <scriptname> -> prints newest matching file in Downloads (or nothing)
+find_match() {
+    local f best=""
+    for f in "$DL_DIR"/*; do
+        [[ -f $f ]] || continue
+        matches_name "$f" "$1" || continue
+        if [[ -z $best || $f -nt $best ]]; then best=$f; fi
+    done
+    printf '%s' "$best"
+}
+
+backup_file() {   # backup_file <path> <name>
+    mkdir -p "$BACKUP_DIR" || return 1
+    cp -p -- "$1" "$BACKUP_DIR/$2.$(date +%Y%m%d-%H%M%S)" || return 1
+    # prune old backups
+    local old
+    mapfile -t old < <(ls -1t "$BACKUP_DIR/$2".????????-?????? 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)))
+    ((${#old[@]})) && rm -f -- "${old[@]}"
+    return 0
+}
+
+INSTALLED=0; UNCHANGED=0; FAILED=0
+
+install_one() {   # install_one <src> <name>
+    local src=$1 name=$2 dest="$BIN_DIR/$2" old_v new_v label verb
+    new_v=$(get_ver "$src")
+
+    if [[ -e $dest ]]; then
+        if cmp -s -- "$src" "$dest"; then
+            note "$name: unchanged (${src##*/} is identical)"
+            ((UNCHANGED++)); return
+        fi
+        old_v=$(get_ver "$dest")
+        label="$name  ${old_v} → ${new_v}"
+        verb="replace"
+    else
+        label="$name  (new, ${new_v})"
+        verb="install"
+    fi
+
+    if ((DRY)); then
+        note "would $verb: ${src##*/} → $dest   [$label]"
+        return
+    fi
+
+    mkdir -p -- "$BIN_DIR" || { err "cannot create $BIN_DIR"; ((FAILED++)); return; }
+
+    if [[ -e $dest && $BACKUP -eq 1 ]]; then
+        backup_file "$dest" "$name" || warn "$name: backup failed, continuing"
+    fi
+
+    if ((COPY)); then cp -f -- "$src" "$dest"; else mv -f -- "$src" "$dest"; fi \
+        || { err "$name: failed to write $dest"; ((FAILED++)); return; }
+    chmod +x -- "$dest" || { err "$name: chmod +x failed"; ((FAILED++)); return; }
+
+    ok "$label   ${D}(from ${src##*/})${X}"
+    [[ $(head -c2 -- "$dest") == "#!" ]] || warn "$name: no shebang on first line"
+    ((INSTALLED++))
+}
+
+summary() {
+    local s="$INSTALLED installed/updated"
+    ((UNCHANGED)) && s+=", $UNCHANGED unchanged"
+    ((FAILED))    && s+=", $FAILED failed"
+    ((DRY))       && s+=" (dry run)"
+    printf '%s\n' "${D}$s${X}"
+}
+
+cmd_default() {
+    [[ -d $DL_DIR ]] || { err "$DL_DIR does not exist"; return 1; }
+    [[ -d $BIN_DIR ]] || { err "$BIN_DIR does not exist"; return 1; }
+    local f name src found=0
+    for f in "$BIN_DIR"/*; do
+        [[ -f $f ]] || continue
+        name=${f##*/}
+        src=$(find_match "$name")
+        [[ -n $src ]] || continue
+        found=1
+        install_one "$src" "$name"
+    done
+    if ((found)); then summary; else note "No matching files in $DL_DIR for scripts in $BIN_DIR"; fi
+    ((FAILED == 0))
+}
+
+cmd_named() {
+    local name=${1##*/} target src ext
+    [[ -d $DL_DIR ]] || { err "$DL_DIR does not exist"; return 1; }
+    target=$name
+    # "ims foo.sh": use the installed name if it exists; otherwise drop the
+    # known extension for a new install (unless --keep-ext)
+    if [[ ! -e $BIN_DIR/$target && $name == *.* ]]; then
+        ext=${name##*.}
+        if [[ ${ext,,} =~ ^($KNOWN_EXT)$ ]] && { [[ -e $BIN_DIR/${name%.*} ]] || ((!KEEP_EXT)); }; then
+            target=${name%.*}
+        fi
+    fi
+    src=$(find_match "$target")
+    if [[ -z $src && $target != "$name" ]]; then src=$(find_match "$name"); fi
+    if [[ -z $src ]]; then
+        err "No file matching '$name' found in $DL_DIR"
+        return 1
+    fi
+    install_one "$src" "$target"
+    summary
+    ((FAILED == 0))
+}
+
+cmd_list() {
+    [[ -d $BIN_DIR ]] || { err "$BIN_DIR does not exist"; return 1; }
+    local f name src n=0 flags
+    printf '%s\n' "${B}$(printf '%-30s %-10s %-11s %s' NAME VERSION MODIFIED NOTES)${X}"
+    for f in "$BIN_DIR"/*; do
+        [[ -f $f || -L $f ]] || continue
+        name=${f##*/}; flags=""
+        [[ -x $f ]] || flags+="not-executable "
+        src=$(find_match "$name")
+        if [[ -n $src ]] && ! cmp -s -- "$src" "$f"; then flags+="${Y}update in Downloads (${src##*/})${X}"; fi
+        printf '%-30s %-10s %-11s %s\n' "$name" "$(get_ver "$f")" "$(date -r "$f" +%F 2>/dev/null)" "$flags"
+        ((n++))
+    done
+    ((n)) || note "No scripts in $BIN_DIR"
+    ((n)) && printf '%s\n' "${D}$n script(s) in $BIN_DIR${X}"
+    return 0
+}
+
+cmd_restore() {
+    local name=${1:-}
+    [[ -n $name ]] || { err "restore needs a script name"; return 2; }
+    local dest="$BIN_DIR/$name" latest
+    latest=$(ls -1t "$BACKUP_DIR/$name".????????-?????? 2>/dev/null | head -n1)
+    [[ -n $latest ]] || { err "No backup found for '$name' in $BACKUP_DIR"; return 1; }
+    if ((DRY)); then note "would restore $name from ${latest##*/} (${D}$(get_ver "$latest")${X})"; return 0; fi
+    local tmp; tmp=$(mktemp) || { err "mktemp failed"; return 1; }
+    cp -p -- "$latest" "$tmp" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
+    [[ -e $dest ]] && { backup_file "$dest" "$name" || warn "could not back up current $name"; }
+    cp -p -- "$tmp" "$dest" && chmod +x -- "$dest" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
+    rm -f -- "$tmp"
+    ok "$name restored to $(get_ver "$dest") ${D}(from ${latest##*/})${X}"
+}
+
+# ---- argument parsing ----
+DRY=0; COPY=0; BACKUP=1; KEEP_EXT=0
+pos=()
+while (($#)); do
+    case $1 in
+        -h|--help)    usage; exit 0 ;;
+        -v|--version) printf '%s %s\n' "$NAME" "$VERSION"; exit 0 ;;
+        -n|--dry-run) DRY=1 ;;
+        -c|--copy)    COPY=1 ;;
+        --no-backup)  BACKUP=0 ;;
+        --keep-ext)   KEEP_EXT=1 ;;
+        --)           shift; pos+=("$@"); break ;;
+        -*)           err "Unknown option: $1 (try $NAME --help)"; exit 2 ;;
+        *)            pos+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#pos[@]} > 2)); then err "Too many arguments (try $NAME --help)"; exit 2; fi
+
+case "${pos[0]-}" in
+    "")        cmd_default ;;
+    list|ls)   cmd_list ;;
+    restore)   cmd_restore "${pos[1]-}" ;;
+    *)         ((${#pos[@]} > 1)) && { err "Too many arguments (try $NAME --help)"; exit 2; }
+               cmd_named "${pos[0]}" ;;
+esac
