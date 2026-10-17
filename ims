@@ -2,9 +2,10 @@
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
 # CHANGELOG (newest first)
+# 2.0.1 (2026-10-18): Atomic installs (safe self-update, incl. --copy/restore); tidied --help layout.
 # 2.0.0 (2026-10-18): New scripts installed by name now drop known extensions (.sh, .py ...); added --keep-ext.
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 NAME="ims"
 
 set -uo pipefail
@@ -36,31 +37,33 @@ and running chmod +x on it.
 
 Usage:
   $NAME                    Update every script in ~/.local/bin that has a
-                           matching file in ~/Downloads
+                         matching file in ~/Downloads
   $NAME <scriptname>       Only look for <scriptname> in ~/Downloads
-                           (installs it as new, without .sh/.py etc., if not installed yet)
-  $NAME list               List scripts in ~/.local/bin (version, date,
-                           and whether an update is waiting in ~/Downloads)
+                         (new scripts install without .sh/.py etc.)
+  $NAME list               List scripts in ~/.local/bin with version, date
+                         and any update waiting in ~/Downloads
   $NAME restore <name>     Roll back <name> to its latest backup
-                           (run again to toggle back)
+                         (run again to toggle back)
   $NAME -h, --help         Show this help
   $NAME -v, --version      Show version
 
 Options:
-  -n, --dry-run            Show what would happen, change nothing
-  -c, --copy               Copy instead of move (keep the file in ~/Downloads)
-      --no-backup          Don't back up the script being replaced
-      --keep-ext           When installing a NEW script by name, keep its
-                           extension (default: "ims foo.sh" installs as "foo")
+  -n, --dry-run          Show what would happen, change nothing
+  -c, --copy             Copy instead of move (keep file in ~/Downloads)
+      --no-backup        Don't back up the script being replaced
+      --keep-ext         Keep the extension when installing a NEW script
+                         by name (default: "$NAME foo.sh" installs as "foo")
 
 Matching:
-  Downloads file matches a script "foo" if it is named foo, foo.sh, foo.py ...
-  (extensions: ${KNOWN_EXT//|/, }) and may carry a browser duplicate suffix,
-  e.g. "foo (1).sh". If several match, the newest one wins.
-  Identical files are skipped. Partial downloads (.part/.crdownload) are ignored.
+  A Downloads file matches script "foo" if it is named foo, or foo.<ext>
+  where <ext> is one of: ${KNOWN_EXT//|/ }.
+  A browser duplicate suffix such as "foo (1).sh" is fine. The newest
+  match wins. Identical files are skipped; .part/.crdownload are ignored.
 
-Backups:  $BACKUP_DIR (last $KEEP_BACKUPS per script)
-Env:      IMS_BIN_DIR, IMS_DL_DIR override the default directories.
+Notes:
+  $NAME can safely update itself (installs are atomic renames).
+  Backups: $BACKUP_DIR (last $KEEP_BACKUPS per script)
+  Env:     IMS_BIN_DIR, IMS_DL_DIR override the default directories.
 EOF
 }
 
@@ -111,6 +114,19 @@ backup_file() {   # backup_file <path> <name>
     return 0
 }
 
+# atomic_put <src> <dest>: stage next to dest, chmod +x, then rename over it.
+# A running script (e.g. ims updating itself) keeps its old inode, so it is never
+# corrupted mid-run.
+atomic_put() {
+    local tmp
+    tmp=$(mktemp "$(dirname -- "$2")/.ims.XXXXXX") || return 1
+    if cp -p -- "$1" "$tmp" && chmod +x -- "$tmp" && mv -f -- "$tmp" "$2"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
 INSTALLED=0; UNCHANGED=0; FAILED=0
 
 install_one() {   # install_one <src> <name>
@@ -141,11 +157,14 @@ install_one() {   # install_one <src> <name>
         backup_file "$dest" "$name" || warn "$name: backup failed, continuing"
     fi
 
-    if ((COPY)); then cp -f -- "$src" "$dest"; else mv -f -- "$src" "$dest"; fi \
-        || { err "$name: failed to write $dest"; ((FAILED++)); return; }
-    chmod +x -- "$dest" || { err "$name: chmod +x failed"; ((FAILED++)); return; }
+    local self=0
+    [[ $dest -ef ${BASH_SOURCE[0]} ]] && self=1
+
+    atomic_put "$src" "$dest" || { err "$name: failed to write $dest"; ((FAILED++)); return; }
+    ((COPY)) || rm -f -- "$src" || warn "$name: installed, but could not remove ${src##*/}"
 
     ok "$label   ${D}(from ${src##*/})${X}"
+    ((self)) && note "$NAME updated itself; the new version applies on the next run"
     [[ $(head -c2 -- "$dest") == "#!" ]] || warn "$name: no shebang on first line"
     ((INSTALLED++))
 }
@@ -225,7 +244,7 @@ cmd_restore() {
     local tmp; tmp=$(mktemp) || { err "mktemp failed"; return 1; }
     cp -p -- "$latest" "$tmp" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
     [[ -e $dest ]] && { backup_file "$dest" "$name" || warn "could not back up current $name"; }
-    cp -p -- "$tmp" "$dest" && chmod +x -- "$dest" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
+    atomic_put "$tmp" "$dest" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
     rm -f -- "$tmp"
     ok "$name restored to $(get_ver "$dest") ${D}(from ${latest##*/})${X}"
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# syscheck v3.4-arch - reusable health report for Arch Linux + Niri (Dank Material Shell)
+# DESC: Reusable health report for Arch Linux + Niri (Dank Material Shell)
 # (made for a Dell Latitude 5400: systemd-boot + UKI + Plymouth, Btrfs + Snapper, zram,
 #  power-profiles-daemon, greetd + dms-greeter)
 #
@@ -10,8 +10,9 @@
 #   syscheck --directory DIR    same as -d DIR  (--directory=DIR also works)
 #   syscheck -s, --summary      one line per check, even for problems (shortest report)
 #   syscheck -f, --full         every detail for every check
-#                               (aliases: --detailed, --detail, --details, -v, --verbose)
+#                               (aliases: --detailed, --detail, --details, --verbose)
 #   syscheck -h, --help         show this help
+#   syscheck -v, --version      print the name and version, then exit
 #
 # Output modes:
 #   default    healthy checks get one "OK" line; checks that need attention keep their
@@ -19,17 +20,11 @@
 #   --summary  every check gets one line, problems included, with a short reason.
 #   --full     nothing is condensed.
 #
-# v3.4 changes (over v3.3):
-#   - Primary target is now Niri + Dank Material Shell (dms-greeter on greetd) instead of KDE Plasma
-#   - New section "Niri, shell and greeter": installed vs running niri, niri config validity (niri validate),
-#     DMS/quickshell running, greetd + dms-greeter wiring, portals/keyring/Xwayland packages, PipeWire user services
-#   - New checks: running kernel still installed (reboot pending after an upgrade), Plymouth hook + splash wiring,
-#     a power daemon is active (power-profiles-daemon)
-#   - Fix: checks run through sudo lost TPMFILT/KNOWN_TPM (sudo resets the environment), so the filter became an
-#     empty pattern that hid EVERY line of "Kernel errors (dmesg)": it always said "none". Now passed through sudo.
-#   - Fix: display-manager detection never reached its fallback message; generic hostnames (archlinux, arch) are no
-#     longer masked (it would have mangled "Arch Linux" and archlinux.org throughout the report)
-#   - Removed KDE-only parts (plasmashell, drkonqi filter) and Fedora leftovers (tuned)
+# NEW IN THIS VERSION (4.0.0, over 3.5.0):
+#   - BREAKING: -v now means --version (it was an alias of --full); use --verbose or -f
+#   - Header trimmed (older notes moved to the end of the file) so VERSION sits within
+#     the first 40 lines, where the shelf launcher looks for it
+#   - Added a "# DESC:" line (shown by shelf)
 #
 # Read-only: it changes nothing and installs nothing.
 # Privacy: hostname, username, real name, LAN IPs, MAC addresses, Wi-Fi/VPN
@@ -37,8 +32,13 @@
 # report is written. The unmasked data only ever exists in a private temp file
 # that is deleted when the script ends.
 
+NAME="syscheck"
+VERSION="4.0.0"
+
 usage() {
-    awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/,""); print }' "$0"
+    echo "$NAME $VERSION"
+    echo
+    awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?(DESC: *)?/,""); print }' "$0"
 }
 
 DIR=""
@@ -48,7 +48,8 @@ SUMONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)      usage; exit 0 ;;
-        -f|--full|--detailed|--detail|--details|-v|--verbose) FULL=1; shift ;;
+        -v|--version)   echo "$NAME $VERSION"; exit 0 ;;
+        -f|--full|--detailed|--detail|--details|--verbose) FULL=1; shift ;;
         -s|--summary)   SUMONLY=1; shift ;;
         -d|--directory)
             if [ -z "$2" ]; then echo "syscheck: $1 needs a folder name (try --help)" >&2; exit 2; fi
@@ -84,7 +85,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'clear_line; echo "Interrupted. Nothing was saved."; exit 130' INT TERM
 
-echo "${C_BOLD}System check (Arch + Niri)${C_OFF}  (read-only, nothing is changed)"
+echo "${C_BOLD}System check (Arch + Niri)${C_OFF} ${C_DIM}$NAME $VERSION${C_OFF}  (read-only, nothing is changed)"
 echo
 if ! grep -qiE '^(ID|ID_LIKE)=.*arch' /etc/os-release 2>/dev/null; then
     echo "${C_WARN}Note: this does not look like Arch or an Arch derivative. Package checks will fail;"
@@ -272,7 +273,7 @@ SUDO_ENV="env $(printf '%q' "TPMFILT=$TPMFILT") $(printf '%q' "KNOWN_TPM=$KNOWN_
 {
     echo "SYSTEM CHECK REPORT"
     echo "Generated: $(date)"
-    echo "Script: syscheck v3.4-arch (bash $BASH_VERSION)"
+    echo "Script: $NAME $VERSION (bash $BASH_VERSION)"
     if [ "$FULL" -eq 1 ]; then echo "Mode: FULL (every detail included)"
     elif [ "$SUMONLY" -eq 1 ]; then echo "Mode: summary only (one line per check; run without --summary for details of problems)"
     else echo "Mode: default (healthy checks are one line, problems keep full details; --summary is shorter, --full is longer)"; fi
@@ -575,3 +576,17 @@ echo
 echo "Masked: ${N_IP4} LAN IPv4, ${N_IP6} IPv6, ${N_MAC} MAC, ${N_NAME} name(s), ${N_UUID} UUID(s), ${N_SER} serial line(s)."
 echo "Quick skim before sharing is still wise: folder and file names (home folder sizes,"
 echo "journal lines) can contain personal words that no filter can recognise."
+
+# ---------- changelog (older entries; the current one is in the header) ----------
+# 3.5.0  VERSION variable + --version flag, executable file, version in report header
+# 3.4.0 (over 3.3):
+#   - Primary target is now Niri + Dank Material Shell (dms-greeter on greetd) instead of KDE Plasma
+#   - New section "Niri, shell and greeter": installed vs running niri, niri config validity (niri validate),
+#     DMS/quickshell running, greetd + dms-greeter wiring, portals/keyring/Xwayland packages, PipeWire user services
+#   - New checks: running kernel still installed (reboot pending after an upgrade), Plymouth hook + splash wiring,
+#     a power daemon is active (power-profiles-daemon)
+#   - Fix: checks run through sudo lost TPMFILT/KNOWN_TPM (sudo resets the environment), so the filter became an
+#     empty pattern that hid EVERY line of "Kernel errors (dmesg)": it always said "none". Now passed through sudo.
+#   - Fix: display-manager detection never reached its fallback message; generic hostnames (archlinux, arch) are no
+#     longer masked (it would have mangled "Arch Linux" and archlinux.org throughout the report)
+#   - Removed KDE-only parts (plasmashell, drkonqi filter) and Fedora leftovers (tuned)

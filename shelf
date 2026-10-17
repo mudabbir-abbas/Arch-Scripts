@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# DESC: Menu launcher that lists and runs the scripts in ~/.local/bin
+#
+# NEW IN THIS VERSION (3.0.0):
+#   - Menu list is now compact: just name + version (description moved out)
+#   - Source-code preview replaced by an info panel (description, path, size,
+#     and the script's header comments); hidden by default, Tab toggles it
+#   - Menu header shortened; "shelf <version>" moved to the border label
+#   - New --info NAME flag (used by the panel; prints the same info card)
+
+VERSION="3.0.0"
+NAME="shelf"
+
+DIR="${SHELF_DIR:-$HOME/.local/bin}"
+SELF_PATH="$(readlink -f "$0")"
+SELF="$(basename "$SELF_PATH")"
+
+usage() {
+    cat <<EOF
+$NAME $VERSION
+Menu launcher for the scripts in a directory (default: ~/.local/bin).
+
+Usage: $NAME [options]
+
+Options:
+  -d, --dir DIR    Scan DIR instead of ~/.local/bin (or set SHELF_DIR)
+  -l, --list       Print the script table (with descriptions) and exit
+      --info NAME  Print the info card for one script and exit
+  -h, --help       Show this help
+      --version    Show version
+
+Menu keys (fzf):
+  Enter   run script          Ctrl-A  run with arguments
+  Ctrl-H  run with --help     Ctrl-E  open in \$EDITOR
+  Tab     show/hide info      Esc     quit
+
+Metadata (read from the first lines of each script, never executed):
+  VERSION="1.2.3"             -> shown next to the name ("-" if missing)
+  # DESC: short description   -> shown in the info panel
+                                (falls back to the first plain comment line)
+EOF
+}
+
+# ---------- metadata ----------
+meta_version() {
+    sed -nE '1,40s/^[[:space:]]*(readonly[[:space:]]+)?VERSION="?([0-9]+\.[0-9]+\.[0-9]+)"?.*/\2/p' "$1" | head -n1
+}
+
+meta_desc() {
+    local d
+    d=$(sed -nE '1,20s/^#[[:space:]]*DESC:[[:space:]]*(.*)$/\1/p' "$1" | head -n1)
+    [[ -z $d ]] && d=$(sed -nE '2,12{/^#[[:space:]]*[A-Za-z]/{s/^#[[:space:]]*//p;q}}' "$1")
+    printf '%s' "$d"
+}
+
+is_script() {
+    [[ -f $1 && -x $1 && $(head -c2 "$1" 2>/dev/null) == '#!' ]]
+}
+
+# Emits: name<TAB>version<TAB>description
+build_rows() {
+    local f n v d
+    for f in "$DIR"/*; do
+        is_script "$f" || continue
+        n=$(basename "$f")
+        [[ $n == "$SELF" ]] && continue
+        v=$(meta_version "$f"); d=$(meta_desc "$f")
+        printf '%s\t%s\t%s\n' "$n" "${v:--}" "${d:--}"
+    done | sort
+}
+
+# Compact list for the menu: name + version only
+table() { build_rows | cut -f1,2 | column -t -s $'\t'; }
+
+# Info card: description, file facts, then the script's header comments
+show_info() {
+    local name=$1 f="$DIR/$1" v d hdr
+    [[ -f $f ]] || { echo "not found: $name"; return 1; }
+    v=$(meta_version "$f"); d=$(meta_desc "$f")
+    printf '%s  %s\n' "$name" "${v:--}"
+    printf '%s\n\n' "${d:--}"
+    printf 'path    %s\n' "$f"
+    printf 'lines   %s\n' "$(wc -l <"$f")"
+    printf 'edited  %s\n' "$(date -r "$f" '+%Y-%m-%d %H:%M')"
+    hdr=$(awk 'NR>1 && NR<=60 {
+            if ($0 ~ /^#[ \t]*DESC:/) next
+            if ($0 ~ /^#/) { sub(/^#[ \t]?/, ""); print; seen=1 }
+            else if ($0 ~ /^[ \t]*$/) { if (seen) print "" }
+            else exit
+        }' "$f" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+    # drop the first header line if it is just the description again
+    [[ ${hdr%%$'\n'*} == "$d" ]] && hdr=$(sed '1d' <<<"$hdr" | sed '/./,$!d')
+    [[ -n $hdr ]] && printf '\n%s\n' "$hdr"
+    return 0
+}
+
+# ---------- running ----------
+run_script() {
+    local name=$1; shift
+    clear
+    printf '── %s %s ──\n\n' "$name" "$*"
+    "$DIR/$name" "$@"
+    local rc=$?
+    printf '\n[exit %d] Press Enter to return…' "$rc"
+    read -r _
+}
+
+menu_fzf() {
+    local out key sel args
+    export SHELF_DIR="$DIR"
+    while true; do
+        out=$(table | fzf --height=100% --reverse --border --info=hidden \
+            --border-label=" $NAME $VERSION " \
+            --header="Enter run · ^A args · ^H help · ^E edit · Tab info" \
+            --expect=ctrl-a,ctrl-h,ctrl-e \
+            --bind=tab:toggle-preview \
+            --preview="'$SELF_PATH' --info {1}" \
+            --preview-window=right:55%:wrap:hidden) || return 0
+        key=$(sed -n 1p <<<"$out")
+        sel=$(sed -n 2p <<<"$out" | awk '{print $1}')
+        [[ -z $sel ]] && continue
+        case $key in
+            ctrl-h) run_script "$sel" --help ;;
+            ctrl-e) "${EDITOR:-nano}" "$DIR/$sel" ;;
+            ctrl-a)
+                read -e -r -p "Args for $sel: " -a args
+                run_script "$sel" "${args[@]}" ;;
+            *) run_script "$sel" ;;
+        esac
+    done
+}
+
+menu_select() {
+    local -a names
+    mapfile -t names < <(build_rows | cut -f1)
+    ((${#names[@]})) || { echo "No scripts found in $DIR"; return 1; }
+    echo "$NAME $VERSION (install fzf for a better menu)"
+    PS3="Run which? (Ctrl-D to quit) "
+    select n in "${names[@]}"; do
+        [[ -n $n ]] && run_script "$n"
+    done
+}
+
+# ---------- main ----------
+LIST=0
+INFO_NAME=""
+while (($#)); do
+    case $1 in
+        --version)  echo "$NAME $VERSION"; exit 0 ;;
+        -h|--help)  usage; exit 0 ;;
+        -l|--list)  LIST=1 ;;
+        --info)     shift; INFO_NAME="${1:?--info needs a script name}" ;;
+        -d|--dir)   shift; DIR="${1:?--dir needs a path}" ;;
+        *)          echo "$NAME: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+[[ -d $DIR ]] || { echo "$NAME: directory not found: $DIR" >&2; exit 1; }
+
+if [[ -n $INFO_NAME ]]; then show_info "$INFO_NAME"; exit $?; fi
+
+if ((LIST)); then
+    { printf 'NAME\tVERSION\tDESCRIPTION\n'; build_rows; } | column -t -s $'\t'
+    exit 0
+fi
+
+if command -v fzf >/dev/null 2>&1; then menu_fzf; else menu_select; fi
