@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # binvc v1.0.1 - friendly git helper for the ~/.local/bin scripts repo
+#   1.0.2  accept -V as well as -v for the version
 #   1.0.1  push/sync now report failures instead of printing "Pushed." anyway
 #   1.0.0  first release
-VERSION="1.0.1"
+VERSION="1.0.2"
 REPO="${BINVC_REPO:-$HOME/.local/bin}"
 
 if [ -t 1 ]; then
@@ -263,7 +264,7 @@ main() {
     scan)              cmd_scan ;;
     ignore)            cmd_ignore ;;
     where)             cmd_where ;;
-    version|-v|--version) echo "binvc v$VERSION" ;;
+    version|-V|-v|--version) echo "binvc v$VERSION" ;;
     help|-h|--help)    usage ;;
     *) warn "unknown command: $cmd"; usage; exit 1 ;;
   esac
