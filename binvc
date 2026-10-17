@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# binvc v1.0.0 - friendly git helper for the ~/.local/bin scripts repo
-VERSION="1.0.0"
+# binvc v1.0.1 - friendly git helper for the ~/.local/bin scripts repo
+#   1.0.1  push/sync now report failures instead of printing "Pushed." anyway
+#   1.0.0  first release
+VERSION="1.0.1"
 REPO="${BINVC_REPO:-$HOME/.local/bin}"
 
 if [ -t 1 ]; then
@@ -75,8 +77,10 @@ cmd_commit() {
 
 cmd_push() {
   has_remote || die "no remote configured (GitHub link missing)"
-  if has_upstream; then git push; else git push -u origin HEAD; fi
-  git push --tags -q 2>/dev/null || true
+  if has_upstream; then git push || { warn "push failed, nothing was uploaded"; return 1; }
+  else git push -u origin HEAD || { warn "push failed, nothing was uploaded"; return 1; }
+  fi
+  git push --tags -q || { warn "pushing tags failed"; return 1; }
   info "Pushed."
 }
 
@@ -88,7 +92,9 @@ cmd_pull() {
 cmd_sync() {
   cmd_commit "$@" || return 1
   if has_remote; then
-    has_upstream && git pull --rebase --autostash
+    if has_upstream; then
+      git pull --rebase --autostash || { warn "pull failed, not pushing"; return 1; }
+    fi
     cmd_push
   else
     warn "no remote, committed locally only"
