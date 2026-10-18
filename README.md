@@ -1,6 +1,6 @@
 # Arch-Scripts
 
-Personal scripts from `~/.local/bin` on Arch Linux.
+Personal utility scripts from `~/.local/bin` on Arch Linux.
 
 - `appimgr`: AppImage manager
 - `fbackup`: backup script
