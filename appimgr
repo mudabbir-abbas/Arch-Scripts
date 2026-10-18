@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# appimgr - minimal AppImage -> app launcher integration
-VERSION="2.0.0"
+# appimgr - minimal AppImage -> app launcher integration (Gearlever-style, terminal only)
+VERSION="2.1.0"
 #
-# NEW IN THIS VERSION (2.0.0):
-#   - Running 'appimgr' with no arguments on a terminal now opens an interactive
-#     menu (add, list, run, check/update, rollback, set source, remove) instead of
-#     printing help. It also finds .AppImage files in ~/Downloads, ~/Desktop and
-#     the current directory so they can be integrated by picking a number.
-#   - Without a terminal (pipe/cron), no arguments prints the app list instead.
-#   - '--version' now prints "appimgr 2.0.0" (no "v" prefix); same in --help header.
-#   - Help is still available: appimgr -h | --help | help (or 'h' in the menu).
+# NEW IN THIS VERSION (2.1.0):
+#   - Custom icons: 'add --icon FILE' (PNG or SVG) overrides the AppImage's icon.
+#   - If an AppImage has no icon at all, add asks for one (once; Enter = generic).
+#   - New 'appimgr icon <slug> [FILE|--reset]' shows/changes the icon of an
+#     installed app; --reset goes back to the icon inside the AppImage.
+#   - A custom icon is remembered and survives 'update'.
+#   - Menu: new option 9 (change icon).
 
 set -euo pipefail
 
@@ -49,6 +48,7 @@ Usage:
   appimgr update --all [--check] [-y]      Same, for every app that has a source
   appimgr update <slug> <file> [options]   Replace with a local file instead
   appimgr rollback <slug>                  Swap back to the previous version
+  appimgr icon <slug> [<file>|--reset]     Show / change the icon (PNG or SVG)
   appimgr source [<slug> [set ...|clear]]  Show/set/clear the update source (no args = how-to)
   appimgr run <slug> [-d] [args...]        Launch from the terminal (-d = detached)
   appimgr list [-l]                        List integrated AppImages (-l = details)
@@ -59,6 +59,8 @@ Usage:
 Options for add / update <slug> <file>:
   -n, --name "Name"     Override the display name
   -a, --args "ARGS"     Extra args added to Exec (e.g. "--no-sandbox")
+  -i, --icon FILE       Use this PNG/SVG as the icon (remembered across updates).
+                        Only needed to override; if the AppImage has no icon you are asked.
       --no-fuse         Force extract-and-run mode (APPIMAGE_EXTRACT_AND_RUN=1).
                         Without it, FUSE is checked and this is enabled automatically if needed.
       --no-move         Keep the original file (default: it is deleted after success)
@@ -132,6 +134,7 @@ saved_opts() { # <slug> -> fills SAVED with the options used at install time
   v=$(meta_get "$1" name);   if [[ -n $v ]]; then SAVED+=(--name "$v"); fi
   v=$(meta_get "$1" args);   if [[ -n $v ]]; then SAVED+=(--args "$v"); fi
   v=$(meta_get "$1" nofuse); if [[ $v == 1 ]]; then SAVED+=(--no-fuse); fi
+  v=$(meta_get "$1" icon);   if [[ -n $v && -f $v ]]; then SAVED+=(--icon "$v"); fi
 }
 
 desktop_path() { grep -m1 '^X-AppImage-Path=' "$1" | cut -d= -f2- || true; }
@@ -369,13 +372,55 @@ download() { # <url> <outfile>   (sets DL_ETAG)
   rm -f -- "$hdr"
 }
 
+# ---------- custom icons ----------
+icon_ext() { # <file> -> png|svg, or return 1 if the type is not usable in a launcher
+  local m
+  m=$(file -b --mime-type -- "$1" 2>/dev/null || echo unknown)
+  case $m in
+    image/png)     echo png ;;
+    image/svg+xml) echo svg ;;
+    *) if [[ ${1,,} == *.svg ]] && grep -qa '<svg' "$1"; then echo svg; else return 1; fi ;;
+  esac
+}
+
+set_desktop_icon() { # <desktop file> <icon path or name>
+  local t has=0
+  if grep -q '^Icon=' "$1"; then has=1; fi
+  t=$(mktemp "$DESKTOP_DIR/.tmp.XXXXXX")
+  IC="$2" HAS="$has" awk '
+    /^Icon=/ { print "Icon=" ENVIRON["IC"]; next }
+    { print }
+    /^\[Desktop Entry\]/ && !h { h=1; if (ENVIRON["HAS"] == "0") print "Icon=" ENVIRON["IC"] }
+  ' "$1" > "$t"
+  chmod 644 "$t"; mv -f -- "$t" "$1"
+}
+
+embedded_icon() { # <appimage> <workdir> -> prints the path of the icon inside it ('' if none)
+  local f=$1 w=$2 root=$2/squashfs-root d n="" c p
+  (cd "$w" && "$f" --appimage-extract '*.desktop' >/dev/null 2>&1) || true
+  d=$(find "$root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -n1 || true)
+  if [[ -n $d ]]; then n=$(grep -m1 '^Icon=' "$d" 2>/dev/null | cut -d= -f2- || true); fi
+  for p in '.DirIcon' "$n.svg" "$n.png" 'usr/share/icons/*'; do
+    (cd "$w" && "$f" --appimage-extract "$p" >/dev/null 2>&1) || true
+  done
+  c=$(find_icon "$root" "$n")
+  if [[ -z $c ]]; then
+    (cd "$w" && "$f" --appimage-extract >/dev/null 2>&1) || true
+    d=$(find "$root" -maxdepth 1 -name '*.desktop' 2>/dev/null | head -n1 || true)
+    if [[ -n $d ]]; then n=$(grep -m1 '^Icon=' "$d" 2>/dev/null | cut -d= -f2- || true); fi
+    c=$(find_icon "$root" "$n")
+  fi
+  printf '%s' "$c"
+}
+
 # ---------- add ----------
 cmd_add() {
-  local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force=""
+  local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force="" icon_arg="" asked=0
   while (($#)); do
     case $1 in
       -n|--name)  name=${2:?missing value for $1}; shift 2 ;;
       -a|--args)  extra=${2:?missing value for $1}; shift 2 ;;
+      -i|--icon)  icon_arg=${2:?missing value for $1}; shift 2 ;;
       --slug)     slug_force=${2:?}; shift 2 ;;
       --move)     move=1; shift ;;
       --no-move)  move=0; shift ;;
@@ -387,6 +432,10 @@ cmd_add() {
   [[ -n $src ]] || { usage; exit 1; }
   [[ -f $src ]] || die "file not found: $src"
   [[ $(head -c4 "$src" | tail -c3) == ELF ]] || die "not an ELF/AppImage file: $src"
+  if [[ -n $icon_arg ]]; then
+    [[ -f $icon_arg ]] || die "icon file not found: $icon_arg"
+    icon_ext "$icon_arg" >/dev/null || die "icon must be a PNG or SVG file: $icon_arg"
+  fi
 
   mkdir -p "$APPS_DIR" "$ICONS_DIR" "$DESKTOP_DIR"
   TMP_DIR=$(mktemp -d)
@@ -449,6 +498,23 @@ cmd_add() {
   slug="${slug_force:-$(slugify "$display")}"
   [[ -n $slug ]] || slug="app"
   dest="$APPS_DIR/$slug.AppImage"
+
+  # --- custom icon: --icon always wins; we only ask when the AppImage has none ---
+  local custom_icon="" cext=""
+  if [[ -z $icon_arg && -z $icon_src && -t 0 && -z $(meta_get "$slug" iconasked) ]]; then
+    asked=1; REPLY=""
+    ask "   No icon found in this AppImage. Path to a PNG/SVG icon (Enter = generic icon): " || true
+    if [[ -n $REPLY ]]; then
+      icon_arg=$(clean_path "$REPLY")
+      if [[ ! -f $icon_arg ]] || ! icon_ext "$icon_arg" >/dev/null; then
+        warn "not a usable PNG/SVG file: $icon_arg - using generic icon"; icon_arg=""
+      fi
+    fi
+  fi
+  if [[ -n $icon_arg ]]; then
+    cext=$(icon_ext "$icon_arg")
+    cp -- "$icon_arg" "$tmp/custom.$cext"; custom_icon="$tmp/custom.$cext"
+  fi
   local src_real dest_real
   src_real=$(readlink -f -- "$src"); dest_real="$(readlink -f -- "$APPS_DIR")/$slug.AppImage"
   if [[ -e $dest ]]; then
@@ -461,7 +527,13 @@ cmd_add() {
   # --- icon (stored next to the AppImages, referenced by absolute path) ---
   local icon_id="application-x-executable"
   find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
-  if [[ -n $icon_src ]]; then
+  rm -f -- "$ICONS_DIR/custom/$slug".*
+  if [[ -n $custom_icon ]]; then
+    mkdir -p "$ICONS_DIR/custom"
+    icon_id="$ICONS_DIR/custom/$slug.$cext"
+    install -m644 "$custom_icon" "$icon_id"
+    info "using custom icon"
+  elif [[ -n $icon_src ]]; then
     local mime ext=""
     mime=$(file -b --mime-type "$icon_src" 2>/dev/null || echo unknown)
     case $mime in
@@ -473,8 +545,8 @@ cmd_add() {
       install -m644 "$icon_src" "$ICONS_DIR/$slug.$ext"
       icon_id="$ICONS_DIR/$slug.$ext"
     fi
-  else
-    info "no icon found in AppImage, using generic icon"
+  elif (( ! asked )); then
+    info "no icon found in AppImage, using generic icon (set one: appimgr icon $slug FILE)"
   fi
 
   # --- desktop entry ---
@@ -526,6 +598,8 @@ EOF
   meta_set "$slug" args "$extra"
   if (( forced )); then meta_set "$slug" nofuse 1; else meta_set "$slug" nofuse ""; fi
   meta_set "$slug" installed "$(date +%F)"
+  meta_set "$slug" icon "${custom_icon:+$icon_id}"
+  if (( asked )); then meta_set "$slug" iconasked 1; fi
   meta_set "$slug" version ""
   meta_set "$slug" etag ""
 
@@ -592,7 +666,7 @@ cmd_update() {
       --all)      all=1; shift ;;
       --check)    check=1; shift ;;
       -y|--yes)   yes=1; shift ;;
-      -n|--name|-a|--args) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
+      -n|--name|-a|--args|-i|--icon) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
       --no-fuse|--no-move|--move) pass+=("$1"); shift ;;
       -*)         die "unknown option: $1" ;;
       *)
@@ -762,6 +836,7 @@ cmd_remove() {
   fi
   rm -f -- "$df" "$BACKUP_DIR/$slug.AppImage" "$META_DIR/$slug.conf"
   find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+  rm -f -- "$ICONS_DIR/custom/$slug".*
   refresh
   info "removed: $slug"
   if [[ -n $trashed ]]; then info "AppImage moved to Trash as '$trashed' (restore it from your file manager)"; fi
@@ -808,6 +883,49 @@ cmd_list() {
     n=$((n+1))
   done
   if (( n == 0 )); then echo "No integrated AppImages."; fi
+}
+
+# ---------- icon ----------
+cmd_icon() {
+  local slug=${1:-} arg=${2:-} df cur kind path icon ext
+  [[ -n $slug ]] || { usage; exit 1; }
+  df="$DESKTOP_DIR/appimage-$slug.desktop"
+  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+  case $arg in
+    "")
+      cur=$(grep -m1 '^Icon=' "$df" | cut -d= -f2- || true)
+      if [[ -n $(meta_get "$slug" icon) ]]; then kind="custom"
+      elif [[ $cur == /* ]]; then kind="from the AppImage"
+      else kind="generic"; fi
+      echo "$slug: ${cur:-none}  ($kind)"
+      echo "change: appimgr icon $slug FILE.png|svg     undo: appimgr icon $slug --reset" ;;
+    --reset)
+      path=$(desktop_path "$df")
+      [[ -f $path ]] || die "AppImage binary missing: $path"
+      TMP_DIR=$(mktemp -d)
+      icon=$(embedded_icon "$path" "$TMP_DIR")
+      [[ -n $icon ]] || die "no icon found inside this AppImage (nothing changed)"
+      ext=$(icon_ext "$icon") || die "the icon inside the AppImage is not PNG/SVG (nothing changed)"
+      find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+      rm -f -- "$ICONS_DIR/custom/$slug".*
+      install -m644 "$icon" "$ICONS_DIR/$slug.$ext"
+      set_desktop_icon "$df" "$ICONS_DIR/$slug.$ext"
+      meta_set "$slug" icon ""
+      refresh; info "$slug: back to the icon inside the AppImage" ;;
+    -*) die "unknown option: $arg" ;;
+    *)
+      [[ -f $arg ]] || die "file not found: $arg"
+      ext=$(icon_ext "$arg") || die "icon must be a PNG or SVG file: $arg"
+      TMP_DIR=$(mktemp -d)
+      cp -- "$arg" "$TMP_DIR/new.$ext"
+      mkdir -p "$ICONS_DIR/custom"
+      find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+      rm -f -- "$ICONS_DIR/custom/$slug".*
+      install -m644 "$TMP_DIR/new.$ext" "$ICONS_DIR/custom/$slug.$ext"
+      set_desktop_icon "$df" "$ICONS_DIR/custom/$slug.$ext"
+      meta_set "$slug" icon "$ICONS_DIR/custom/$slug.$ext"
+      refresh; info "$slug: custom icon set (kept across updates)" ;;
+  esac
 }
 
 # ---------- interactive menu (no arguments, on a terminal) ----------
@@ -936,6 +1054,19 @@ menu_source() {
   esac
 }
 
+menu_icon() {
+  local slug
+  pick_app "Change icon of which app" || return 0
+  slug=$PICKED
+  run_self icon "$slug"
+  ask "   New icon (PNG/SVG path), [r]eset to the AppImage's own, Enter = keep: " || return 0
+  case $REPLY in
+    "") ;;
+    r|R) run_self icon "$slug" --reset ;;
+    *)   run_self icon "$slug" "$(clean_path "$REPLY")" ;;
+  esac
+}
+
 cmd_menu() {
   local first=1
   while true; do
@@ -959,6 +1090,7 @@ cmd_menu() {
   6) Roll back to previous version
   7) Set update source
   8) Remove an app
+  9) Change an app's icon
   h) Full help        q) Quit (or Enter)
 EOF
     ask "Choose: " || break
@@ -971,6 +1103,7 @@ EOF
       6|rollback)    if pick_app "Roll back which app"; then run_self rollback "$PICKED"; fi ;;
       7|s|source)    menu_source ;;
       8|rm|remove)   if pick_app "Remove which app"; then run_self remove "$PICKED"; fi ;;
+      9|i|icon)      menu_icon ;;
       h|help|'?')    usage ;;
       q|Q|quit|exit|"") break ;;
       *)             warn "unknown choice: $REPLY" ;;
@@ -982,6 +1115,7 @@ case "${1:-}" in
   add)               shift; cmd_add "$@" ;;
   update)            shift; cmd_update "$@" ;;
   rollback)          shift; cmd_rollback "$@" ;;
+  icon)              shift; cmd_icon "$@" ;;
   source)            shift; cmd_source "$@" ;;
   run)               shift; cmd_run "$@" ;;
   remove|rm)         shift; cmd_remove "$@" ;;
