@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# binvc v1.1.0 - friendly git helper for the ~/.local/bin scripts repo
-#   1.1.0  status now contacts GitHub (network) and recommends commit/push/pull/sync;
-#          status -n skips the network; new "incoming" command shows what GitHub has that you don't
-#   1.0.2  accept -V as well as -v for the version
-#   1.0.1  push/sync now report failures instead of printing "Pushed." anyway
-#   1.0.0  first release
-VERSION="1.1.0"
+# binvc - friendly git helper for the ~/.local/bin scripts repo
+#
+# NEW IN THIS VERSION (2.0.0):
+#   - BREAKING: --version now prints "binvc 2.0.0" (was "binvc v1.1.x");
+#     --help and the menu title use the same "binvc <version>" style
+#   - push/sync only say "Pushed." when something was really uploaded,
+#     otherwise "Nothing to push" (fixes a misleading message)
+#   - -V now works as well as -v (it was documented before but missing)
+#   - this header now lists only the current version's changes
+#     (older history lives in git log / tags)
+VERSION="2.0.0"
 REPO="${BINVC_REPO:-$HOME/.local/bin}"
 
 if [ -t 1 ]; then
@@ -142,13 +146,24 @@ cmd_commit() {
   git commit -q -m "$msg" && info "Committed: $msg"
 }
 
+# Run "git push" and set PUSHED_ANY=1 if at least one ref/tag was really updated.
+# --porcelain output is locale independent: a leading "=" means already up to date.
+push_run() {
+  local out rc=0
+  out=$(git push --porcelain "$@") || rc=$?
+  if printf '%s\n' "$out" | grep -qE $'^[ +*-]\t'; then PUSHED_ANY=1; fi
+  return $rc
+}
+
 cmd_push() {
   has_remote || die "no remote configured (GitHub link missing)"
-  if has_upstream; then git push || { warn "push failed, nothing was uploaded"; return 1; }
-  else git push -u origin HEAD || { warn "push failed, nothing was uploaded"; return 1; }
+  PUSHED_ANY=0
+  if has_upstream; then push_run || { warn "push failed, nothing was uploaded"; return 1; }
+  else push_run -u origin HEAD || { warn "push failed, nothing was uploaded"; return 1; }
   fi
-  git push --tags -q || { warn "pushing tags failed"; return 1; }
-  info "Pushed."
+  push_run --tags || { warn "pushing tags failed"; return 1; }
+  if [ "$PUSHED_ANY" = 1 ]; then info "Pushed."
+  else info "Nothing to push, GitHub already has everything."; fi
 }
 
 cmd_pull() {
@@ -249,7 +264,7 @@ cmd_where() {
 
 usage() {
   cat <<EOF
-${B}binvc v$VERSION${N} - git helper for $REPO
+${B}binvc $VERSION${N} - git helper for $REPO
 
 Run with no arguments for an interactive menu.
 
@@ -280,7 +295,7 @@ menu() {
   local c
   while true; do
     echo
-    echo "${B}binvc v$VERSION${N}  ($REPO)"
+    echo "${B}binvc $VERSION${N}  ($REPO)"
     cat <<'EOF'
   1) Status           7) Restore a file
   2) Show changes     8) Get older version of a file
@@ -335,7 +350,7 @@ main() {
     scan)              cmd_scan ;;
     ignore)            cmd_ignore ;;
     where)             cmd_where ;;
-    version|-v|--version) echo "binvc v$VERSION" ;;
+    version|-v|-V|--version) echo "binvc $VERSION" ;;
     help|-h|--help)    usage ;;
     *) warn "unknown command: $cmd"; usage; exit 1 ;;
   esac
