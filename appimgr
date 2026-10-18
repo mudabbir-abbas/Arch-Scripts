@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# appimgr - minimal AppImage -> app launcher integration (Gearlever-style, terminal only)
+# appimgr - minimal AppImage -> app launcher integration
 VERSION="2.1.1"
 #
 # NEW IN THIS VERSION (2.1.1):
