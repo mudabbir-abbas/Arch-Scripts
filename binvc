@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# binvc v1.0.2 - friendly git helper for the ~/.local/bin scripts repo
+# binvc v1.1.0 - friendly git helper for the ~/.local/bin scripts repo
+#   1.1.0  status now contacts GitHub (network) and recommends commit/push/pull/sync;
+#          status -n skips the network; new "incoming" command shows what GitHub has that you don't
 #   1.0.2  accept -V as well as -v for the version
 #   1.0.1  push/sync now report failures instead of printing "Pushed." anyway
 #   1.0.0  first release
-VERSION="1.0.2"
+VERSION="1.1.0"
 REPO="${BINVC_REPO:-$HOME/.local/bin}"
 
 if [ -t 1 ]; then
@@ -44,11 +46,75 @@ check_exec() {
 
 # ---------- commands ----------
 
+# Contact GitHub and download its news (changes none of your files).
+fetch_remote() {
+  has_remote || return 1
+  info "Contacting GitHub (needs network)..."
+  if timeout 20 git fetch -q; then return 0; fi
+  warn "could not reach GitHub (offline or ssh problem). Showing the last known state."
+  return 1
+}
+
+# recommend <online 0|1> <dirty 0|1> <ahead> <behind|-1 if unknown>
+recommend() {
+  local online=$1 dirty=$2 ahead=$3 behind=$4 rec why
+  if ! has_remote; then
+    if [ "$dirty" = 1 ]; then rec='binvc commit "message"'; why="no GitHub link, so changes can only be saved locally"
+    else rec="nothing to do"; why="everything is committed locally"; fi
+  elif ! has_upstream; then
+    if [ "$dirty" = 1 ]; then rec='binvc sync "message"'; why="commit your edits and upload them (sets up the GitHub link)"
+    else rec="binvc push"; why="branch is not uploaded to GitHub yet"; fi
+  elif [ "$online" = 0 ]; then
+    if [ "$dirty" = 1 ]; then rec='binvc commit "message"'; why="offline: save locally now, run sync once you are online"
+    elif [ "$ahead" -gt 0 ]; then rec="binvc push (when online)"; why="$ahead commit(s) not uploaded yet"
+    else rec="nothing needed"; why="clean, but GitHub could not be checked"; fi
+  elif [ "$dirty" = 1 ]; then
+    rec='binvc sync "message"'
+    if [ "$behind" -gt 0 ]; then why="commits your edits, brings in $behind newer commit(s) from GitHub, then uploads"
+    else why="commits your edits and uploads them"; fi
+  elif [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+    rec="binvc sync"; why="you are $ahead ahead and $behind behind: pull then push"
+  elif [ "$ahead" -gt 0 ]; then
+    rec="binvc push"; why="$ahead commit(s) are only on this laptop"
+  elif [ "$behind" -gt 0 ]; then
+    rec="binvc pull"; why="GitHub has $behind newer commit(s) (see them with: binvc incoming)"
+  else
+    rec="nothing to do"; why="laptop and GitHub are identical"
+  fi
+  printf '%sSuggested:%s %s  (%s)\n' "$B" "$N" "$rec" "$why"
+}
+
 cmd_status() {
+  local online=0 dirty=0 ahead=0 behind=-1
+  if [ "${1:-}" != "-n" ] && [ "${1:-}" != "--offline" ]; then
+    fetch_remote && online=1
+  else
+    info "Offline mode: not contacting GitHub (information may be outdated)."
+  fi
   info "Branch and changes"
   git status -sb
-  has_changes || info "Working folder is clean."
+  has_changes && dirty=1 || info "Working folder is clean."
+  if has_upstream; then
+    read -r ahead behind < <(git rev-list --left-right --count 'HEAD...@{u}')
+  fi
   check_exec
+  echo
+  recommend "$online" "$dirty" "$ahead" "$behind"
+}
+
+cmd_incoming() {
+  has_remote || die "no remote configured"
+  fetch_remote || warn "showing what was known at the last successful contact"
+  has_upstream || die "this branch is not linked to GitHub yet (run: binvc push)"
+  if [ "$(git rev-list --count 'HEAD..@{u}')" = 0 ]; then
+    info "GitHub has nothing new for you."
+    return 0
+  fi
+  info "Commits on GitHub that you don't have:"
+  git log --oneline 'HEAD..@{u}'
+  info "What they change:"
+  git diff 'HEAD...@{u}'
+  info "Apply them with: binvc pull"
 }
 
 cmd_diff() {
@@ -187,8 +253,10 @@ ${B}binvc v$VERSION${N} - git helper for $REPO
 
 Run with no arguments for an interactive menu.
 
-  status               what changed, and any script missing chmod +x
-  diff [file]          show new files and edits since last commit
+  status [-n]          checks GitHub (needs network), shows what changed and
+                       suggests the best next command. -n = skip the network
+  incoming             show what is on GitHub that you don't have yet (needs network)
+  diff [file]          show new files and edits since last commit (local only)
   commit ["message"]   stage everything and commit (asks if no message)
   push                 upload commits (and tags) to GitHub
   pull                 download changes from GitHub
@@ -220,6 +288,7 @@ menu() {
   4) Push            10) Tag a version
   5) Sync (all-in-1) 11) Scan for secrets
   6) Log             12) Create .gitignore
+ 13) What's new on GitHub
   q) Quit
 EOF
     read -r -p "Choose: " c || break
@@ -237,6 +306,7 @@ EOF
       10) cmd_tag ;;
       11) cmd_scan ;;
       12) cmd_ignore ;;
+      13) cmd_incoming ;;
       q|Q) break ;;
       *) warn "unknown choice" ;;
     esac
@@ -248,7 +318,8 @@ main() {
   [ $# -gt 0 ] && shift
   case "$cmd" in
     "")                menu ;;
-    status|st|s)       cmd_status ;;
+    status|st|s)       cmd_status "$@" ;;
+    incoming|in)       cmd_incoming ;;
     diff|d)            cmd_diff "$@" ;;
     commit|c)          cmd_commit "$@" ;;
     push|p)            cmd_push ;;
@@ -264,7 +335,7 @@ main() {
     scan)              cmd_scan ;;
     ignore)            cmd_ignore ;;
     where)             cmd_where ;;
-    version|-V|-v|--version) echo "binvc v$VERSION" ;;
+    version|-v|--version) echo "binvc v$VERSION" ;;
     help|-h|--help)    usage ;;
     *) warn "unknown command: $cmd"; usage; exit 1 ;;
   esac
