@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # appimgr - minimal AppImage -> app launcher integration (Gearlever-style, terminal only)
-VERSION="2.1.0"
+VERSION="2.1.1"
 #
-# NEW IN THIS VERSION (2.1.0):
-#   - Custom icons: 'add --icon FILE' (PNG or SVG) overrides the AppImage's icon.
-#   - If an AppImage has no icon at all, add asks for one (once; Enter = generic).
-#   - New 'appimgr icon <slug> [FILE|--reset]' shows/changes the icon of an
-#     installed app; --reset goes back to the icon inside the AppImage.
-#   - A custom icon is remembered and survives 'update'.
-#   - Menu: new option 9 (change icon).
+# NEW IN THIS VERSION (2.1.1):
+#   - Fix: changing an icon only touches Icon= in the main [Desktop Entry] section;
+#     Icon= lines of [Desktop Action ...] sections are left alone (also on 'add').
+#   - If the main section has no Icon= line, one is added there.
+#   - 'icon --reset' now says whether extraction itself failed or just no icon exists.
+#   - Clearer wording: icon files are only checked for type, not fully validated.
 
 set -euo pipefail
 
@@ -383,14 +382,17 @@ icon_ext() { # <file> -> png|svg, or return 1 if the type is not usable in a lau
   esac
 }
 
-set_desktop_icon() { # <desktop file> <icon path or name>
-  local t has=0
-  if grep -q '^Icon=' "$1"; then has=1; fi
+set_desktop_icon() { # <desktop file> <icon path or name>; touches only [Desktop Entry]
+  local t
   t=$(mktemp "$DESKTOP_DIR/.tmp.XXXXXX")
-  IC="$2" HAS="$has" awk '
-    /^Icon=/ { print "Icon=" ENVIRON["IC"]; next }
-    { print }
-    /^\[Desktop Entry\]/ && !h { h=1; if (ENVIRON["HAS"] == "0") print "Icon=" ENVIRON["IC"] }
+  IC="$2" awk '
+    function flush() { if (main && !done) { print "Icon=" ENVIRON["IC"]; done=1 } }
+    function out(l)  { printf "%s", pend; pend=""; print l }
+    /^[ \t]*$/ { pend = pend $0 "\n"; next }          # hold blank lines so a new Icon= lands before them
+    /^\[/ { flush(); main = ($0 == "[Desktop Entry]" && !seen); if (main) seen=1 }
+    main && /^Icon=/ { if (!done) { out("Icon=" ENVIRON["IC"]); done=1 } ; next }
+    { out($0) }
+    END { flush(); printf "%s", pend }
   ' "$1" > "$t"
   chmod 644 "$t"; mv -f -- "$t" "$1"
 }
@@ -434,7 +436,7 @@ cmd_add() {
   [[ $(head -c4 "$src" | tail -c3) == ELF ]] || die "not an ELF/AppImage file: $src"
   if [[ -n $icon_arg ]]; then
     [[ -f $icon_arg ]] || die "icon file not found: $icon_arg"
-    icon_ext "$icon_arg" >/dev/null || die "icon must be a PNG or SVG file: $icon_arg"
+    icon_ext "$icon_arg" >/dev/null || die "icon does not look like a PNG or SVG file: $icon_arg"
   fi
 
   mkdir -p "$APPS_DIR" "$ICONS_DIR" "$DESKTOP_DIR"
@@ -563,7 +565,7 @@ cmd_add() {
       /^\[/ && !/^\[Desktop Entry\]/ { main=0 }
       /^(TryExec|X-AppImage-Integrate|X-AppImage-Managed|X-AppImage-Path)=/ { next }
       /^Name=/ && nm != "" && main { print "Name=" nm; next }
-      /^Icon=/ { print "Icon=" icon; next }
+      /^Icon=/ && main { print "Icon=" icon; next }
       /^Exec=/ {
         rest=$0; sub(/^Exec=[ \t]*/, "", rest)
         if (rest ~ /^"/) sub(/^"[^"]*"[ \t]*/, "", rest); else sub(/^[^ \t]+[ \t]*/, "", rest)
@@ -904,7 +906,10 @@ cmd_icon() {
       [[ -f $path ]] || die "AppImage binary missing: $path"
       TMP_DIR=$(mktemp -d)
       icon=$(embedded_icon "$path" "$TMP_DIR")
-      [[ -n $icon ]] || die "no icon found inside this AppImage (nothing changed)"
+      if [[ -z $icon ]]; then
+        if [[ -d $TMP_DIR/squashfs-root ]]; then die "no icon found inside this AppImage (nothing changed)"
+        else die "could not extract the AppImage - is it runnable? (nothing changed)"; fi
+      fi
       ext=$(icon_ext "$icon") || die "the icon inside the AppImage is not PNG/SVG (nothing changed)"
       find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
       rm -f -- "$ICONS_DIR/custom/$slug".*
@@ -915,7 +920,7 @@ cmd_icon() {
     -*) die "unknown option: $arg" ;;
     *)
       [[ -f $arg ]] || die "file not found: $arg"
-      ext=$(icon_ext "$arg") || die "icon must be a PNG or SVG file: $arg"
+      ext=$(icon_ext "$arg") || die "icon does not look like a PNG or SVG file: $arg"
       TMP_DIR=$(mktemp -d)
       cp -- "$arg" "$TMP_DIR/new.$ext"
       mkdir -p "$ICONS_DIR/custom"
