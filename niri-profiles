@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+# niri-profiles: save and restore workspace layouts ("profiles") in Niri,
+# each with its own shortcut. Stdlib-only Python, no background service.
+#
+# NEW IN THIS VERSION (1.0.0):
+#   - Initial release: setup (config include + own dir), capture, restore,
+#     manage (rebind, rename, edit commands/URLs, enable/disable, delete,
+#     re-capture), Niri version tracking, nested-include with flat fallback,
+#     config backups with automatic rollback when `niri validate` fails.
+#
+VERSION="1.0.0"
+NAME="niri-profiles"
+
+import argparse, json, os, re, shlex, shutil, subprocess, sys, time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+NIRI_DIR = HOME / ".config" / "niri"
+CONFIG = NIRI_DIR / "config.kdl"
+DIR = NIRI_DIR / NAME
+PROFILES = DIR / "profiles"
+MAIN = DIR / "main.kdl"
+STATE = DIR / "state.json"
+BACKUPS = DIR / "backups"
+BIN = HOME / ".local" / "bin" / NAME
+MARK_BEGIN = f"// >>> {NAME} (managed block, do not edit) >>>"
+MARK_END = f"// <<< {NAME} <<<"
+INCLUDE_LINE = f'include "{NAME}/main.kdl"'
+
+# Fallback app-id -> Flatpak ID when no .desktop match is found.
+KNOWN_FLATPAK = {
+    "brave-browser": "com.brave.Browser", "com.brave.browser": "com.brave.Browser",
+    "zen": "app.zen_browser.zen", "zen-browser": "app.zen_browser.zen",
+    "app.zen_browser.zen": "app.zen_browser.zen",
+}
+BROWSER_RE = re.compile(r"brave|zen_browser|\bzen\b|firefox|chrom|vivaldi|librewolf", re.I)
+COMBO_RE = re.compile(r"^(?:(?:Mod|Ctrl|Control|Shift|Alt|Super|Win|ISO_Level3_Shift|ISO_Level5_Shift)\+)*[A-Za-z0-9_]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+RELEVANT = [
+    "`include` directive (config.kdl, nested includes with relative paths)",
+    "`binds {}` syntax incl. hotkey-overlay-title",
+    "`niri validate`",
+    "`niri msg --json` windows / workspaces / outputs (fields: pid, app_id, is_floating,",
+    "    workspace_id, layout.pos_in_scrolling_layout, layout.window_size, layout.tile_pos_in_workspace_view)",
+    "actions: move-window-to-workspace (--window-id, --focus), focus-window --id, focus-monitor,",
+    "    move-column-to-index, consume-window-into-column, set-column-width, set-window-width/height,",
+    "    move-window-to-floating, move-floating-window",
+]
+
+
+# ---------------------------------------------------------------- helpers
+def die(msg, code=1):
+    print(f"{NAME}: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def ask(prompt, default=""):
+    try:
+        s = input(prompt).strip()
+    except EOFError:
+        return default
+    return s or default
+
+
+def write(path, text):
+    real = Path(os.path.realpath(path))
+    real.parent.mkdir(parents=True, exist_ok=True)
+    tmp = real.with_name(real.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, real)
+
+
+def niri_json(what):
+    r = sh(["niri", "msg", "--json", what])
+    if r.returncode:
+        die(f"`niri msg --json {what}` failed (is Niri running?): {r.stderr.strip()}")
+    return json.loads(r.stdout)
+
+
+def niri_version():
+    r = sh(["niri", "--version"])
+    m = re.search(r"(\d+\.\d+(?:\.\d+)?)", r.stdout)
+    return m.group(1) if m else (r.stdout.strip() or "unknown")
+
+
+def validate():
+    r = sh(["niri", "validate"])
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def is_setup():
+    try:
+        return DIR.is_dir() and MARK_BEGIN in CONFIG.read_text()
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- state
+def load_state():
+    try:
+        s = json.loads(STATE.read_text())
+    except Exception:
+        s = {}
+    s.setdefault("bind_mode", "nested")
+    s.setdefault("confirmed", [])
+    s.setdefault("flagged", [])
+    return s
+
+
+def save_state(s):
+    write(STATE, json.dumps(s, indent=2) + "\n")
+
+
+def check_version(interactive=True):
+    cur, st = niri_version(), load_state()
+    if cur in st["confirmed"]:
+        return True
+    if cur in st["flagged"]:
+        print(f"! Niri {cur} is flagged as NOT supported (you marked it earlier).")
+        if interactive and ask("  Mark it supported now? [y/N]: ").lower() == "y":
+            st["flagged"].remove(cur)
+            st["confirmed"].append(cur)
+            save_state(st)
+            return True
+        return False
+    last = st["confirmed"][-1] if st["confirmed"] else "none"
+    print(f"! Niri is {cur}; last confirmed version: {last}.")
+    print("  Features this script depends on (check the release notes for changes):")
+    for line in RELEVANT:
+        print(f"    - {line}" if not line.startswith("    ") else f"  {line}")
+    if not interactive:
+        return False
+    a = ask("  Does this version work? [y]es / [n]o / [l]ater (default l): ", "l").lower()
+    if a.startswith("y"):
+        st["confirmed"].append(cur)
+        save_state(st)
+        print(f"  Recorded Niri {cur} as supported.")
+        return True
+    if a.startswith("n"):
+        st["flagged"].append(cur)
+        save_state(st)
+        print(f"  Recorded Niri {cur} as NOT supported.")
+    return False
+
+
+# ---------------------------------------------------------------- snapshots / rollback
+def snapshot():
+    BACKUPS.mkdir(parents=True, exist_ok=True)
+    dst = BACKUPS / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    dst.mkdir()
+    if CONFIG.exists():
+        shutil.copy2(CONFIG, dst / "config.kdl")
+    for f in ("main.kdl", "state.json"):
+        if (DIR / f).exists():
+            shutil.copy2(DIR / f, dst / f)
+    if PROFILES.exists():
+        shutil.copytree(PROFILES, dst / "profiles")
+    for old in sorted(p for p in BACKUPS.iterdir() if p.is_dir())[:-10]:
+        shutil.rmtree(old)
+    return dst
+
+
+def rollback(dst):
+    if (dst / "config.kdl").exists():
+        shutil.copy2(dst / "config.kdl", Path(os.path.realpath(CONFIG)))
+    for f in ("main.kdl", "state.json"):
+        if (dst / f).exists():
+            shutil.copy2(dst / f, DIR / f)
+        elif (DIR / f).exists():
+            (DIR / f).unlink()
+    if PROFILES.exists():
+        shutil.rmtree(PROFILES)
+    if (dst / "profiles").exists():
+        shutil.copytree(dst / "profiles", PROFILES)
+
+
+# ---------------------------------------------------------------- profiles + KDL generation
+def pfile(name):
+    return PROFILES / f"{name}.json"
+
+
+def profile_names():
+    return sorted(f.stem for f in PROFILES.glob("*.json")) if PROFILES.is_dir() else []
+
+
+def load_profile(name):
+    try:
+        return json.loads(pfile(name).read_text())
+    except FileNotFoundError:
+        return None
+
+
+def save_profile(p):
+    write(pfile(p["name"]), json.dumps(p, indent=2) + "\n")
+
+
+def kdl_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def profile_kdl(p, ver):
+    out = [f"// {NAME} v{VERSION} | profile: {p['name']} | generated for niri {ver}",
+           "// Managed file: change it through the script."]
+    if p.get("bind"):
+        title = kdl_str("Workspace profile: " + p["name"])
+        out += ["binds {",
+                f'    {p["bind"]} hotkey-overlay-title={title} '
+                f'{{ spawn {kdl_str(str(BIN))} "restore" {kdl_str(p["name"])}; }}',
+                "}"]
+    else:
+        out.append("// (no shortcut assigned)")
+    return "\n".join(out) + "\n"
+
+
+def write_all(state, ver):
+    names = profile_names()
+    profs = [load_profile(n) for n in names]
+    for p in profs:
+        write(PROFILES / f"{p['name']}.kdl", profile_kdl(p, ver))
+    for f in PROFILES.glob("*.kdl"):
+        if f.stem not in names:
+            f.unlink()
+    lines = [f"// {NAME} v{VERSION} hub file | niri {ver} | mode: {state['bind_mode']}",
+             "// One line per enabled profile. Remove a line to disable it."]
+    for p in profs:
+        if not p.get("enabled", True):
+            continue
+        if state["bind_mode"] == "nested":
+            lines.append(f'include "profiles/{p["name"]}.kdl"')
+        else:
+            lines.append((PROFILES / f"{p['name']}.kdl").read_text().rstrip("\n"))
+    write(MAIN, "\n".join(lines) + "\n")
+
+
+def rebuild_and_validate(state):
+    ver, last = niri_version(), ""
+    modes = [state["bind_mode"]] + (["flat"] if state["bind_mode"] == "nested" else [])
+    for mode in modes:
+        state["bind_mode"] = mode
+        write_all(state, ver)
+        ok, msg = validate()
+        if ok:
+            save_state(state)
+            return True, msg
+        last = msg
+    return False, last
+
+
+def mutate(fn):
+    """Run fn(state), regenerate files, validate with niri; roll back on failure."""
+    ok, msg = validate()
+    if not ok:
+        die("your Niri config does not validate before any change; fix it first:\n" + msg)
+    snap = snapshot()
+    state = load_state()
+    try:
+        fn(state)
+        ok, msg = rebuild_and_validate(state)
+    except Exception as e:  # noqa
+        ok, msg = False, f"{type(e).__name__}: {e}"
+    if not ok:
+        rollback(snap)
+        die("`niri validate` failed, changes rolled back:\n" + msg)
+    if state["bind_mode"] == "flat":
+        print("  note: nested includes were rejected, using flat mode (main.kdl holds the binds directly).")
+    return state
+
+
+# ---------------------------------------------------------------- shortcut conflicts
+ALIAS = {"control": "ctrl", "win": "super"}
+
+
+def norm_combo(c):
+    parts = c.split("+")
+    mods = {ALIAS.get(m.lower(), m.lower()) for m in parts[:-1]}
+    mods = {"mod" if m == "super" else m for m in mods}
+    return "+".join(sorted(mods) + [parts[-1].lower()])
+
+
+BIND_RE = re.compile(r'^\s*([A-Za-z0-9_+]+)(?:\s+[\w-]+=(?:"[^"]*"|\S+))*\s*\{')
+
+
+def scan_binds(path):
+    found, depth, in_binds = [], 0, False
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
+        return found
+    for raw in lines:
+        line = raw.split("//", 1)[0]
+        if depth == 0 and re.match(r"\s*binds\s*\{", line):
+            in_binds = True
+        elif in_binds and depth == 1:
+            m = BIND_RE.match(line)
+            if m:
+                found.append(m.group(1))
+        depth += line.count("{") - line.count("}")
+        if in_binds and depth < 1:
+            in_binds = False
+    return found
+
+
+def existing_binds(exclude=None):
+    out = {}
+    for f in NIRI_DIR.rglob("*.kdl"):
+        if DIR in f.parents:
+            continue
+        for b in scan_binds(f):
+            out.setdefault(norm_combo(b), f.name)
+    for n in profile_names():
+        if n == exclude:
+            continue
+        p = load_profile(n)
+        if p and p.get("bind"):
+            out[norm_combo(p["bind"])] = f"profile '{n}'"
+    return out
+
+
+def ask_bind(exclude=None, current=None):
+    taken = existing_binds(exclude)
+    while True:
+        s = ask("  Shortcut (e.g. Mod+Alt+1, Enter = none)"
+                + (f" [{current}]" if current else "") + ": ", current or "")
+        if not s:
+            return None
+        if not COMBO_RE.match(s):
+            print("  Invalid. Format: Mod+Alt+1 (find key names with `wev`).")
+            continue
+        where = taken.get(norm_combo(s))
+        if where and where.startswith("profile"):
+            print(f"  Already used by {where}.")
+            continue
+        if where and ask(f"  {s} already exists in {where}. Use anyway? [y/N]: ").lower() != "y":
+            continue
+        return s
+
+
+# ---------------------------------------------------------------- commands / desktop files
+_idx = None
+
+
+def desktop_index():
+    global _idx
+    if _idx is not None:
+        return _idx
+    idx = {}
+    dirs = [HOME / ".local/share/applications", Path("/usr/share/applications"),
+            Path("/usr/local/share/applications"),
+            HOME / ".local/share/flatpak/exports/share/applications",
+            Path("/var/lib/flatpak/exports/share/applications")]
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.desktop"):
+            exe = wm = None
+            try:
+                for line in f.read_text(errors="ignore").splitlines():
+                    if line.startswith("[") and line.strip() != "[Desktop Entry]":
+                        break
+                    if line.startswith("Exec=") and exe is None:
+                        exe = line[5:]
+                    elif line.startswith("StartupWMClass="):
+                        wm = line[15:].strip()
+            except OSError:
+                continue
+            if exe:
+                idx.setdefault(f.stem.lower(), exe)
+                if wm:
+                    idx.setdefault(wm.lower(), exe)
+    _idx = idx
+    return idx
+
+
+def clean_exec(exe):
+    try:
+        toks = shlex.split(exe)
+    except ValueError:
+        return None
+    out = [t for t in toks if not re.fullmatch(r"%[A-Za-z%]|@@[uf]?", t)]
+    return out or None
+
+
+def guess_cmd(w):
+    aid = (w.get("app_id") or "").lower()
+    exe = desktop_index().get(aid)
+    if exe:
+        c = clean_exec(exe)
+        if c:
+            return c
+    if aid in KNOWN_FLATPAK:
+        return ["flatpak", "run", KNOWN_FLATPAK[aid]]
+    pid = w.get("pid")
+    if pid:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            c = [x.decode() for x in raw if x]
+            if c and Path(c[0]).name != "bwrap":
+                return c
+        except OSError:
+            pass
+    return [w.get("app_id")] if w.get("app_id") else []
+
+
+def build_launch(w):
+    cmd = list(w["cmd"])
+    if w.get("url"):
+        if any(BROWSER_RE.search(t) for t in cmd):
+            cmd += ["--new-window", w["url"]]
+        else:
+            cmd.append(w["url"])
+    return cmd
+
+
+# ---------------------------------------------------------------- capture
+def ancestors():
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat.rsplit(")", 1)[1].split()[1])
+        except Exception:
+            break
+    return pids
+
+
+def skey(it):
+    return (it["workspace"]["idx"], 1 if it["floating"] else 0, it.get("column") or 0, it.get("tile") or 0)
+
+
+def capture_windows():
+    wins = niri_json("windows")
+    wss = {w["id"]: w for w in niri_json("workspaces")}
+    outs = niri_json("outputs")
+    anc = ancestors()
+    own = [w for w in wins if w.get("pid") in anc] or [w for w in wins if w.get("is_focused")]
+    skip = {w["id"] for w in own}
+    items = []
+    for w in wins:
+        ws = wss.get(w.get("workspace_id"))
+        if not ws:
+            continue
+        lay = w.get("layout") or {}
+        pos = lay.get("pos_in_scrolling_layout")
+        out = ws.get("output")
+        items.append({
+            "app_id": w.get("app_id"), "title": w.get("title"), "cmd": guess_cmd(w), "url": None,
+            "workspace": {"idx": ws.get("idx"), "name": ws.get("name")},
+            "output": out,
+            "out_width": ((outs.get(out) or {}).get("logical") or {}).get("width") if out else None,
+            "floating": bool(w.get("is_floating")),
+            "column": pos[0] if pos else None, "tile": pos[1] if pos else None,
+            "size": list(lay.get("window_size") or []),
+            "pos": lay.get("tile_pos_in_workspace_view"),
+            "_skip": w["id"] in skip,
+        })
+    items.sort(key=skey)
+    return items
+
+
+def desc(it):
+    ws = it["workspace"]
+    loc = "float" if it["floating"] else f"col{it['column']}.{it['tile']}"
+    s = f"ws:{ws['name'] or ws['idx']} {loc:<8} {(it['app_id'] or '?')[:24]:<24} {shlex.join(it['cmd'])[:46]}"
+    return s + (f"  -> {it['url']}" if it.get("url") else "")
+
+
+def edit_window(it):
+    s = ask(f"  command [{shlex.join(it['cmd'])}]: ")
+    if s:
+        it["cmd"] = shlex.split(s)
+    cu = it.get("url") or ""
+    s = ask(f"  URL [{cu or 'none'}] ('-' clears): ")
+    if s == "-":
+        it["url"] = None
+    elif s:
+        it["url"] = s
+
+
+def review(items):
+    while True:
+        for i, it in enumerate(items, 1):
+            print(f"{i:>3} [{'skip' if it['_skip'] else 'keep'}] {desc(it)}")
+        s = ask("Toggle keep/skip: numbers | edit: e<N> | Enter = continue > ")
+        if not s:
+            return
+        m = re.fullmatch(r"e\s*(\d+)", s)
+        if m and 1 <= int(m[1]) <= len(items):
+            edit_window(items[int(m[1]) - 1])
+            continue
+        for t in s.replace(",", " ").split():
+            if t.isdigit() and 1 <= int(t) <= len(items):
+                items[int(t) - 1]["_skip"] = not items[int(t) - 1]["_skip"]
+
+
+def require_setup():
+    if not is_setup():
+        die(f"not set up yet. Run: {NAME} setup")
+
+
+def cmd_capture(name=None, bind=None, yes=False, recapture=False):
+    require_setup()
+    old = load_profile(name) if recapture else None
+    if recapture and not old:
+        die(f"no such profile: {name}")
+    items = capture_windows()
+    if old:  # carry over edited commands/URLs by app_id
+        pool = list(old["windows"])
+        for it in items:
+            m = next((o for o in pool if o["app_id"] == it["app_id"]), None)
+            if m:
+                pool.remove(m)
+                it["cmd"], it["url"] = m["cmd"], m.get("url")
+    if not yes:
+        if not sys.stdin.isatty():
+            die("interactive input needed (or use --yes with a name)")
+        review(items)
+    items = [{k: v for k, v in it.items() if k != "_skip"} for it in items if not it["_skip"]]
+    if not items:
+        die("no windows selected")
+    if not recapture:
+        while True:
+            name = name or ask("  Profile name: ")
+            if not NAME_RE.match(name or ""):
+                print("  Use letters, digits, - and _ only.")
+                name = None
+                if yes:
+                    die("invalid profile name")
+                continue
+            if load_profile(name):
+                print("  That name already exists.")
+                name = None
+                if yes:
+                    die("profile exists")
+                continue
+            break
+        if bind is None and not yes:
+            bind = ask_bind()
+        if bind and not COMBO_RE.match(bind):
+            die(f"invalid shortcut: {bind}")
+    p = old or {"name": name, "bind": bind, "enabled": True, "existing": "move", "timeout": 20}
+    p["windows"], p["captured_with"] = items, niri_version()
+    mutate(lambda s: save_profile(p))
+    print(f"Saved profile '{p['name']}' ({len(items)} windows)" + (f", shortcut {p['bind']}" if p.get("bind") else "") + ".")
+
+
+# ---------------------------------------------------------------- restore
+def act(fails, *args):
+    r = sh(["niri", "msg", "action", *args])
+    if r.returncode:
+        fails.append(f"{' '.join(args)}: {r.stderr.strip()}")
+    return r.returncode == 0
+
+
+def same_app(x, w):
+    a = (x.get("app_id") or "").lower()
+    return bool(a) and a == (w.get("app_id") or "").lower()
+
+
+def cmd_restore(name, dry=False):
+    p = load_profile(name)
+    if not p:
+        die(f"no such profile: {name}")
+    wins = sorted(p["windows"], key=skey)
+    before = niri_json("windows")
+    base = {w["id"] for w in before}
+    claimed, fails = {}, []
+    for i, w in enumerate(wins):
+        if p.get("existing", "move") == "move" and not w.get("url"):
+            used = set(claimed.values())
+            m = next((x for x in before if x["id"] not in used and same_app(x, w)), None)
+            if m:
+                claimed[i] = m["id"]
+                continue
+        cmd = build_launch(w)
+        if dry:
+            print("spawn:", shlex.join(cmd))
+            continue
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            fails.append(f"launch {cmd[:1]}: {e}")
+    if dry:
+        print(f"(dry run) {len(claimed)} existing window(s) would be reused.")
+        return
+    pending = [i for i in range(len(wins)) if i not in claimed]
+    deadline = time.time() + p.get("timeout", 20)
+    while pending and time.time() < deadline:
+        time.sleep(0.3)
+        for x in niri_json("windows"):
+            if x["id"] in base or x["id"] in claimed.values():
+                continue
+            hit = next((i for i in pending if same_app(x, wins[i])), None)
+            if hit is not None:
+                claimed[hit] = x["id"]
+                pending.remove(hit)
+    outs = niri_json("outputs")
+    groups = {}
+    for i in sorted(claimed):
+        w = wins[i]
+        ws = w["workspace"]
+        groups.setdefault((w.get("output"), ws["idx"], ws["name"]), []).append((w, claimed[i]))
+    first = None
+    for (out, idx, wsname), members in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        ref = str(wsname or idx)
+        if out in outs:
+            act(fails, "focus-monitor", out)
+        cur_w = ((outs.get(out) or {}).get("logical") or {}).get("width")
+        for w, wid in members:
+            if not act(fails, "move-window-to-workspace", "--window-id", str(wid), "--focus", "false", ref):
+                act(fails, "focus-window", "--id", str(wid))
+                act(fails, "move-window-to-workspace", ref)
+        tiled = [(w, wid) for w, wid in members if not w["floating"]]
+        for k, (w, wid) in enumerate(tiled, 1):
+            act(fails, "focus-window", "--id", str(wid))
+            act(fails, "move-column-to-index", str(k))
+        cols = {}
+        for w, wid in tiled:
+            cols.setdefault(w["column"], []).append((w, wid))
+        for its in cols.values():
+            if len(its) > 1:
+                act(fails, "focus-window", "--id", str(its[0][1]))
+                for _ in its[1:]:
+                    act(fails, "consume-window-into-column")
+        for its in cols.values():
+            w0, id0 = its[0]
+            scale = (cur_w / w0["out_width"]) if cur_w and w0.get("out_width") else 1
+            act(fails, "focus-window", "--id", str(id0))
+            if len(w0["size"]) == 2:
+                act(fails, "set-column-width", str(int(w0["size"][0] * scale)))
+            if len(its) > 1:
+                for w, wid in its[:-1]:
+                    if len(w["size"]) == 2:
+                        act(fails, "focus-window", "--id", str(wid))
+                        act(fails, "set-window-height", str(int(w["size"][1])))
+        for w, wid in members:
+            if not w["floating"]:
+                continue
+            scale = (cur_w / w["out_width"]) if cur_w and w.get("out_width") else 1
+            act(fails, "focus-window", "--id", str(wid))
+            act(fails, "move-window-to-floating")
+            if len(w["size"]) == 2:
+                act(fails, "set-window-width", str(int(w["size"][0] * scale)))
+                act(fails, "set-window-height", str(int(w["size"][1])))
+            if w.get("pos"):
+                act(fails, "move-floating-window", "-x", str(max(0, int(w["pos"][0] * scale))),
+                    "-y", str(max(0, int(w["pos"][1]))))
+        if first is None and members:
+            first = members[0][1]
+    if first is not None:
+        act(fails, "focus-window", "--id", str(first))
+    msgs = [f"not found: {wins[i]['app_id']} ({shlex.join(wins[i]['cmd'])})" for i in pending] + fails
+    if msgs:
+        print(f"Restored '{name}' with {len(msgs)} problem(s):", file=sys.stderr)
+        for m in msgs:
+            print("  -", m, file=sys.stderr)
+        sys.exit(2)
+    print(f"Restored '{name}' ({len(claimed)} windows).")
+
+
+# ---------------------------------------------------------------- management
+def need_profile(name):
+    p = load_profile(name)
+    if not p:
+        die(f"no such profile: {name}")
+    return p
+
+
+def cmd_setup():
+    if not shutil.which("niri"):
+        die("`niri` not found in PATH")
+    if not CONFIG.exists():
+        die(f"{CONFIG} not found")
+    check_version()
+
+    def change(state):
+        src = Path(os.path.realpath(__file__))
+        BIN.parent.mkdir(parents=True, exist_ok=True)
+        if not BIN.exists() or Path(os.path.realpath(BIN)) != src:
+            shutil.copy2(src, BIN)
+        BIN.chmod(0o755)
+        PROFILES.mkdir(parents=True, exist_ok=True)
+        text = CONFIG.read_text()
+        if MARK_BEGIN not in text:
+            write(CONFIG, text.rstrip("\n") + f"\n\n{MARK_BEGIN}\n{INCLUDE_LINE}\n{MARK_END}\n")
+
+    mutate(change)
+    print(f"Setup done. Script installed at {BIN}; data in {DIR}.")
+    if str(BIN.parent) not in os.environ.get("PATH", "").split(":"):
+        print(f"  (~/.local/bin is not in PATH; shortcuts use the full path, so they still work.)")
+
+
+def cmd_list():
+    names = profile_names()
+    if not names:
+        print("No profiles yet.")
+    for n in names:
+        p = load_profile(n)
+        print(f"{n:<16} {p.get('bind') or '(no shortcut)':<18} {len(p['windows'])} windows"
+              f"{'' if p.get('enabled', True) else '  [disabled]'}")
+
+
+def cmd_rebind(name, bind=None):
+    p = need_profile(name)
+    if bind is None:
+        bind = ask_bind(exclude=name, current=p.get("bind"))
+    elif not COMBO_RE.match(bind):
+        die(f"invalid shortcut: {bind}")
+    p["bind"] = bind
+    mutate(lambda s: save_profile(p))
+    print(f"'{name}' shortcut: {bind or 'none'}")
+
+
+def cmd_rename(old, new):
+    p = need_profile(old)
+    if not NAME_RE.match(new):
+        die("invalid name")
+    if load_profile(new):
+        die("target name exists")
+
+    def change(s):
+        pfile(old).unlink()
+        p["name"] = new
+        save_profile(p)
+
+    mutate(change)
+    print(f"Renamed '{old}' -> '{new}'.")
+
+
+def cmd_edit(name):
+    p = need_profile(name)
+    wins = p["windows"]
+    while True:
+        for i, w in enumerate(wins, 1):
+            print(f"{i:>3} {desc(w)}")
+        print("    existing-window policy:", p.get("existing", "move"), "(m = toggle move/spawn)")
+        s = ask("Edit window number | d<N> delete | m | Enter = save > ")
+        if not s:
+            break
+        if s == "m":
+            p["existing"] = "spawn" if p.get("existing", "move") == "move" else "move"
+        elif re.fullmatch(r"d\d+", s) and 1 <= int(s[1:]) <= len(wins):
+            del wins[int(s[1:]) - 1]
+        elif s.isdigit() and 1 <= int(s) <= len(wins):
+            edit_window(wins[int(s) - 1])
+    mutate(lambda st: save_profile(p))
+    print("Saved.")
+
+
+def cmd_enable(name, on):
+    p = need_profile(name)
+    p["enabled"] = on
+    mutate(lambda s: save_profile(p))
+    print(f"'{name}' {'enabled' if on else 'disabled'}.")
+
+
+def cmd_delete(name, yes=False):
+    need_profile(name)
+    if not yes and ask(f"Delete '{name}'? [y/N]: ").lower() != "y":
+        return
+
+    def change(s):
+        pfile(name).unlink()
+
+    mutate(change)
+    print(f"Deleted '{name}'.")
+
+
+def cmd_confirm(unsupported=False):
+    cur, st = niri_version(), load_state()
+    for k in ("confirmed", "flagged"):
+        if cur in st[k]:
+            st[k].remove(cur)
+    st["flagged" if unsupported else "confirmed"].append(cur)
+    save_state(st)
+    print(f"Niri {cur} recorded as {'NOT supported' if unsupported else 'supported'}.")
+
+
+def cmd_status():
+    st = load_state()
+    print(f"{NAME} v{VERSION}")
+    print(f"niri version : {niri_version()}")
+    print(f"confirmed    : {', '.join(st['confirmed']) or 'none'}")
+    print(f"flagged      : {', '.join(st['flagged']) or 'none'}")
+    print(f"set up       : {'yes' if is_setup() else 'no'} (include mode: {st['bind_mode']})")
+    print(f"profiles     : {len(profile_names())}")
+    check_version(interactive=sys.stdin.isatty())
+
+
+# ---------------------------------------------------------------- menu
+def pick_profile(prompt="Profile"):
+    names = profile_names()
+    if not names:
+        print("No profiles yet.")
+        return None
+    for i, n in enumerate(names, 1):
+        p = load_profile(n)
+        print(f"  {i}) {n}  [{p.get('bind') or 'no shortcut'}]")
+    s = ask(f"{prompt} (number or name): ")
+    if s.isdigit() and 1 <= int(s) <= len(names):
+        return names[int(s) - 1]
+    return s if s in names else None
+
+
+def menu():
+    print(f"{NAME} v{VERSION}")
+    if not is_setup():
+        print("Not set up yet.")
+        if ask("Run setup now? [Y/n]: ", "y").lower().startswith("y"):
+            cmd_setup()
+        else:
+            return
+    else:
+        check_version()
+    while True:
+        print(f"\n{NAME} v{VERSION}  (niri {niri_version()})\n"
+              " 1) Capture current layout as a new profile\n 2) List profiles\n 3) Restore a profile\n"
+              " 4) Change shortcut\n 5) Rename\n 6) Edit windows (commands / URLs)\n"
+              " 7) Re-capture layout of a profile\n 8) Enable / disable\n 9) Delete\n"
+              "10) Setup / repair\n11) Status & Niri version\n 0) Quit")
+        c = ask("> ")
+        try:
+            if c == "1":
+                cmd_capture()
+            elif c == "2":
+                cmd_list()
+            elif c in ("3", "4", "5", "6", "7", "8", "9"):
+                n = pick_profile()
+                if not n:
+                    continue
+                if c == "3":
+                    cmd_restore(n)
+                elif c == "4":
+                    cmd_rebind(n)
+                elif c == "5":
+                    cmd_rename(n, ask("New name: "))
+                elif c == "6":
+                    cmd_edit(n)
+                elif c == "7":
+                    cmd_capture(n, recapture=True)
+                elif c == "8":
+                    cmd_enable(n, not load_profile(n).get("enabled", True))
+                elif c == "9":
+                    cmd_delete(n)
+            elif c == "10":
+                cmd_setup()
+            elif c == "11":
+                cmd_status()
+            elif c in ("0", "q"):
+                return
+        except SystemExit as e:
+            if e.code not in (0, None):
+                print("(action failed, see message above)")
+        except KeyboardInterrupt:
+            print()
+
+
+# ---------------------------------------------------------------- CLI
+class Parser(argparse.ArgumentParser):
+    def print_help(self, file=None):
+        print(f"{NAME} v{VERSION}", file=file or sys.stdout)
+        super().print_help(file)
+
+
+def main():
+    ap = Parser(prog=NAME, formatter_class=argparse.RawDescriptionHelpFormatter,
+                description="Save and restore Niri workspace layouts, each with its own shortcut.\n"
+                            "Run without arguments for an interactive menu.")
+    ap.add_argument("--version", action="version", version=f"{NAME} v{VERSION}")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", parser_class=Parser)
+    sub.add_parser("setup", help="install script, create config dir, add include to config.kdl")
+    c = sub.add_parser("capture", help="record the current layout as a new profile")
+    c.add_argument("name", nargs="?")
+    c.add_argument("--bind", help="shortcut, e.g. Mod+Alt+1")
+    c.add_argument("--yes", action="store_true", help="no prompts (needs NAME)")
+    sub.add_parser("recapture", help="replace a profile's layout with the current one").add_argument("name")
+    r = sub.add_parser("restore", help="launch and place a profile's windows")
+    r.add_argument("name")
+    r.add_argument("--dry-run", action="store_true")
+    sub.add_parser("list", help="list profiles")
+    b = sub.add_parser("rebind", help="change a profile's shortcut")
+    b.add_argument("name")
+    b.add_argument("bind", nargs="?")
+    rn = sub.add_parser("rename", help="rename a profile")
+    rn.add_argument("old")
+    rn.add_argument("new")
+    sub.add_parser("edit", help="edit a profile's window commands / URLs").add_argument("name")
+    sub.add_parser("enable", help="enable a profile").add_argument("name")
+    sub.add_parser("disable", help="disable a profile (keeps its files)").add_argument("name")
+    d = sub.add_parser("delete", help="delete a profile")
+    d.add_argument("name")
+    d.add_argument("--yes", action="store_true")
+    cf = sub.add_parser("confirm", help="record the installed Niri version as supported")
+    cf.add_argument("--no", action="store_true", help="record it as NOT supported")
+    sub.add_parser("status", help="show setup state and Niri version tracking")
+    a = ap.parse_args()
+
+    if not a.cmd:
+        if not sys.stdin.isatty():
+            ap.print_help()
+            return
+        return menu()
+    if a.cmd != "restore" and not shutil.which("niri"):
+        die("`niri` not found in PATH")
+    if a.cmd in ("capture", "recapture", "rebind", "rename", "edit", "enable", "disable",
+                 "delete", "list", "restore"):
+        require_setup()
+    if a.cmd == "setup":
+        cmd_setup()
+    elif a.cmd == "capture":
+        if sys.stdin.isatty() and not a.yes:
+            check_version()
+        cmd_capture(a.name, a.bind, a.yes)
+    elif a.cmd == "recapture":
+        cmd_capture(a.name, recapture=True)
+    elif a.cmd == "restore":
+        cmd_restore(a.name, a.dry_run)
+    elif a.cmd == "list":
+        cmd_list()
+    elif a.cmd == "rebind":
+        cmd_rebind(a.name, a.bind)
+    elif a.cmd == "rename":
+        cmd_rename(a.old, a.new)
+    elif a.cmd == "edit":
+        cmd_edit(a.name)
+    elif a.cmd == "enable":
+        cmd_enable(a.name, True)
+    elif a.cmd == "disable":
+        cmd_enable(a.name, False)
+    elif a.cmd == "delete":
+        cmd_delete(a.name, a.yes)
+    elif a.cmd == "confirm":
+        cmd_confirm(a.no)
+    elif a.cmd == "status":
+        cmd_status()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
