@@ -2,21 +2,22 @@
 # niri-ws: save and restore Niri workspace layouts ("profiles"), each with its
 # own shortcut. Stdlib-only Python, no background service.
 #
-# NEW IN THIS VERSION (2.1.0):
-#   - A window's URL field now accepts several URLs separated by spaces; browsers
-#     open them as tabs in one new window (e.g. two tabs in Brave).
+# NEW IN THIS VERSION (2.2.0):
+#   - Guided capture: numbered steps ("Step 2 of 5: ..."), a legend, then a summary
+#     with a "Save? [Y/n]" confirmation.
+#   - Window list in aligned columns (state, workspace, position, app name, title).
+#   - Toggle several windows at once ("1 3 4", "2-4"); no more "e<N>" needed
+#     (still accepted). Customizing asks for URL(s) first, then optional extra
+#     arguments; replacing the whole command is an advanced, separate choice.
+#   - Shortcut prompt suggests the next free Mod+Alt+<N>; Enter accepts it,
+#     "none" skips.
+#   - New `show <profile>` command (windows, URLs, exact launch commands).
+#   - Optional colours (auto-off when piped or when NO_COLOR is set).
+#   - Friendlier errors with a next step; shorter Niri-version notice with a
+#     [d]etails choice; progress lines when restoring from a terminal.
+#   Earlier: 2.1.0 several URLs per window; 2.0.0 rename to niri-ws, uninstall, debug.
 #
-# Earlier (2.0.0):
-#   - BREAKING: renamed niri-profiles -> niri-ws (command, ~/.config/niri/niri-ws/,
-#     include block). `niri-ws setup` migrates an old install automatically.
-#   - New `uninstall`: removes the config include and everything the script
-#     created (the script itself in ~/.local/bin is left alone).
-#   - New `--debug` flag and `debug on|off|show|clear`: detailed log of every niri
-#     call and decision in ~/.config/niri/niri-ws/logs/debug.log.
-#   - `restore --dry-run` is now detailed: prints every launch and niri action it
-#     would run, without changing anything.
-#
-VERSION="2.1.0"
+VERSION="2.2.0"
 NAME="niri-ws"
 LEGACY="niri-profiles"
 
@@ -66,6 +67,24 @@ RELEVANT = [
 
 
 # ---------------------------------------------------------------- helpers
+def _color_on(stream):
+    return stream.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def paint(code, text, stream=None):
+    return f"\033[{code}m{text}\033[0m" if _color_on(stream or sys.stdout) else text
+
+
+def bold(t): return paint("1", t)
+def dim(t): return paint("2", t)
+def green(t): return paint("32", t)
+def yellow(t): return paint("33", t)
+
+
+def step(n, total, title):
+    print("\n" + bold(f"Step {n} of {total}: {title}"))
+
+
 def log(msg, force=False):
     """Debug log. Written when --debug or `debug on` is active; force=True always
     logs (used for errors) but only once the data dir exists."""
@@ -87,7 +106,7 @@ def log(msg, force=False):
 
 def die(msg, code=1):
     log(f"ERROR: {msg}", force=True)
-    print(f"{NAME}: {msg}", file=sys.stderr)
+    print(f"{paint('31', NAME + ':', sys.stderr)} {msg}", file=sys.stderr)
     sys.exit(code)
 
 
@@ -165,7 +184,7 @@ def check_version(interactive=True):
     if cur in st["confirmed"]:
         return True
     if cur in st["flagged"]:
-        print(f"! Niri {cur} is flagged as NOT supported (you marked it earlier).")
+        print(yellow(f"! Niri {cur} is flagged as NOT supported (you marked it earlier)."))
         if interactive and ask("  Mark it supported now? [y/N]: ").lower() == "y":
             st["flagged"].remove(cur)
             st["confirmed"].append(cur)
@@ -173,13 +192,17 @@ def check_version(interactive=True):
             return True
         return False
     last = st["confirmed"][-1] if st["confirmed"] else "none"
-    print(f"! Niri is {cur}; last confirmed version: {last}.")
-    print("  Features this script depends on (check the release notes for changes):")
-    for line in RELEVANT:
-        print(f"    - {line}" if not line.startswith("    ") else f"  {line}")
+    print(yellow(f"! Niri is {cur}; last confirmed version: {last}. Check the release notes."))
     if not interactive:
         return False
-    a = ask("  Does this version work? [y]es / [n]o / [l]ater (default l): ", "l").lower()
+    while True:
+        a = ask("  Does this version work? [y]es / [n]o / [d]etails / [l]ater (default l): ", "l").lower()
+        if a.startswith("d"):
+            print("  Features this script depends on:")
+            for line in RELEVANT:
+                print(f"    - {line}" if not line.startswith("    ") else f"  {line}")
+            continue
+        break
     if a.startswith("y"):
         st["confirmed"].append(cur)
         save_state(st)
@@ -369,23 +392,35 @@ def existing_binds(exclude=None):
     return out
 
 
+def suggest_bind(taken):
+    for n in range(1, 10):
+        c = f"Mod+Alt+{n}"
+        if norm_combo(c) not in taken:
+            return c
+    return None
+
+
 def check_bind_free(bind, exclude=None):
     if not COMBO_RE.match(bind):
-        die(f"invalid shortcut: {bind}")
-    where = existing_binds(exclude).get(norm_combo(bind))
+        die(f"invalid shortcut: {bind}. Use a format like Mod+Alt+1.")
+    taken = existing_binds(exclude)
+    where = taken.get(norm_combo(bind))
     if where:
-        die(f"shortcut {bind} is already used by {where}")
+        alt = suggest_bind(taken)
+        die(f"shortcut {bind} is already used by {where}." + (f" Try {alt} instead." if alt else ""))
 
 
 def ask_bind(exclude=None, current=None):
     taken = existing_binds(exclude)
+    default = current or suggest_bind(taken)
+    print("  Enter accepts the suggestion. Type 'none' for no shortcut, or your own combo")
+    print("  (e.g. Mod+Shift+F2; `wev` shows key names).")
     while True:
-        s = ask("  Shortcut (e.g. Mod+Alt+1, Enter = none)"
-                + (f" [{current}]" if current else "") + ": ", current or "")
-        if not s:
+        s = ask(f"  Shortcut{f' [{default}]' if default else ''}: ", default or "")
+        if s.lower() in ("", "none", "-"):
             return None
         if not COMBO_RE.match(s):
-            print("  Invalid. Format: Mod+Alt+1 (find key names with `wev`).")
+            print("  Invalid. Use a format like Mod+Alt+1.")
             continue
         where = taken.get(norm_combo(s))
         if where and where.startswith("profile"):
@@ -398,6 +433,7 @@ def ask_bind(exclude=None, current=None):
 
 # ---------------------------------------------------------------- commands / desktop files
 _idx = None
+_names = {}
 
 
 def desktop_index():
@@ -413,7 +449,7 @@ def desktop_index():
         if not d.is_dir():
             continue
         for f in d.glob("*.desktop"):
-            exe = wm = None
+            exe = wm = nm = None
             try:
                 for line in f.read_text(errors="ignore").splitlines():
                     if line.startswith("[") and line.strip() != "[Desktop Entry]":
@@ -422,14 +458,25 @@ def desktop_index():
                         exe = line[5:]
                     elif line.startswith("StartupWMClass="):
                         wm = line[15:].strip()
+                    elif line.startswith("Name=") and nm is None:
+                        nm = line[5:].strip()
             except OSError:
                 continue
             if exe:
                 idx.setdefault(f.stem.lower(), exe)
+                if nm:
+                    _names.setdefault(f.stem.lower(), nm)
                 if wm:
                     idx.setdefault(wm.lower(), exe)
+                    if nm:
+                        _names.setdefault(wm.lower(), nm)
     _idx = idx
     return idx
+
+
+def app_label(aid):
+    desktop_index()
+    return _names.get((aid or "").lower()) or aid or "?"
 
 
 def clean_exec(exe):
@@ -477,9 +524,9 @@ def _guess_cmd(w):
 
 
 def build_launch(w):
-    cmd = list(w["cmd"])
+    cmd = list(w["cmd"]) + shlex.split(w.get("args") or "")
     if w.get("url"):
-        if any(BROWSER_RE.search(t) for t in cmd):
+        if any(BROWSER_RE.search(t) for t in w["cmd"]):
             cmd += ["--new-window", *w["url"].split()]
         else:
             cmd += w["url"].split()
@@ -520,7 +567,8 @@ def capture_windows():
         pos = lay.get("pos_in_scrolling_layout")
         out = ws.get("output")
         items.append({
-            "app_id": w.get("app_id"), "title": w.get("title"), "cmd": guess_cmd(w), "url": None,
+            "app_id": w.get("app_id"), "label": app_label(w.get("app_id")), "title": w.get("title"),
+            "cmd": guess_cmd(w), "url": None, "args": "",
             "workspace": {"idx": ws.get("idx"), "name": ws.get("name")},
             "output": out,
             "out_width": ((outs.get(out) or {}).get("logical") or {}).get("width") if out else None,
@@ -534,41 +582,106 @@ def capture_windows():
     return items
 
 
-def desc(it):
-    ws = it["workspace"]
-    loc = "float" if it["floating"] else f"col{it['column']}.{it['tile']}"
-    s = f"ws:{ws['name'] or ws['idx']} {loc:<8} {(it['app_id'] or '?')[:24]:<24} {shlex.join(it['cmd'])[:46]}"
+def pos_str(it):
+    return "float" if it["floating"] else f"col{it['column']}.{it['tile']}"
+
+
+def row(i, it, skipped=None):
+    ws = str(it["workspace"]["name"] or it["workspace"]["idx"])
+    label = (it.get("label") or it.get("app_id") or "?")[:22]
+    out = f"{i:>3}  "
+    if skipped is not None:
+        txt = f"{'skip' if skipped else 'keep':<5} "
+        out += dim(txt) if skipped else green(txt)
+    out += f"{ws[:4]:<4} {pos_str(it):<8} {label:<22} {(it.get('title') or '')[:30]}"
+    if it.get("url"):
+        out += f"  -> {it['url']}"
+    if it.get("args"):
+        out += f"  + {it['args']}"
     if any(t.startswith("/tmp/.mount_") for t in it["cmd"]):
-        s += "  [!] temp AppImage path, use e<N> to set the real one"
-    return s + (f"  -> {it['url']}" if it.get("url") else "")
+        out += "  " + yellow("[!] temp AppImage path: customize this window to set the real one")
+    return out
+
+
+def print_rows(items, with_state=False):
+    head = f"{'#':>3}  " + (f"{'State':<5} " if with_state else "") + f"{'WS':<4} {'Position':<8} {'App':<22} Title / opens"
+    print(bold(head))
+    for i, it in enumerate(items, 1):
+        print(row(i, it, it.get("_skip", False) if with_state else None))
 
 
 def edit_window(it):
-    s = ask(f"  command [{shlex.join(it['cmd'])}]: ")
-    if s:
-        it["cmd"] = shlex.split(s)
+    print(f"\n{bold(it.get('label') or it.get('app_id') or 'window')}: {it.get('title') or ''}")
+    print(dim(f"  runs: {shlex.join(it['cmd'])}"))
     cu = it.get("url") or ""
-    s = ask(f"  URL(s), space-separated for several tabs [{cu or 'none'}] ('-' clears): ")
+    s = ask(f"  URL(s) to open, space-separated [{cu or 'none'}] (Enter keeps, '-' clears): ")
     if s == "-":
         it["url"] = None
     elif s:
         it["url"] = s
+    ca = it.get("args") or ""
+    s = ask(f"  Extra arguments added after the command [{ca or 'none'}] (Enter keeps, '-' clears): ")
+    if s == "-":
+        it["args"] = ""
+    elif s:
+        try:
+            shlex.split(s)
+            it["args"] = s
+        except ValueError as e:
+            print(f"  Not saved ({e}).")
+    if ask("  Replace the whole launch command? (advanced) [y/N]: ").lower() == "y":
+        s = ask("  New command (Enter keeps the current one): ")
+        if s:
+            try:
+                it["cmd"] = shlex.split(s)
+            except ValueError as e:
+                print(f"  Not saved ({e}).")
 
 
-def review(items):
+def parse_numbers(s, n):
+    out = []
+    for t in s.replace(",", " ").split():
+        m = re.fullmatch(r"(\d+)-(\d+)", t)
+        out += list(range(int(m[1]), int(m[2]) + 1)) if m else ([int(t)] if t.isdigit() else [0])
+    return out if out and all(1 <= x <= n for x in out) else None
+
+
+def choose_windows(items):
+    print("Type numbers to flip keep/skip (e.g. 1 3 4 or 2-4), then Enter. Enter alone = the list is right.")
     while True:
-        for i, it in enumerate(items, 1):
-            print(f"{i:>3} [{'skip' if it['_skip'] else 'keep'}] {desc(it)}")
-        s = ask("Toggle keep/skip: numbers | edit: e<N> | Enter = continue > ")
+        print_rows(items, True)
+        s = ask("> ")
         if not s:
             return
         m = re.fullmatch(r"e\s*(\d+)", s)
         if m and 1 <= int(m[1]) <= len(items):
             edit_window(items[int(m[1]) - 1])
             continue
-        for t in s.replace(",", " ").split():
-            if t.isdigit() and 1 <= int(t) <= len(items):
-                items[int(t) - 1]["_skip"] = not items[int(t) - 1]["_skip"]
+        nums = parse_numbers(s, len(items))
+        if nums is None:
+            print(f"  Use window numbers from 1 to {len(items)}, like: 1 3 4  or  2-4")
+            continue
+        for n in nums:
+            items[n - 1]["_skip"] = not items[n - 1]["_skip"]
+
+
+def customize(items):
+    print("Set what a window opens (URLs) or extra arguments. Type its number, or Enter to continue.")
+    while True:
+        print_rows(items)
+        s = ask("Customize window > ")
+        if not s:
+            return
+        if s.isdigit() and 1 <= int(s) <= len(items):
+            edit_window(items[int(s) - 1])
+        else:
+            print(f"  Type a number from 1 to {len(items)}, or press Enter.")
+
+
+def summary(p):
+    print(f"  Name     : {p['name']}")
+    print(f"  Shortcut : {p.get('bind') or 'none'}")
+    print_rows(p["windows"])
 
 
 def require_setup():
@@ -582,7 +695,10 @@ def cmd_capture(name=None, bind=None, yes=False, recapture=False):
     require_setup()
     old = load_profile(name) if recapture else None
     if recapture and not old:
-        die(f"no such profile: {name}")
+        die(f"no such profile: {name}. Run `{NAME} list` to see your profiles.")
+    interactive = not yes
+    if interactive and not sys.stdin.isatty():
+        die("interactive input needed (or use --yes with a name)")
     items = capture_windows()
     if old:  # carry over edited commands/URLs by app_id
         pool = list(old["windows"])
@@ -590,38 +706,52 @@ def cmd_capture(name=None, bind=None, yes=False, recapture=False):
             m = next((o for o in pool if o["app_id"] == it["app_id"]), None)
             if m:
                 pool.remove(m)
-                it["cmd"], it["url"] = m["cmd"], m.get("url")
-    if not yes:
-        if not sys.stdin.isatty():
-            die("interactive input needed (or use --yes with a name)")
-        review(items)
+                it["cmd"], it["url"], it["args"] = m["cmd"], m.get("url"), m.get("args", "")
+    total = 3 if recapture else 5
+    if interactive:
+        step(1, total, "Choose which windows to include")
+        choose_windows(items)
     items = [{k: v for k, v in it.items() if k != "_skip"} for it in items if not it["_skip"]]
     if not items:
-        die("no windows selected")
+        die("no windows selected. Run it again and keep at least one window.")
+    if interactive:
+        step(2, total, "Customize windows (optional)")
+        customize(items)
     if not recapture:
+        if interactive:
+            step(3, total, "Name the profile")
         while True:
-            name = name or ask("  Profile name: ")
+            name = name or (ask("  Profile name (letters, digits, - and _): ") if interactive else "")
             if not NAME_RE.match(name or ""):
+                if not interactive:
+                    die("a valid profile name is required (letters, digits, - and _)")
                 print("  Use letters, digits, - and _ only.")
                 name = None
-                if yes:
-                    die("invalid profile name")
                 continue
             if load_profile(name):
+                if not interactive:
+                    die(f"profile '{name}' already exists")
                 print("  That name already exists.")
                 name = None
-                if yes:
-                    die("profile exists")
                 continue
             break
-        if bind is None and not yes:
+        if bind is None and interactive:
+            step(4, total, "Choose a shortcut")
             bind = ask_bind()
-        if bind:
+        elif bind:
             check_bind_free(bind)
     p = old or {"name": name, "bind": bind, "enabled": True, "existing": "move", "timeout": 20}
     p["windows"], p["captured_with"] = items, niri_version()
+    if interactive:
+        step(total, total, "Review and save")
+        summary(p)
+        if ask("Save this profile? [Y/n]: ", "y").lower().startswith("n"):
+            print("Cancelled, nothing saved.")
+            return
     mutate(lambda s: save_profile(p))
-    print(f"Saved profile '{p['name']}' ({len(items)} windows)" + (f", shortcut {p['bind']}" if p.get("bind") else "") + ".")
+    how = f"Press {p['bind']} to restore it, or run" if p.get("bind") else "No shortcut set. Restore it with"
+    print(f"Saved profile '{p['name']}' ({len(items)} windows). {how}: {NAME} restore {p['name']}")
+    print(f"Preview first with: {NAME} restore {p['name']} --dry-run")
 
 
 # ---------------------------------------------------------------- restore
@@ -646,7 +776,7 @@ def cmd_restore(name, dry=False):
     DRY = dry
     p = load_profile(name)
     if not p:
-        die(f"no such profile: {name}")
+        die(f"no such profile: {name}. Run `{NAME} list` to see your profiles.")
     log(f"restore '{name}' dry={dry} windows={len(p['windows'])} existing={p.get('existing', 'move')}")
     wins = sorted(p["windows"], key=skey)
     before = niri_json("windows")
@@ -677,6 +807,9 @@ def cmd_restore(name, dry=False):
         for i in pending:
             claimed[i] = f"<new:{wins[i]['app_id']}#{i}>"
         pending = []
+    total, tty = len(pending), sys.stdout.isatty() and not dry
+    if tty and total:
+        print(f"Launching {total} app(s) and waiting for their windows...")
     deadline = time.time() + p.get("timeout", 20)
     while pending and time.time() < deadline:
         time.sleep(0.3)
@@ -688,6 +821,8 @@ def cmd_restore(name, dry=False):
                 claimed[hit] = x["id"]
                 pending.remove(hit)
                 log(f"new window {x['id']} ({x.get('app_id')}) matched profile window #{hit}")
+                if tty:
+                    print(f"  found {wins[hit].get('label') or wins[hit]['app_id']} ({total - len(pending)} of {total})")
     log(f"matching done; unmatched={[wins[i]['app_id'] for i in pending]}")
     outs = niri_json("outputs")
     groups = {}
@@ -761,7 +896,7 @@ def cmd_restore(name, dry=False):
 def need_profile(name):
     p = load_profile(name)
     if not p:
-        die(f"no such profile: {name}")
+        die(f"no such profile: {name}. Run `{NAME} list` to see your profiles.")
     return p
 
 
@@ -904,11 +1039,13 @@ def cmd_rename(old, new):
 def cmd_edit(name):
     p = need_profile(name)
     wins = p["windows"]
+    print(bold(f"Editing '{name}'"))
+    print("Type a window number to customize it, d<N> to delete one, m to change how already-open")
+    print("windows are handled, or Enter to save.")
     while True:
-        for i, w in enumerate(wins, 1):
-            print(f"{i:>3} {desc(w)}")
-        print("    existing-window policy:", p.get("existing", "move"), "(m = toggle move/spawn)")
-        s = ask("Edit window number | d<N> delete | m | Enter = save > ")
+        print_rows(wins)
+        print(f"  Already-open windows: {'moved into place' if p.get('existing', 'move') == 'move' else 'always launch new ones'}")
+        s = ask("> ")
         if not s:
             break
         if s == "m":
@@ -917,8 +1054,22 @@ def cmd_edit(name):
             del wins[int(s[1:]) - 1]
         elif s.isdigit() and 1 <= int(s) <= len(wins):
             edit_window(wins[int(s) - 1])
+        else:
+            print(f"  Type a number from 1 to {len(wins)}, d<N>, m, or Enter.")
     mutate(lambda st: save_profile(p))
     print("Saved.")
+
+
+def cmd_show(name):
+    p = need_profile(name)
+    print(bold(p["name"]) + f"   shortcut: {p.get('bind') or 'none'}" + ("   (disabled)" if not p.get("enabled", True) else ""))
+    print(f"captured with niri {p.get('captured_with', '?')}; already-open windows: "
+          f"{'moved into place' if p.get('existing', 'move') == 'move' else 'always launch new ones'}")
+    wins = sorted(p["windows"], key=skey)
+    print_rows(wins)
+    print("\nLaunch commands:")
+    for i, w in enumerate(wins, 1):
+        print(f"  {i}. {shlex.join(build_launch(w))}")
 
 
 def cmd_enable(name, on):
@@ -977,7 +1128,7 @@ def pick_profile(prompt="Profile"):
 
 
 def menu():
-    print(f"{NAME} v{VERSION}")
+    print(bold(f"{NAME} v{VERSION}"))
     if not is_setup():
         print("Not set up yet.")
         if ask("Run setup now? [Y/n]: ", "y").lower().startswith("y"):
@@ -987,42 +1138,46 @@ def menu():
     else:
         check_version()
     while True:
-        print(f"\n{NAME} v{VERSION}  (niri {niri_version()})\n"
-              " 1) Capture current layout as a new profile\n 2) List profiles\n 3) Restore a profile\n"
-              " 4) Change shortcut\n 5) Rename\n 6) Edit windows (commands / URLs)\n"
-              " 7) Re-capture layout of a profile\n 8) Enable / disable\n 9) Delete\n"
-              "10) Setup / repair\n11) Status & Niri version\n12) Debug & logs\n13) Uninstall\n 0) Quit")
+        print(f"\n{bold(f'{NAME} v{VERSION}')}  (niri {niri_version()})\n"
+              " 1) Capture the current layout as a new profile\n"
+              " 2) List profiles\n 3) Show a profile (windows and launch commands)\n"
+              " 4) Restore a profile\n 5) Change shortcut\n 6) Rename\n"
+              " 7) Edit windows (URLs, arguments, delete)\n 8) Re-capture a profile's layout\n"
+              " 9) Enable / disable\n10) Delete\n11) Setup / repair\n12) Status & Niri version\n"
+              "13) Debug & logs\n14) Uninstall\n 0) Quit")
         c = ask("> ")
         try:
             if c == "1":
                 cmd_capture()
             elif c == "2":
                 cmd_list()
-            elif c in ("3", "4", "5", "6", "7", "8", "9"):
+            elif c in ("3", "4", "5", "6", "7", "8", "9", "10"):
                 n = pick_profile()
                 if not n:
                     continue
                 if c == "3":
-                    cmd_restore(n)
+                    cmd_show(n)
                 elif c == "4":
-                    cmd_rebind(n)
+                    cmd_restore(n)
                 elif c == "5":
-                    cmd_rename(n, ask("New name: "))
+                    cmd_rebind(n)
                 elif c == "6":
-                    cmd_edit(n)
+                    cmd_rename(n, ask("New name: "))
                 elif c == "7":
-                    cmd_capture(n, recapture=True)
+                    cmd_edit(n)
                 elif c == "8":
-                    cmd_enable(n, not load_profile(n).get("enabled", True))
+                    cmd_capture(n, recapture=True)
                 elif c == "9":
+                    cmd_enable(n, not load_profile(n).get("enabled", True))
+                elif c == "10":
                     cmd_delete(n)
-            elif c == "10":
-                cmd_setup()
             elif c == "11":
-                cmd_status()
+                cmd_setup()
             elif c == "12":
-                cmd_debug(ask("on / off / show / clear (Enter = status): ") or None)
+                cmd_status()
             elif c == "13":
+                cmd_debug(ask("on / off / show / clear (Enter = status): ") or None)
+            elif c == "14":
                 cmd_uninstall()
                 if not is_setup():
                     return
@@ -1060,6 +1215,7 @@ def main():
     r.add_argument("name")
     r.add_argument("--dry-run", action="store_true", help="print every launch and niri action, change nothing")
     sub.add_parser("list", help="list profiles")
+    sub.add_parser("show", help="show a profile's windows and exact launch commands").add_argument("name")
     b = sub.add_parser("rebind", help="change a profile's shortcut")
     b.add_argument("name")
     b.add_argument("bind", nargs="?")
@@ -1097,7 +1253,7 @@ def main():
     if a.cmd not in ("restore", "uninstall", "debug") and not shutil.which("niri"):
         die("`niri` not found in PATH")
     if a.cmd in ("capture", "recapture", "rebind", "rename", "edit", "enable", "disable",
-                 "delete", "list", "restore"):
+                 "delete", "list", "restore", "show"):
         require_setup()
     if a.cmd == "setup":
         cmd_setup()
@@ -1111,6 +1267,8 @@ def main():
         cmd_restore(a.name, a.dry_run)
     elif a.cmd == "list":
         cmd_list()
+    elif a.cmd == "show":
+        cmd_show(a.name)
     elif a.cmd == "rebind":
         cmd_rebind(a.name, a.bind)
     elif a.cmd == "rename":
