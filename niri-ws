@@ -2,7 +2,11 @@
 # niri-ws: save and restore Niri workspace layouts ("profiles"), each with its
 # own shortcut. Stdlib-only Python, no background service.
 #
-# NEW IN THIS VERSION (2.0.0):
+# NEW IN THIS VERSION (2.1.0):
+#   - A window's URL field now accepts several URLs separated by spaces; browsers
+#     open them as tabs in one new window (e.g. two tabs in Brave).
+#
+# Earlier (2.0.0):
 #   - BREAKING: renamed niri-profiles -> niri-ws (command, ~/.config/niri/niri-ws/,
 #     include block). `niri-ws setup` migrates an old install automatically.
 #   - New `uninstall`: removes the config include and everything the script
@@ -12,7 +16,7 @@
 #   - `restore --dry-run` is now detailed: prints every launch and niri action it
 #     would run, without changing anything.
 #
-VERSION="2.0.0"
+VERSION="2.1.0"
 NAME="niri-ws"
 LEGACY="niri-profiles"
 
@@ -476,9 +480,9 @@ def build_launch(w):
     cmd = list(w["cmd"])
     if w.get("url"):
         if any(BROWSER_RE.search(t) for t in cmd):
-            cmd += ["--new-window", w["url"]]
+            cmd += ["--new-window", *w["url"].split()]
         else:
-            cmd.append(w["url"])
+            cmd += w["url"].split()
     return cmd
 
 
@@ -544,7 +548,7 @@ def edit_window(it):
     if s:
         it["cmd"] = shlex.split(s)
     cu = it.get("url") or ""
-    s = ask(f"  URL [{cu or 'none'}] ('-' clears): ")
+    s = ask(f"  URL(s), space-separated for several tabs [{cu or 'none'}] ('-' clears): ")
     if s == "-":
         it["url"] = None
     elif s:
