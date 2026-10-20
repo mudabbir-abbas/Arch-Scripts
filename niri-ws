@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
-# niri-profiles: save and restore workspace layouts ("profiles") in Niri,
-# each with its own shortcut. Stdlib-only Python, no background service.
+# niri-ws: save and restore Niri workspace layouts ("profiles"), each with its
+# own shortcut. Stdlib-only Python, no background service.
 #
-# NEW IN THIS VERSION (1.0.2):
-#   - Fix: AppImages are captured with their real .AppImage path (read from the
-#     process's APPIMAGE variable) instead of the temporary /tmp/.mount_* path.
-#     Any remaining temp-mount command is flagged with [!] in the review list.
+# NEW IN THIS VERSION (2.0.0):
+#   - BREAKING: renamed niri-profiles -> niri-ws (command, ~/.config/niri/niri-ws/,
+#     include block). `niri-ws setup` migrates an old install automatically.
+#   - New `uninstall`: removes the config include and everything the script
+#     created (the script itself in ~/.local/bin is left alone).
+#   - New `--debug` flag and `debug on|off|show|clear`: detailed log of every niri
+#     call and decision in ~/.config/niri/niri-ws/logs/debug.log.
+#   - `restore --dry-run` is now detailed: prints every launch and niri action it
+#     would run, without changing anything.
 #
-# Earlier (1.0.1):
-#   - Fix: shortcuts given on the command line (capture --bind, rebind NAME KEY)
-#     are now checked for conflicts with existing binds and are refused if taken.
-#
-# Earlier (1.0.0): initial release: setup (config include + own dir), capture, restore,
-#     manage (rebind, rename, edit commands/URLs, enable/disable, delete,
-#     re-capture), Niri version tracking, nested-include with flat fallback,
-#     config backups with automatic rollback when `niri validate` fails.
-#
-VERSION="1.0.2"
-NAME="niri-profiles"
+VERSION="2.0.0"
+NAME="niri-ws"
+LEGACY="niri-profiles"
 
 import argparse, json, os, re, shlex, shutil, subprocess, sys, time
 from datetime import datetime
@@ -35,6 +32,12 @@ BIN = HOME / ".local" / "bin" / NAME
 MARK_BEGIN = f"// >>> {NAME} (managed block, do not edit) >>>"
 MARK_END = f"// <<< {NAME} <<<"
 INCLUDE_LINE = f'include "{NAME}/main.kdl"'
+LEGACY_DIR = NIRI_DIR / LEGACY
+LOG = DIR / "logs" / "debug.log"
+DEBUG = False          # --debug: also echo log lines to stderr
+PERSIST_DEBUG = False  # `debug on`: always log to the file
+NOLOG = False
+DRY = False
 
 # Fallback app-id -> Flatpak ID when no .desktop match is found.
 KNOWN_FLATPAK = {
@@ -59,13 +62,39 @@ RELEVANT = [
 
 
 # ---------------------------------------------------------------- helpers
+def log(msg, force=False):
+    """Debug log. Written when --debug or `debug on` is active; force=True always
+    logs (used for errors) but only once the data dir exists."""
+    if NOLOG or not (DEBUG or PERSIST_DEBUG or (force and DIR.exists())):
+        return
+    now = datetime.now()
+    line = f"{now:%H:%M:%S.%f}"[:-3] + f" [{os.getpid()}] {msg}"
+    if DEBUG:
+        print("debug:", line, file=sys.stderr)
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > 1_000_000:
+            os.replace(LOG, LOG.with_name("debug.log.1"))
+        with open(LOG, "a") as f:
+            f.write(f"{now:%Y-%m-%d} {line}\n")
+    except OSError:
+        pass
+
+
 def die(msg, code=1):
+    log(f"ERROR: {msg}", force=True)
     print(f"{NAME}: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
 def sh(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    log(f"$ {shlex.join(cmd)} -> rc={r.returncode}")
+    if r.stdout.strip():
+        log("    stdout: " + r.stdout.strip()[:20000])
+    if r.stderr.strip():
+        log("    stderr: " + r.stderr.strip()[:2000])
+    return r
 
 
 def ask(prompt, default=""):
@@ -78,6 +107,7 @@ def ask(prompt, default=""):
 
 def write(path, text):
     real = Path(os.path.realpath(path))
+    log(f"write {real} ({len(text)} bytes)")
     real.parent.mkdir(parents=True, exist_ok=True)
     tmp = real.with_name(real.name + ".tmp")
     tmp.write_text(text)
@@ -118,6 +148,7 @@ def load_state():
     s.setdefault("bind_mode", "nested")
     s.setdefault("confirmed", [])
     s.setdefault("flagged", [])
+    s.setdefault("debug", False)
     return s
 
 
@@ -171,10 +202,12 @@ def snapshot():
         shutil.copytree(PROFILES, dst / "profiles")
     for old in sorted(p for p in BACKUPS.iterdir() if p.is_dir())[:-10]:
         shutil.rmtree(old)
+    log(f"snapshot -> {dst}")
     return dst
 
 
 def rollback(dst):
+    log(f"ROLLBACK from {dst}", force=True)
     if (dst / "config.kdl").exists():
         shutil.copy2(dst / "config.kdl", Path(os.path.realpath(CONFIG)))
     for f in ("main.kdl", "state.json"):
@@ -253,6 +286,7 @@ def rebuild_and_validate(state):
         state["bind_mode"] = mode
         write_all(state, ver)
         ok, msg = validate()
+        log(f"rebuild mode={mode} validate ok={ok} {msg}")
         if ok:
             save_state(state)
             return True, msg
@@ -263,6 +297,7 @@ def rebuild_and_validate(state):
 def mutate(fn):
     """Run fn(state), regenerate files, validate with niri; roll back on failure."""
     ok, msg = validate()
+    log(f"mutate: pre-validate ok={ok}")
     if not ok:
         die("your Niri config does not validate before any change; fix it first:\n" + msg)
     snap = snapshot()
@@ -403,6 +438,12 @@ def clean_exec(exe):
 
 
 def guess_cmd(w):
+    c = _guess_cmd(w)
+    log(f"launch command for app_id={w.get('app_id')} pid={w.get('pid')}: {c}")
+    return c
+
+
+def _guess_cmd(w):
     aid = (w.get("app_id") or "").lower()
     exe = desktop_index().get(aid)
     if exe:
@@ -465,6 +506,7 @@ def capture_windows():
     anc = ancestors()
     own = [w for w in wins if w.get("pid") in anc] or [w for w in wins if w.get("is_focused")]
     skip = {w["id"] for w in own}
+    log(f"own-terminal windows excluded: {sorted(skip)} (ancestor pids: {sorted(anc)})")
     items = []
     for w in wins:
         ws = wss.get(w.get("workspace_id"))
@@ -527,6 +569,8 @@ def review(items):
 
 def require_setup():
     if not is_setup():
+        if LEGACY_DIR.exists():
+            die(f"an old {LEGACY} install was found. Run: {NAME} setup (it migrates it)")
         die(f"not set up yet. Run: {NAME} setup")
 
 
@@ -578,9 +622,13 @@ def cmd_capture(name=None, bind=None, yes=False, recapture=False):
 
 # ---------------------------------------------------------------- restore
 def act(fails, *args):
+    if DRY:
+        print("  would run: niri msg action " + shlex.join(args))
+        return True
     r = sh(["niri", "msg", "action", *args])
     if r.returncode:
         fails.append(f"{' '.join(args)}: {r.stderr.strip()}")
+        log(f"ACTION FAILED: {' '.join(args)}: {r.stderr.strip()}", force=True)
     return r.returncode == 0
 
 
@@ -590,9 +638,12 @@ def same_app(x, w):
 
 
 def cmd_restore(name, dry=False):
+    global DRY
+    DRY = dry
     p = load_profile(name)
     if not p:
         die(f"no such profile: {name}")
+    log(f"restore '{name}' dry={dry} windows={len(p['windows'])} existing={p.get('existing', 'move')}")
     wins = sorted(p["windows"], key=skey)
     before = niri_json("windows")
     base = {w["id"] for w in before}
@@ -603,20 +654,25 @@ def cmd_restore(name, dry=False):
             m = next((x for x in before if x["id"] not in used and same_app(x, w)), None)
             if m:
                 claimed[i] = m["id"]
+                log(f"reuse existing window {m['id']} for {w['app_id']}")
+                if dry:
+                    print(f"reuse existing window {m['id']} ({w['app_id']})")
                 continue
         cmd = build_launch(w)
         if dry:
-            print("spawn:", shlex.join(cmd))
+            print("would launch:", shlex.join(cmd))
             continue
+        log(f"launch: {shlex.join(cmd)}")
         try:
             subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError as e:
             fails.append(f"launch {cmd[:1]}: {e}")
-    if dry:
-        print(f"(dry run) {len(claimed)} existing window(s) would be reused.")
-        return
     pending = [i for i in range(len(wins)) if i not in claimed]
+    if dry:
+        for i in pending:
+            claimed[i] = f"<new:{wins[i]['app_id']}#{i}>"
+        pending = []
     deadline = time.time() + p.get("timeout", 20)
     while pending and time.time() < deadline:
         time.sleep(0.3)
@@ -627,6 +683,8 @@ def cmd_restore(name, dry=False):
             if hit is not None:
                 claimed[hit] = x["id"]
                 pending.remove(hit)
+                log(f"new window {x['id']} ({x.get('app_id')}) matched profile window #{hit}")
+    log(f"matching done; unmatched={[wins[i]['app_id'] for i in pending]}")
     outs = niri_json("outputs")
     groups = {}
     for i in sorted(claimed):
@@ -682,8 +740,12 @@ def cmd_restore(name, dry=False):
             first = members[0][1]
     if first is not None:
         act(fails, "focus-window", "--id", str(first))
+    if dry:
+        print("(dry run) nothing was changed.")
+        return
     msgs = [f"not found: {wins[i]['app_id']} ({shlex.join(wins[i]['cmd'])})" for i in pending] + fails
     if msgs:
+        log("restore problems: " + " | ".join(msgs), force=True)
         print(f"Restored '{name}' with {len(msgs)} problem(s):", file=sys.stderr)
         for m in msgs:
             print("  -", m, file=sys.stderr)
@@ -713,14 +775,87 @@ def cmd_setup():
             shutil.copy2(src, BIN)
         BIN.chmod(0o755)
         PROFILES.mkdir(parents=True, exist_ok=True)
+        if LEGACY_DIR.exists():
+            log(f"migrating {LEGACY_DIR} -> {DIR}")
+            shutil.copytree(LEGACY_DIR, DIR, dirs_exist_ok=True, ignore=shutil.ignore_patterns("backups", "logs"))
+            state.update(load_state())
         text = CONFIG.read_text()
-        if MARK_BEGIN not in text:
-            write(CONFIG, text.rstrip("\n") + f"\n\n{MARK_BEGIN}\n{INCLUDE_LINE}\n{MARK_END}\n")
+        new = strip_block(text, LEGACY)
+        if MARK_BEGIN not in new:
+            new = new.rstrip("\n") + f"\n\n{MARK_BEGIN}\n{INCLUDE_LINE}\n{MARK_END}\n"
+        if new != text:
+            write(CONFIG, new)
 
     mutate(change)
+    if LEGACY_DIR.exists():
+        shutil.rmtree(LEGACY_DIR)
+        print(f"Migrated the old {LEGACY} install. You can delete the old script: rm {BIN.with_name(LEGACY)}")
     print(f"Setup done. Script installed at {BIN}; data in {DIR}.")
     if str(BIN.parent) not in os.environ.get("PATH", "").split(":"):
         print(f"  (~/.local/bin is not in PATH; shortcuts use the full path, so they still work.)")
+
+
+def strip_block(text, name):
+    pat = re.compile(r"\n*// >>> " + re.escape(name) + r" \(managed block.*?// <<< " + re.escape(name) + r" <<<\n?", re.S)
+    out = pat.sub("\n", text)
+    return out if out == text else out.rstrip("\n") + "\n"
+
+
+def cmd_uninstall(yes=False):
+    global NOLOG
+    text = CONFIG.read_text() if CONFIG.exists() else ""
+    stripped = strip_block(strip_block(text, NAME), LEGACY)
+    dirs = [d for d in (DIR, LEGACY_DIR) if d.exists()]
+    if stripped == text and not dirs:
+        print("Nothing to remove.")
+        return
+    print("This will remove:")
+    if stripped != text:
+        print(f"  - the {NAME} include block in {CONFIG}")
+    for d in dirs:
+        print(f"  - {d}  (profiles, state, backups, logs)")
+    print(f"The script itself ({BIN}) is left in place.")
+    if not yes and ask("Proceed? [y/N]: ").lower() != "y":
+        print("Cancelled.")
+        return
+    if stripped != text:
+        have_niri = bool(shutil.which("niri"))
+        ok_before = validate()[0] if have_niri else True
+        write(CONFIG, stripped)
+        if have_niri:
+            ok, msg = validate()
+            if ok_before and not ok:
+                write(CONFIG, text)
+                die("`niri validate` failed after removing the include; config restored, nothing deleted:\n" + msg)
+    log("uninstall: deleting data dirs")
+    NOLOG = True
+    for d in dirs:
+        shutil.rmtree(d)
+    print(f"Uninstalled. To remove the script itself: rm {BIN}")
+
+
+def cmd_debug(action=None):
+    if action in ("on", "off"):
+        require_setup()
+        st = load_state()
+        st["debug"] = action == "on"
+        save_state(st)
+        print(f"Persistent debug logging: {action}. Log: {LOG}")
+    elif action == "show":
+        if not LOG.exists():
+            print(f"No log yet ({LOG}). Run a command with --debug, or `{NAME} debug on`.")
+            return
+        print(f"# {LOG}")
+        print("\n".join(LOG.read_text(errors="ignore").splitlines()[-80:]))
+    elif action == "clear":
+        for f in (LOG, LOG.with_name("debug.log.1")):
+            if f.exists():
+                f.unlink()
+        print("Log cleared.")
+    else:
+        print(f"Persistent debug logging: {'on' if load_state().get('debug') else 'off'}")
+        print(f"Log file: {LOG}" + ("" if LOG.exists() else " (none yet)"))
+        print(f"Use `{NAME} debug show`, or add --debug to any command.")
 
 
 def cmd_list():
@@ -852,7 +987,7 @@ def menu():
               " 1) Capture current layout as a new profile\n 2) List profiles\n 3) Restore a profile\n"
               " 4) Change shortcut\n 5) Rename\n 6) Edit windows (commands / URLs)\n"
               " 7) Re-capture layout of a profile\n 8) Enable / disable\n 9) Delete\n"
-              "10) Setup / repair\n11) Status & Niri version\n 0) Quit")
+              "10) Setup / repair\n11) Status & Niri version\n12) Debug & logs\n13) Uninstall\n 0) Quit")
         c = ask("> ")
         try:
             if c == "1":
@@ -881,6 +1016,12 @@ def menu():
                 cmd_setup()
             elif c == "11":
                 cmd_status()
+            elif c == "12":
+                cmd_debug(ask("on / off / show / clear (Enter = status): ") or None)
+            elif c == "13":
+                cmd_uninstall()
+                if not is_setup():
+                    return
             elif c in ("0", "q"):
                 return
         except SystemExit as e:
@@ -902,6 +1043,8 @@ def main():
                 description="Save and restore Niri workspace layouts, each with its own shortcut.\n"
                             "Run without arguments for an interactive menu.")
     ap.add_argument("--version", action="version", version=f"{NAME} v{VERSION}")
+    ap.add_argument("--debug", action="store_true",
+                    help="log every niri call and decision (stderr + log file); works anywhere on the line")
     sub = ap.add_subparsers(dest="cmd", metavar="COMMAND", parser_class=Parser)
     sub.add_parser("setup", help="install script, create config dir, add include to config.kdl")
     c = sub.add_parser("capture", help="record the current layout as a new profile")
@@ -911,7 +1054,7 @@ def main():
     sub.add_parser("recapture", help="replace a profile's layout with the current one").add_argument("name")
     r = sub.add_parser("restore", help="launch and place a profile's windows")
     r.add_argument("name")
-    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--dry-run", action="store_true", help="print every launch and niri action, change nothing")
     sub.add_parser("list", help="list profiles")
     b = sub.add_parser("rebind", help="change a profile's shortcut")
     b.add_argument("name")
@@ -927,15 +1070,27 @@ def main():
     d.add_argument("--yes", action="store_true")
     cf = sub.add_parser("confirm", help="record the installed Niri version as supported")
     cf.add_argument("--no", action="store_true", help="record it as NOT supported")
+    ud = sub.add_parser("uninstall", help="remove the config include and everything this script created")
+    ud.add_argument("--yes", action="store_true")
+    dg = sub.add_parser("debug", help="debug logging: on | off | show | clear (no argument = status)")
+    dg.add_argument("action", nargs="?", choices=["on", "off", "show", "clear"])
     sub.add_parser("status", help="show setup state and Niri version tracking")
+    global DEBUG, PERSIST_DEBUG
+    if "--debug" in sys.argv[1:]:
+        DEBUG = True
+        sys.argv = [x for x in sys.argv if x != "--debug"]
+    if STATE.exists():
+        PERSIST_DEBUG = bool(load_state().get("debug"))
     a = ap.parse_args()
+    if DEBUG or PERSIST_DEBUG:
+        log(f"run: {NAME} v{VERSION} args={sys.argv[1:]} niri={niri_version() if shutil.which('niri') else 'missing'}")
 
     if not a.cmd:
         if not sys.stdin.isatty():
             ap.print_help()
             return
         return menu()
-    if a.cmd != "restore" and not shutil.which("niri"):
+    if a.cmd not in ("restore", "uninstall", "debug") and not shutil.which("niri"):
         die("`niri` not found in PATH")
     if a.cmd in ("capture", "recapture", "rebind", "rename", "edit", "enable", "disable",
                  "delete", "list", "restore"):
@@ -968,6 +1123,10 @@ def main():
         cmd_confirm(a.no)
     elif a.cmd == "status":
         cmd_status()
+    elif a.cmd == "uninstall":
+        cmd_uninstall(a.yes)
+    elif a.cmd == "debug":
+        cmd_debug(a.action)
 
 
 if __name__ == "__main__":
