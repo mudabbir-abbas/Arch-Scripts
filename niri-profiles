@@ -2,13 +2,21 @@
 # niri-profiles: save and restore workspace layouts ("profiles") in Niri,
 # each with its own shortcut. Stdlib-only Python, no background service.
 #
-# NEW IN THIS VERSION (1.0.0):
-#   - Initial release: setup (config include + own dir), capture, restore,
+# NEW IN THIS VERSION (1.0.2):
+#   - Fix: AppImages are captured with their real .AppImage path (read from the
+#     process's APPIMAGE variable) instead of the temporary /tmp/.mount_* path.
+#     Any remaining temp-mount command is flagged with [!] in the review list.
+#
+# Earlier (1.0.1):
+#   - Fix: shortcuts given on the command line (capture --bind, rebind NAME KEY)
+#     are now checked for conflicts with existing binds and are refused if taken.
+#
+# Earlier (1.0.0): initial release: setup (config include + own dir), capture, restore,
 #     manage (rebind, rename, edit commands/URLs, enable/disable, delete,
 #     re-capture), Niri version tracking, nested-include with flat fallback,
 #     config backups with automatic rollback when `niri validate` fails.
 #
-VERSION="1.0.0"
+VERSION="1.0.2"
 NAME="niri-profiles"
 
 import argparse, json, os, re, shlex, shutil, subprocess, sys, time
@@ -322,6 +330,14 @@ def existing_binds(exclude=None):
     return out
 
 
+def check_bind_free(bind, exclude=None):
+    if not COMBO_RE.match(bind):
+        die(f"invalid shortcut: {bind}")
+    where = existing_binds(exclude).get(norm_combo(bind))
+    if where:
+        die(f"shortcut {bind} is already used by {where}")
+
+
 def ask_bind(exclude=None, current=None):
     taken = existing_binds(exclude)
     while True:
@@ -398,6 +414,14 @@ def guess_cmd(w):
     pid = w.get("pid")
     if pid:
         try:
+            for e in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+                if e.startswith(b"APPIMAGE="):
+                    ai = e[9:].decode()
+                    if ai and Path(ai).exists():
+                        return [ai]
+        except OSError:
+            pass
+        try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
             c = [x.decode() for x in raw if x]
             if c and Path(c[0]).name != "bwrap":
@@ -468,6 +492,8 @@ def desc(it):
     ws = it["workspace"]
     loc = "float" if it["floating"] else f"col{it['column']}.{it['tile']}"
     s = f"ws:{ws['name'] or ws['idx']} {loc:<8} {(it['app_id'] or '?')[:24]:<24} {shlex.join(it['cmd'])[:46]}"
+    if any(t.startswith("/tmp/.mount_") for t in it["cmd"]):
+        s += "  [!] temp AppImage path, use e<N> to set the real one"
     return s + (f"  -> {it['url']}" if it.get("url") else "")
 
 
@@ -542,8 +568,8 @@ def cmd_capture(name=None, bind=None, yes=False, recapture=False):
             break
         if bind is None and not yes:
             bind = ask_bind()
-        if bind and not COMBO_RE.match(bind):
-            die(f"invalid shortcut: {bind}")
+        if bind:
+            check_bind_free(bind)
     p = old or {"name": name, "bind": bind, "enabled": True, "existing": "move", "timeout": 20}
     p["windows"], p["captured_with"] = items, niri_version()
     mutate(lambda s: save_profile(p))
@@ -711,8 +737,10 @@ def cmd_rebind(name, bind=None):
     p = need_profile(name)
     if bind is None:
         bind = ask_bind(exclude=name, current=p.get("bind"))
-    elif not COMBO_RE.match(bind):
-        die(f"invalid shortcut: {bind}")
+    elif bind != "none":
+        check_bind_free(bind, exclude=name)
+    if bind == "none":
+        bind = None
     p["bind"] = bind
     mutate(lambda s: save_profile(p))
     print(f"'{name}' shortcut: {bind or 'none'}")

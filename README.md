@@ -8,3 +8,4 @@ Personal utility scripts from `~/.local/bin` on Arch Linux.
 - `binvc` : GitHub Repo Help
 - `ims` : Install My Script
 - `shelf` : A deck for all my scripts
+- `niri-profiles` : Workspace Manager for Niri
