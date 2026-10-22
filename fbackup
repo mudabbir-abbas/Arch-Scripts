@@ -17,11 +17,24 @@
 #   - compression: zstd if installed, otherwise gzip, otherwise plain tar
 #   - no python, no realpath, no sed/grep, no KDE/GUI tools
 
-# Version (semantic: MAJOR.MINOR.PATCH). Bump it on every change and add a line below.
+# Version (semantic: MAJOR.MINOR.PATCH). Bump it on every change.
+#
+# NEW IN THIS VERSION (2.0.0)
+#   - Saved paths: put the paths you always want in ~/.config/fbackup/paths.conf.
+#     Every time a backup starts, fbackup lists them and asks "Include? [Y/n]"
+#     (Enter or y = include, n = skip them this time).
+#   - New 'config' command to manage them: config [list|add|remove|edit]
+#     (plain 'fbackup config' opens a small interactive editor).
+#   - New --saved / --no-saved: always / never include saved paths, no question.
+#   - Running fbackup with no arguments now opens a menu (Enter = Backup)
+#     instead of going straight to the file picker.
+#   - 'list' without an archive now asks for one, like 'restore' does.
+#
+# History
 #   1.0.0  first versioned release: pure-bash (no python/kdialog), zstd->gzip->tar
 #          fallback, dependency preflight + --check, symlink warnings, sudo offer
 #          on permission errors, --home mode, restore checks archive contents
-VERSION="1.0.0"
+VERSION="2.0.0"
 
 set -euo pipefail
 
@@ -39,6 +52,10 @@ EXT="tar"
 VERBOSE=false
 OVERWRITE=false
 HOME_ONLY=false
+SAVED_MODE="ask"      # ask | yes (--saved) | no (--no-saved)
+SAVED=()
+CONF_DIR=""
+CONF_FILE=""
 REPLY=""
 
 usage() {
@@ -46,10 +63,13 @@ echo "fbackup v$VERSION - back up chosen files/folders into one archive and rest
 cat <<'EOF'
 
 Usage:
+  fbackup                             open the menu (backup, restore, saved paths, ...)
   fbackup [options]                   drag files/folders into the terminal, Enter to finish
   fbackup [options] PATH [PATH...]    back up exactly these paths
   fbackup restore [options] [ARCHIVE] restore to the original locations
-  fbackup list [-v] ARCHIVE           show what is inside an archive
+  fbackup list [-v] [ARCHIVE]         show what is inside an archive
+  fbackup config [list|add|remove|edit] [PATH...]
+                                      manage the saved paths (see "Saved paths")
   fbackup --check                     check that everything fbackup needs is installed
 
 Modes:
@@ -63,10 +83,26 @@ Modes:
             backup   only items inside your home are saved; others are skipped
             restore  only the home part of the archive is restored
 
+Saved paths:
+  Paths you always want backed up live in  ~/.config/fbackup/paths.conf
+  (one per line; ~/... for your home; lines starting with # are ignored).
+  When a backup starts without PATH arguments, fbackup lists them and asks
+  "Include these? [Y/n]": Enter or y includes them, n skips them for this run.
+  You can still drag in more files afterwards.
+    fbackup config                     small interactive editor
+    fbackup config add PATH...         save paths
+    fbackup config remove PATH...      forget paths
+    fbackup config list                show them
+    fbackup config edit                open the file in $VISUAL / $EDITOR
+  With explicit PATH arguments fbackup uses exactly those; add --saved to
+  include the saved ones as well.
+
 Options:
   --home           home-only mode (see above)
   -v, --verbose    show every file that is archived / restored / skipped
   -o, --output DIR save the archive in DIR instead of your home folder
+  --saved          include the saved paths without asking (also with PATH arguments)
+  --no-saved       do not include or ask about the saved paths
   --overwrite      (restore) replace files that already exist
                    (default: existing files are left untouched)
   --check          check that everything fbackup needs is installed
@@ -75,6 +111,7 @@ Options:
 
 Examples:
   fbackup --home ~/Documents ~/.config/niri      home files only, no root
+  fbackup config add ~/.config/niri ~/Documents  always offer these from now on
   sudo fbackup /usr/share/wallpapers ~/Pictures  system + home files (needs root)
   fbackup restore backup.tar.zst                 checks the archive, asks for sudo if needed
   fbackup restore --home backup.tar.zst          restore only the home part, no root
@@ -208,6 +245,8 @@ setup_home() {
   [[ -n $h && $h == /* ]] \
     || die "\$HOME is not set to a real folder (got '${HOME-}'). Set it and try again."
   HOME_DIR=$h
+  CONF_DIR="$HOME_DIR/.config/fbackup"
+  CONF_FILE="$CONF_DIR/paths.conf"
 }
 
 in_home() { [[ $1 == "$HOME_DIR" || $1 == "$HOME_DIR"/* ]]; }
@@ -419,6 +458,260 @@ pick_cli() {
   done
 }
 
+# ---------- saved paths (config) ----------
+# Config file: ~/.config/fbackup/paths.conf - one path per line, ~/... for
+# your home, "#" starts a comment. Missing paths are kept but skipped.
+
+# Give a config folder/file the owner of your home (matters when run via sudo).
+conf_chown() {
+  if (( EUID == 0 )) && have chown; then
+    chown --reference="$HOME_DIR" -- "$@" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# conf_parse LINE -> REPLY=absolute path. Returns 1 for blank/comment lines,
+# 2 for a line that is not an absolute path or ~/... path.
+conf_parse() {
+  trim "$1"
+  local s=$REPLY
+  [[ -n $s && $s != '#'* ]] || return 1
+  case $s in
+    '~')   s=$HOME_DIR ;;
+    '~/'*) s=$HOME_DIR/${s#'~/'} ;;
+  esac
+  [[ $s == /* ]] || return 2
+  abspath "$s"
+  return 0
+}
+
+# Fill SAVED[] from the config file (silent when there is none).
+load_saved() {
+  SAVED=()
+  [[ -f $CONF_FILE ]] || return 0
+  if [[ ! -r $CONF_FILE ]]; then warn "Cannot read config: $(short "$CONF_FILE")"; return 0; fi
+  local line rc p n=0 seen=$'\n'
+  while IFS= read -r line || [[ -n $line ]]; do
+    n=$((n+1))
+    rc=0; conf_parse "$line" || rc=$?
+    case $rc in
+      0) p=$REPLY
+         if [[ $seen != *$'\n'"$p"$'\n'* ]]; then seen+="$p"$'\n'; SAVED+=("$p"); fi ;;
+      2) warn "config line $n ignored (use an absolute path or ~/...): $line" ;;
+    esac
+  done <"$CONF_FILE"
+  return 0
+}
+
+# Create the config folder and a commented, empty file if they do not exist yet.
+conf_ensure() {
+  if [[ ! -d $CONF_DIR ]]; then
+    local fresh=0
+    if [[ ! -d $HOME_DIR/.config ]]; then fresh=1; fi
+    mkdir -p -- "$CONF_DIR" || die "Cannot create config folder: $CONF_DIR"
+    if (( fresh )); then conf_chown "$HOME_DIR/.config"; fi
+    conf_chown "$CONF_DIR"
+  fi
+  if [[ ! -e $CONF_FILE ]]; then
+    cat >"$CONF_FILE" <<'EOF' || die "Cannot create $CONF_FILE"
+# fbackup saved paths - one path per line.
+# fbackup offers these every time you start a backup.
+# Use ~/... for files in your home. Lines starting with # are ignored.
+# Manage with:  fbackup config add|remove|list|edit
+EOF
+    conf_chown "$CONF_FILE"
+  fi
+}
+
+# Replace the config with the finished temp file $1.
+conf_commit() {
+  mv -- "$1" "$CONF_FILE" || die "Could not update $(short "$CONF_FILE")"
+  conf_chown "$CONF_FILE"
+}
+
+conf_list() {
+  load_saved
+  info "${B}Saved paths${N} ($(short "$CONF_FILE")):"
+  if (( ${#SAVED[@]} == 0 )); then
+    info "  (none yet - add some with: fbackup config add PATH...)"
+    return 0
+  fi
+  local i=1 p mark
+  for p in "${SAVED[@]}"; do
+    mark=""
+    if [[ ! -e $p && ! -L $p ]]; then mark="  ${Y}(not found)${N}"; fi
+    printf '  %2d) %s%s\n' "$i" "$(short "$p")" "$mark"
+    i=$((i+1))
+  done
+}
+
+# conf_add PATH... - save paths (home paths are stored as ~/... ).
+conf_add() {
+  local p form cur content tmp new=()
+  local -A known=()
+  load_saved
+  for cur in ${SAVED[@]+"${SAVED[@]}"}; do known["$cur"]=1; done
+  for p in "$@"; do
+    abspath "$p"; p=$REPLY
+    if [[ $p == / ]]; then warn "refusing to save '/', skipped."; continue; fi
+    if [[ ! -e $p && ! -L $p ]]; then warn "not found, not saved: $p"; continue; fi
+    if [[ -n ${known["$p"]+x} ]]; then info "  already saved: $(short "$p")"; continue; fi
+    known["$p"]=1
+    if in_home "$p"; then form="~${p#"$HOME_DIR"}"; else form=$p; fi
+    new+=("$form")
+  done
+  (( ${#new[@]} )) || return 0
+  conf_ensure
+  content=$(<"$CONF_FILE")                  # (also normalises the trailing newline)
+  tmp="$CONF_FILE.tmp.$$"; TMPS+=("$tmp")
+  { printf '%s\n' "$content"; printf '%s\n' "${new[@]}"; } >"$tmp" \
+    || die "Cannot write to $(short "$CONF_DIR")"
+  conf_commit "$tmp"
+  for form in "${new[@]}"; do ok "saved: $form"; done
+}
+
+# conf_remove PATH... - forget paths (comments and other lines are kept).
+conf_remove() {
+  [[ -f $CONF_FILE ]] || { info "No saved paths."; return 0; }
+  local p line rc tmp removed=0 keep=()
+  local -A drop=() hit=()
+  for p in "$@"; do abspath "$p"; drop["$REPLY"]=1; done
+  while IFS= read -r line || [[ -n $line ]]; do
+    rc=0; conf_parse "$line" || rc=$?
+    if (( rc == 0 )) && [[ -n ${drop["$REPLY"]+x} ]]; then
+      hit["$REPLY"]=1; removed=$((removed+1)); continue
+    fi
+    keep+=("$line")
+  done <"$CONF_FILE"
+  for p in "${!drop[@]}"; do
+    if [[ -z ${hit["$p"]+x} ]]; then warn "not in the saved list: $(short "$p")"; fi
+  done
+  (( removed )) || return 0
+  tmp="$CONF_FILE.tmp.$$"; TMPS+=("$tmp")
+  { if (( ${#keep[@]} )); then printf '%s\n' "${keep[@]}"; fi; } >"$tmp" \
+    || die "Cannot write to $(short "$CONF_DIR")"
+  conf_commit "$tmp"
+  for p in "${!hit[@]}"; do ok "removed: $(short "$p")"; done
+}
+
+conf_edit() {
+  conf_ensure
+  local ed=${VISUAL:-${EDITOR:-}} e
+  if [[ -z $ed ]]; then
+    for e in nano micro vim vi; do if have "$e"; then ed=$e; break; fi; done
+  fi
+  [[ -n $ed ]] || die "No editor found. Set \$EDITOR, or edit this file by hand: $CONF_FILE"
+  # shellcheck disable=SC2086   # $ed may hold arguments, e.g. "code -w"
+  $ed "$CONF_FILE" || warn "Editor exited with an error."
+  conf_chown "$CONF_FILE"
+}
+
+config_remove_ui() {
+  load_saved
+  if (( ${#SAVED[@]} == 0 )); then info "Nothing to remove."; return 0; fi
+  local ans="" tok nums=() pick=()
+  read -r -p "Number(s) to remove, e.g. 1 3 (Enter = cancel): " ans || true
+  read -r -a nums <<<"$ans" || true
+  for tok in ${nums[@]+"${nums[@]}"}; do
+    if [[ $tok =~ ^[0-9]{1,4}$ ]] && (( 10#$tok >= 1 && 10#$tok <= ${#SAVED[@]} )); then
+      pick+=("${SAVED[10#$tok-1]}")
+    else
+      warn "ignored: $tok"
+    fi
+  done
+  if (( ${#pick[@]} )); then conf_remove "${pick[@]}"; fi
+}
+
+config_menu() {
+  if [[ ! -t 0 ]]; then conf_list; return 0; fi
+  local ans=""
+  while true; do
+    echo; conf_list; echo
+    echo "  a) add paths   r) remove paths   e) edit the file   Enter) done"
+    read -r -p "Choice: " ans || break
+    trim "$ans"
+    case ${REPLY,,} in
+      a|add)    PATHS=(); pick_cli; if (( ${#PATHS[@]} )); then conf_add "${PATHS[@]}"; fi ;;
+      r|remove) config_remove_ui ;;
+      e|edit)   conf_edit ;;
+      ''|q|done) break ;;
+      *)        warn "Unknown choice: $REPLY" ;;
+    esac
+  done
+}
+
+do_config() {
+  setup_home
+  local sub=${ARGS[0]-}
+  case $sub in
+    '')        config_menu ;;
+    list|ls)   conf_list ;;
+    add)       (( ${#ARGS[@]} > 1 )) || die "config add needs at least one path."
+               conf_add "${ARGS[@]:1}" ;;
+    remove|rm) (( ${#ARGS[@]} > 1 )) || die "config remove needs at least one path."
+               conf_remove "${ARGS[@]:1}" ;;
+    edit)      conf_edit ;;
+    *)         die "Unknown config command: $sub (use list, add, remove or edit)." ;;
+  esac
+}
+
+# At the start of a backup: show the saved paths and ask whether to include them.
+offer_saved() {
+  load_saved
+  (( ${#SAVED[@]} )) || return 0
+  local p ans=""
+  if [[ $SAVED_MODE == yes ]]; then
+    PATHS+=("${SAVED[@]}")
+    info "Including ${#SAVED[@]} saved path(s) from $(short "$CONF_FILE")."
+    return 0
+  fi
+  [[ -t 0 ]] || return 0                       # cannot ask without a terminal
+  info "${B}Saved paths${N} ($(short "$CONF_FILE")):"
+  for p in "${SAVED[@]}"; do
+    if [[ -e $p || -L $p ]]; then info "  $(short "$p")"
+    else info "  $(short "$p")  ${Y}(not found - will be skipped)${N}"; fi
+  done
+  read -r -p "Include these ${#SAVED[@]} path(s)? [Y/n] " ans || true
+  trim "$ans"; ans=$REPLY
+  if [[ $ans == [nN]* ]]; then
+    info "  Saved paths skipped this time."
+  else
+    PATHS+=("${SAVED[@]}")
+    ok "${#SAVED[@]} saved path(s) added."
+  fi
+}
+
+# ---------- menu (running fbackup with no arguments) ----------
+main_menu() {
+  [[ -t 0 ]] || { usage >&2; exit 1; }
+  local ans=""
+  info "${B}fbackup v$VERSION${N}"
+  cat <<'EOF'
+
+  1) Backup                (any path; needs root)
+  2) Backup, home only     (no root needed)
+  3) Restore
+  4) List an archive
+  5) Saved paths           (paths that are always offered)
+  6) Check requirements
+  q) Quit
+
+EOF
+  read -r -p "Choose [1]: " ans || exit 0
+  trim "$ans"
+  case ${REPLY,,} in
+    ''|1)      CMD=backup ;;
+    2)         CMD=backup; HOME_ONLY=true ;;
+    3)         CMD=restore ;;
+    4)         CMD=list ;;
+    5)         CMD=config ;;
+    6)         CMD=check ;;
+    q|quit|0)  exit 0 ;;
+    *)         die "Unknown choice: $REPLY" ;;
+  esac
+  echo
+}
+
 # ---------- backup ----------
 do_backup() {
   need_tar
@@ -432,12 +725,24 @@ do_backup() {
     info "Use --home to back up only files inside your home without root."
     local rr1=()
     if $VERBOSE; then rr1+=(-v); fi
+    case $SAVED_MODE in yes) rr1+=(--saved) ;; no) rr1+=(--no-saved) ;; esac
     rr1+=(-o "$OUT_DIR")
     offer_sudo "${rr1[@]}"
     die "Not running as root - nothing was backed up."
   fi
 
-  if (( ${#ARGS[@]} )); then PATHS=("${ARGS[@]}"); else pick_cli; fi
+  PATHS=()
+  if (( ${#ARGS[@]} )); then
+    PATHS=("${ARGS[@]}")                       # explicit PATHs: saved ones only with --saved
+    if [[ $SAVED_MODE == yes ]]; then offer_saved; fi
+  else
+    if [[ $SAVED_MODE != no ]]; then offer_saved; fi
+    if [[ -t 0 ]]; then
+      pick_cli
+    elif (( ${#PATHS[@]} == 0 )); then
+      die "No paths given and no terminal to ask in. Pass the paths as arguments."
+    fi
+  fi
 
   local p q keep abs=() clean=() seen=$'\n'
   for p in ${PATHS[@]+"${PATHS[@]}"}; do
@@ -604,6 +909,19 @@ newest_archive() {
   REPLY=$newest
 }
 
+# Ask for an archive (drag-and-drop or Enter for the newest). Result in $REPLY.
+ask_archive() {
+  [[ -t 0 ]] || die "Give the archive as an argument."
+  local raw prompt="Archive (drag it here, then Enter): " newest
+  newest_archive "$OUT_DIR"; newest=$REPLY
+  if [[ -n $newest ]]; then prompt="Archive (drag it here, or Enter for newest: $(short "$newest")): "; fi
+  read -r -e -p "$prompt" raw || true
+  PATHS=()
+  add_text "$raw"
+  REPLY=${PATHS[0]-}
+  if [[ -z $REPLY ]]; then REPLY=$newest; fi
+}
+
 do_restore() {
   need_tar
   setup_home
@@ -611,18 +929,7 @@ do_restore() {
   abspath "${OUT_DIR:-$HOME_DIR}"; OUT_DIR=$REPLY
 
   local archive=${ARGS[0]-}
-  if [[ -z $archive ]]; then
-    [[ -t 0 ]] || die "Give the archive to restore as an argument."
-    local raw prompt="Archive (drag it here, then Enter): "
-    newest_archive "$OUT_DIR"
-    local newest=$REPLY
-    if [[ -n $newest ]]; then prompt="Archive (drag it here, or Enter for newest: $(short "$newest")): "; fi
-    read -r -e -p "$prompt" raw || true
-    PATHS=()
-    add_text "$raw"
-    archive=${PATHS[0]-}
-    if [[ -z $archive ]]; then archive=$newest; fi
-  fi
+  if [[ -z $archive ]]; then ask_archive; archive=$REPLY; fi
   [[ -n $archive && -f $archive ]] || die "Archive not found: ${archive:-<none given>}"
   check_decompressor "$archive"
 
@@ -738,9 +1045,10 @@ do_restore() {
 do_list() {
   need_tar
   setup_home
+  abspath "${OUT_DIR:-$HOME_DIR}"; OUT_DIR=$REPLY
   local archive=${ARGS[0]-} l inhome=0
-  [[ -n $archive ]] || die "give an archive to list"
-  [[ -f $archive ]] || die "Archive not found: $archive"
+  if [[ -z $archive ]]; then ask_archive; archive=$REPLY; fi
+  [[ -n $archive && -f $archive ]] || die "Archive not found: ${archive:-<none given>}"
   check_decompressor "$archive"
 
   local listing n_in=0 n_out=0
@@ -781,7 +1089,9 @@ do_list() {
 
 # ---------- main ----------
 CMD=backup
-case "${1-}" in restore|list) CMD=$1; shift ;; esac
+MENU=false
+if (( $# == 0 )); then MENU=true; fi
+case "${1-}" in restore|list|config) CMD=$1; shift ;; esac
 
 while (( $# )); do
   case $1 in
@@ -790,6 +1100,8 @@ while (( $# )); do
     -v|--verbose)   VERBOSE=true ;;
     --overwrite)    OVERWRITE=true ;;
     --home)         HOME_ONLY=true ;;
+    --saved)        SAVED_MODE=yes ;;
+    --no-saved)     SAVED_MODE=no ;;
     --check)        CMD=check ;;
     -o|--output)    (( $# >= 2 )) || die "$1 needs a directory"; OUT_DIR=$2; shift ;;
     --)             shift; ARGS+=("$@"); break ;;
@@ -800,9 +1112,11 @@ while (( $# )); do
 done
 
 find_self
+if $MENU; then main_menu; fi
 case $CMD in
   backup)  do_backup ;;
   restore) do_restore ;;
   list)    do_list ;;
+  config)  do_config ;;
   check)   do_check ;;
 esac
