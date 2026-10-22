@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # appimgr - minimal AppImage -> app launcher integration
-VERSION="2.1.1"
+VERSION="2.4.1"
 #
-# NEW IN THIS VERSION (2.1.1):
-#   - Fix: changing an icon only touches Icon= in the main [Desktop Entry] section;
-#     Icon= lines of [Desktop Action ...] sections are left alone (also on 'add').
-#   - If the main section has no Icon= line, one is added there.
-#   - 'icon --reset' now says whether extraction itself failed or just no icon exists.
-#   - Clearer wording: icon files are only checked for type, not fully validated.
-
+# NEW IN THIS VERSION (2.4.1):
+#   - Clearer wording when 'add' asks about an update source: says why it is asking and what
+#     the risk is (plain links may be fixed to one version, no * in the pattern, several
+#     matching assets, GitHub could not confirm). No behaviour change.
+#
 set -euo pipefail
 
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -26,7 +24,7 @@ info() { echo ":: $*"; }
 
 TMP_DIR=""; STAGE_FILE=""; DL_DIR=""
 SAVED=()
-L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""
+L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""; L_MATCHES=0
 STATUS=""; DL_ETAG=""
 
 cleanup() {
@@ -38,11 +36,14 @@ trap cleanup EXIT
 
 usage() {
 cat <<EOF
-appimgr $VERSION - integrate AppImages into your app launcher
+appimgr v$VERSION - integrate AppImages into your app launcher
 
 Usage:
   appimgr                                  Interactive menu (when run without arguments)
   appimgr add <file.AppImage> [options]    Integrate an AppImage into the launcher
+  appimgr add <link> [options]             Download (GitHub release link or direct URL) and integrate
+  appimgr add --repo OWNER/REPO [--asset 'PATTERN'] [--tag TAG] [options]
+                                           Download from a GitHub release and integrate
   appimgr update <slug> [--check] [-y]     Update from the saved update source
   appimgr update --all [--check] [-y]      Same, for every app that has a source
   appimgr update <slug> <file> [options]   Replace with a local file instead
@@ -63,6 +64,16 @@ Options for add / update <slug> <file>:
       --no-fuse         Force extract-and-run mode (APPIMAGE_EXTRACT_AND_RUN=1).
                         Without it, FUSE is checked and this is enabled automatically if needed.
       --no-move         Keep the original file (default: it is deleted after success)
+
+Options for add <link> / --repo (downloads):
+      --repo OWNER/REPO Take the AppImage from this GitHub project's release
+      --asset 'PATTERN' Asset file name, version replaced by * (default: the one .AppImage
+                        asset for this CPU; asked to choose if several)
+      --tag TAG         Release tag (default: latest non-prerelease). Also the tag saved for updates
+      --no-source       Never save or suggest an update source (apps you don't want updated)
+                        Otherwise a source is saved silently when it is certain to work
+                        (GitHub, one matching asset) and you are asked only when it is not
+                        (--no-move has no effect for downloads: the temp file is always removed)
 
 Options for update <slug|--all>:
       --check           Only check for updates, install nothing
@@ -262,11 +273,12 @@ parse_source_args() { # <type> <args...> -> canonical source on stdout
 }
 
 # Pulls tag + assets out of GitHub's release JSON without needing jq.
-# Output lines: TAG<TAB>tag   and   ASSET<TAB>name<TAB>size<TAB>digest<TAB>url   ('-' = empty)
+# Output lines: TAG<TAB>tag, PRE<TAB>true|false   and   ASSET<TAB>name<TAB>size<TAB>digest<TAB>url   ('-' = empty)
 gh_parse() {
   awk '
     function val(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/"?,?[ \t\r]*$/, "", s); return s }
     /"tag_name"[ \t]*:/ && !gottag { gottag=1; print "TAG\t" val($0); next }
+    /^[ \t]*"prerelease"[ \t]*:/ && !gotpre { gotpre=1; print "PRE\t" val($0); next }
     /^[ \t]*"name"[ \t]*:/   { name=val($0); next }
     /^[ \t]*"size"[ \t]*:/   { size=val($0); next }
     /^[ \t]*"digest"[ \t]*:/ { digest=val($0); next }
@@ -274,6 +286,19 @@ gh_parse() {
       print "ASSET\t" (name==""?"-":name) "\t" (size==""?"-":size) "\t" (digest==""||digest=="null"?"-":digest) "\t" val($0)
       name=""; size=""; digest=""; next
     }'
+}
+
+# Fetches a release's JSON and prints the gh_parse lines. Silent; returns 1 on failure.
+gh_fetch() { # <OWNER/REPO> <tag|latest>
+  local api json lines
+  if [[ $2 == latest ]]; then api="https://api.github.com/repos/$1/releases/latest"
+  else api="https://api.github.com/repos/$1/releases/tags/$2"; fi
+  json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api") || return 1
+  lines=$(printf '%s\n' "$json" | wc -l)
+  if (( lines < 5 )); then   # compact JSON -> one key per line
+    json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
+  fi
+  printf '%s\n' "$json" | gh_parse
 }
 
 hdr_last() { # <header block> <name> -> value of the last such header
@@ -284,19 +309,13 @@ hdr_last() { # <header block> <name> -> value of the last such header
 # Fills L_* for the given canonical source. Returns 1 (after a message) on failure.
 latest_info() { # <canonical source>
   local type=${1%%|*} rest=${1#*|}
-  L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""
+  L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""; L_MATCHES=0
   case $type in
     github)
-      local repo tag pat api json lines kind a b c d n=0 names=()
+      local repo tag pat parsed kind a b c d n=0 names=()
       IFS='|' read -r repo tag pat <<<"$rest"
-      if [[ $tag == latest ]]; then api="https://api.github.com/repos/$repo/releases/latest"
-      else api="https://api.github.com/repos/$repo/releases/tags/$tag"; fi
-      json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api") \
+      parsed=$(gh_fetch "$repo" "$tag") \
         || { warn "could not query GitHub for $repo (tag: $tag): network, rate limit, or wrong repo/tag"; return 1; }
-      lines=$(printf '%s\n' "$json" | wc -l)
-      if (( lines < 5 )); then   # compact JSON -> one key per line
-        json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
-      fi
       while IFS=$'\t' read -r kind a b c d; do
         case $kind in
           TAG) L_VERSION=$a ;;
@@ -312,7 +331,8 @@ latest_info() { # <canonical source>
               fi
             fi ;;
         esac
-      done < <(printf '%s\n' "$json" | gh_parse)
+      done <<<"$parsed"
+      L_MATCHES=$n
       if [[ -z $L_VERSION ]]; then warn "unexpected response from GitHub for $repo"; return 1; fi
       if [[ -z $L_URL ]]; then
         warn "no asset in release '$L_VERSION' matches '$pat'"
@@ -415,9 +435,244 @@ embedded_icon() { # <appimage> <workdir> -> prints the path of the icon inside i
   printf '%s' "$c"
 }
 
+# ---------- remote add (download) ----------
+R_FILE=""; R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=""
+G_REPO=""; G_TAG=""; G_FILE=""
+
+# Recognises GitHub release links. Sets G_REPO, G_TAG ('' = latest), G_FILE ('' = a page, not a file).
+gh_link_parse() { # <url>
+  local u=${1%%[?#]*} r1 r2 r3 r4
+  r1='^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/releases/download/([^/]+)/([^/]+)$'
+  r2='^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/releases/latest/download/([^/]+)$'
+  r3='^https://github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)(/releases(/latest|/tag/([^/]+))?)?/?$'
+  G_REPO=""; G_TAG=""; G_FILE=""
+  if [[ $u =~ $r1 ]]; then
+    G_REPO=${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}; G_TAG=${BASH_REMATCH[3]}; G_FILE=${BASH_REMATCH[4]}
+  elif [[ $u =~ $r2 ]]; then
+    G_REPO=${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}; G_FILE=${BASH_REMATCH[3]}
+  elif [[ $u =~ $r3 ]]; then
+    G_REPO=${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}; G_TAG=${BASH_REMATCH[5]:-}
+  else
+    return 1
+  fi
+}
+
+# "Foo-1.2.3-x86_64.AppImage" -> "Foo-*-x86_64.AppImage" (version = the release tag if it appears
+# in the name, else the first dotted number). No version found -> the exact name.
+derive_pattern() { # <asset name> <tag>
+  local name=$1 ver=${2#[vV]}
+  if [[ -n $ver && $ver == *[0-9]* && $name == *"$ver"* ]]; then
+    printf '%s' "${name//"$ver"/*}"
+  elif [[ $name =~ [0-9]+(\.[0-9]+)+ ]]; then
+    printf '%s' "${name/"${BASH_REMATCH[0]}"/*}"
+  else
+    printf '%s' "$name"
+  fi
+}
+
+# Downloads into $DL_DIR and fills R_FILE / R_SOURCE (candidate) / R_VERSION / R_GENERIC / R_ASSET. Returns 1 after a message on failure.
+fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosource 0|1>
+  local link=$1 repo=$2 asset_arg=$3 tag_arg=$4 nosource=$5
+  local url="" name="" digest="" ver="" pre=0 rtag="" parsed kind a b c d sum i lower m
+  local names=() urls=() digs=() idx=() keep=()
+  R_FILE=""; R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=$name
+  need_cmd curl
+
+  if [[ -n $link ]]; then
+    if gh_link_parse "$link"; then
+      repo=$G_REPO; rtag=$G_TAG
+      if [[ -n $G_FILE ]]; then url=${link%%[#]*}; name=$G_FILE; fi
+    else
+      url=${link%%[#]*}; name=${url%%\?*}; name=${name##*/}
+      [[ -n $name ]] || name="download.AppImage"
+      R_GENERIC=$url
+    fi
+  else
+    rtag=$tag_arg
+  fi
+
+  # --- GitHub release metadata (needed to pick an asset; best effort for a direct file link) ---
+  if [[ -n $repo ]]; then
+    parsed=$(gh_fetch "$repo" "${rtag:-latest}") || parsed=""
+    if [[ -z $parsed ]]; then
+      if [[ -z $url ]]; then
+        warn "could not query GitHub for $repo (tag: ${rtag:-latest}): network, rate limit, or wrong repo/tag"
+        return 1
+      fi
+      info "could not read release info from GitHub - skipping checksum and update source"
+    fi
+    while IFS=$'\t' read -r kind a b c d; do
+      case $kind in
+        TAG)   ver=$a ;;
+        PRE)   if [[ $a == true ]]; then pre=1; fi ;;
+        ASSET) names+=("$a"); urls+=("$d"); digs+=("$c") ;;
+      esac
+    done <<<"$parsed"
+
+    if [[ -z $url ]]; then   # repo mode: choose the asset
+      for i in "${!names[@]}"; do
+        if [[ -n $asset_arg ]]; then
+          # shellcheck disable=SC2053
+          if [[ ${names[i]} == $asset_arg ]]; then idx+=("$i"); fi
+        else
+          lower=${names[i],,}
+          if [[ $lower == *.appimage ]]; then idx+=("$i"); fi
+        fi
+      done
+      if [[ -z $asset_arg ]] && ((${#idx[@]} > 1)); then   # prefer the asset for this CPU
+        case $(uname -m) in
+          x86_64)  m='x86_64|amd64|x64' ;;
+          aarch64) m='aarch64|arm64' ;;
+          *)       m=$(uname -m) ;;
+        esac
+        for i in "${idx[@]}"; do
+          lower=${names[i],,}
+          if [[ $lower =~ ($m) ]]; then keep+=("$i"); fi
+        done
+        if ((${#keep[@]})); then idx=("${keep[@]}"); fi
+      fi
+      if ((${#idx[@]} == 0)); then
+        if [[ -n $asset_arg ]]; then warn "no asset in release '$ver' matches '$asset_arg'"
+        else warn "no .AppImage asset in release '$ver'"; fi
+        if ((${#names[@]})); then warn "assets found: ${names[*]}"; else warn "this release has no assets"; fi
+        return 1
+      fi
+      if ((${#idx[@]} > 1)); then
+        if [[ -n $asset_arg ]]; then
+          warn "pattern matches ${#idx[@]} assets, using ${names[${idx[0]}]} - make it more specific"
+        else
+          warn "several AppImage assets in '$ver' - choose one with --asset 'PATTERN':"
+          for i in "${idx[@]}"; do warn "  ${names[i]}"; done
+          return 1
+        fi
+      fi
+      i=${idx[0]}; name=${names[i]}; url=${urls[i]}
+    fi
+    for i in "${!names[@]}"; do   # digest of the file we are about to download
+      if [[ ${names[i]} == "$name" && ${digs[i]} == sha256:* ]]; then digest=${digs[i]#sha256:}; fi
+    done
+    if [[ -z $ver ]]; then ver=$rtag; fi
+  fi
+
+  # --- download ---
+  mkdir -p "$APPS_DIR"
+  DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
+  info "downloading $name"
+  download "$url" "$DL_DIR/$name" || return 1
+  if [[ -n $digest ]]; then
+    sum=$(sha256sum -- "$DL_DIR/$name" | cut -d' ' -f1)
+    if [[ $sum != "$digest" ]]; then warn "checksum mismatch - aborting, nothing changed"; return 1; fi
+    info "sha256 verified"
+  fi
+  R_FILE="$DL_DIR/$name"; R_VERSION=$ver; R_ASSET=$name
+
+  # --- update source (GitHub only; other links may be version-specific) ---
+  if [[ -z $repo || $nosource == 1 ]]; then return 0; fi
+  if (( pre )); then
+    warn "release '$ver' is a pre-release; 'latest' only tracks stable releases, so no update source was saved"
+    return 0
+  fi
+  local pat stag
+  pat=${asset_arg:-$(derive_pattern "$name" "${ver:-$rtag}")}
+  if [[ -n $tag_arg ]]; then stag=$tag_arg
+  elif [[ -z $rtag || ${ver:-$rtag} == *[0-9]* ]]; then stag=latest
+  else stag=${ver:-$rtag}; fi
+  R_SOURCE="github|$repo|$stag|$pat"   # a candidate only; choose_source checks it
+}
+
+# Is this source certain to keep working? Sets SURE_WHY when not. (GitHub only; see header.)
+source_sure() { # <canonical source> <installed asset name or ''>
+  local type=${1%%|*} rest=${1#*|} repo tag pat
+  SURE_WHY=""
+  case $type in
+    github)
+      IFS='|' read -r repo tag pat <<<"$rest"
+      if [[ $tag == latest && $pat != *\** ]]; then
+        SURE_WHY="the pattern '$pat' has no * (version placeholder), so it can only ever match this exact release and never a newer one"; return 1
+      fi
+      if ! latest_info "$1" 2>/dev/null; then
+        SURE_WHY="GitHub could not confirm it (network problem, or no asset in the latest release matches '$pat')"; return 1
+      fi
+      if (( L_MATCHES != 1 )); then
+        SURE_WHY="the pattern '$pat' matches $L_MATCHES assets in $L_VERSION (e.g. several CPU architectures), so updates could pick the wrong file"; return 1
+      fi
+      # shellcheck disable=SC2053
+      if [[ -n ${2:-} && $2 != $pat ]]; then
+        SURE_WHY="the file you installed ('$2') does not match the pattern '$pat', so it was probably not the file this source tracks"; return 1
+      fi ;;
+    url) SURE_WHY="a plain download link cannot be verified: if it always serves the newest version, updates will work; if it points at one fixed version, 'update' will always say up to date"; return 1 ;;
+    *)   SURE_WHY="unknown source type"; return 1 ;;
+  esac
+}
+
+# Decides what to do about the update source after 'add'. Certain -> saved silently, else asked.
+choose_source() { # <slug> <appimage> <link candidate or ''> <nosource 0|1> <installed asset name or ''>
+  local slug=$1 dest=$2 link=$3 nosource=$4 asset=$5 emb="" cur
+  local link_ok=0 emb_ok=0 link_why="" emb_why="" pick="" n=0 a b
+  if (( nosource )); then return 0; fi
+  cur=$(meta_get "$slug" source)
+  if [[ -z $link && -n $cur ]]; then return 0; fi   # keep what is there (e.g. during 'update')
+
+  emb=$(detect_source "$dest")
+  if [[ $emb == unsupported\|* ]]; then
+    info "AppImage update info found, but its type is not supported: ${emb#unsupported|}"; emb=""
+  fi
+  if [[ -z $link && -z $emb ]]; then
+    info "no update source found in this AppImage (add one: appimgr source $slug set ...)"; return 0
+  fi
+
+  if [[ -n $link ]]; then
+    if source_sure "$link" "$asset"; then link_ok=1; else link_why=$SURE_WHY; fi
+  fi
+  if [[ -n $emb ]]; then
+    if [[ $emb == "$link" ]]; then emb_ok=$link_ok; emb_why=$link_why
+    elif source_sure "$emb" "$asset"; then emb_ok=1; else emb_why=$SURE_WHY; fi
+  fi
+
+  if (( link_ok )); then
+    pick=$link
+    if [[ -n $emb && $emb != "$link" ]]; then
+      if (( emb_ok )); then info "the AppImage's own update info differs; using the one from your link"
+      else info "AppImage's own update info skipped: $emb_why"; fi
+    fi
+  elif (( emb_ok )); then
+    pick=$emb
+    if [[ -n $link ]]; then info "update source from the link skipped: $link_why"; fi
+  fi
+
+  if [[ -n $pick ]]; then   # certain -> no question, unless it would replace a different source
+    if [[ -n $cur && $cur != "$pick" ]]; then
+      info "current update source: $(source_describe "$cur")"
+      if ! confirm "Replace it with: $(source_describe "$pick")?" n; then info "kept the current update source"; return 0; fi
+    fi
+    meta_set "$slug" source "$pick"
+    info "update source saved: $(source_describe "$pick")"
+    return 0
+  fi
+
+  # nothing is certain -> a human has to decide (default: save nothing)
+  info "update source found - asking because I cannot be sure it will keep working:"
+  a=$link; b=$emb
+  if [[ -n $a ]]; then n=$((n+1)); echo "   $n) from the link:     $(source_describe "$a")"; echo "      -> $link_why"; fi
+  if [[ -n $b && $b != "$a" ]]; then n=$((n+1)); echo "   $n) from the AppImage: $(source_describe "$b")"; echo "      -> $emb_why"; fi
+  if [[ -n $cur ]]; then info "current update source (would be replaced): $(source_describe "$cur")"; fi
+  if [[ ! -t 0 ]]; then
+    info "not saved (non-interactive) - set one yourself: appimgr source $slug set ..."; return 0
+  fi
+  if (( n == 1 )); then ask "   Save it anyway? [1/N] (Enter = no): " || return 0
+  else ask "   Save which anyway? [1/2/N] (Enter = none): " || return 0; fi
+  case $REPLY in
+    1) if [[ -n $a ]]; then pick=$a; else pick=$b; fi ;;
+    2) if (( n == 2 )); then pick=$b; fi ;;
+  esac
+  if [[ -z $pick ]]; then info "not saved (add one later: appimgr source $slug set ...)"; return 0; fi
+  meta_set "$slug" source "$pick"; info "update source saved: $(source_describe "$pick")"
+}
+
 # ---------- add ----------
 cmd_add() {
   local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force="" icon_arg="" asked=0
+  local repo_arg="" asset_arg="" tag_arg="" nosource=0 remote=0
   while (($#)); do
     case $1 in
       -n|--name)  name=${2:?missing value for $1}; shift 2 ;;
@@ -427,11 +682,27 @@ cmd_add() {
       --move)     move=1; shift ;;
       --no-move)  move=0; shift ;;
       --no-fuse)  nofuse=1; forced=1; shift ;;
+      --repo)     repo_arg=${2:?missing value for $1}; shift 2 ;;
+      --asset)    asset_arg=${2:?missing value for $1}; shift 2 ;;
+      --tag)      tag_arg=${2:?missing value for $1}; shift 2 ;;
+      --no-source) nosource=1; shift ;;
       -*)         die "unknown option: $1" ;;
       *)          src=$1; shift ;;
     esac
   done
-  [[ -n $src ]] || { usage; exit 1; }
+  [[ -n $src || -n $repo_arg ]] || { usage; exit 1; }
+  if [[ -n $repo_arg ]]; then
+    [[ -z $src ]] || die "give either a link/file or --repo, not both"
+    [[ $repo_arg =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || die "--repo needs OWNER/REPO (e.g. PrismLauncher/PrismLauncher)"
+  fi
+  R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=""
+  if [[ -n $repo_arg || $src =~ ^https?://[^[:space:]]+$ ]]; then
+    remote=1
+    fetch_remote "$src" "$repo_arg" "$asset_arg" "$tag_arg" "$nosource" || exit 1
+    src=$R_FILE
+  elif [[ -n $asset_arg || -n $tag_arg ]]; then
+    die "--asset and --tag only work with a download link or --repo"
+  fi
   [[ -f $src ]] || die "file not found: $src"
   [[ $(head -c4 "$src" | tail -c3) == ELF ]] || die "not an ELF/AppImage file: $src"
   if [[ -n $icon_arg ]]; then
@@ -602,7 +873,7 @@ EOF
   meta_set "$slug" installed "$(date +%F)"
   meta_set "$slug" icon "${custom_icon:+$icon_id}"
   if (( asked )); then meta_set "$slug" iconasked 1; fi
-  meta_set "$slug" version ""
+  meta_set "$slug" version "$R_VERSION"
   meta_set "$slug" etag ""
 
   info "integrated: $display"
@@ -611,9 +882,13 @@ EOF
   if (( nofuse )); then echo "   mode:    extract-and-run (no FUSE)"; else echo "   mode:    normal (FUSE)"; fi
   echo "   entry:   $out"
 
-  if [[ -z $(meta_get "$slug" source) ]]; then offer_source "$slug" "$dest"; fi
+  choose_source "$slug" "$dest" "$R_SOURCE" "$nosource" "$R_ASSET"
+  if [[ -n $R_GENERIC && -z $(meta_get "$slug" source) ]]; then
+    info "if this link always serves the newest version: appimgr source $slug set url '$R_GENERIC'"
+  fi
 
   rm -rf -- "$TMP_DIR"; TMP_DIR=""; STAGE_FILE=""
+  if (( remote )); then rm -rf -- "$DL_DIR"; DL_DIR=""; fi
 }
 
 # ---------- update ----------
@@ -999,7 +1274,7 @@ pick_app() { # <prompt> [all] -> PICKED (slug, or --all)
 }
 
 menu_add() {
-  local i f size file="" tilde='~' args=()
+  local i f size file="" tilde='~' args=() remote=0
   find_candidates
   if ((${#CANDS[@]})); then
     info "AppImage files found:"
@@ -1007,21 +1282,30 @@ menu_add() {
       f=${CANDS[i]}; size=$(du -h -- "$f" | cut -f1)
       printf '   %2d) %s  [%s]\n' $((i+1)) "${f/#$HOME/$tilde}" "$size"
     done
-    ask "   Number, or path to an .AppImage (Enter = cancel): " || return 0
+    ask "   Number, path to an .AppImage, download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
   else
-    ask "   Path to an .AppImage - you can drag & drop it here (Enter = cancel): " || return 0
+    ask "   Path to an .AppImage (drag & drop), download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
   fi
   [[ -n $REPLY ]] || return 0
   if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= ${#CANDS[@]})); then
     file=${CANDS[10#$REPLY-1]}
+  elif [[ $REPLY =~ ^https?://[^[:space:]]+$ ]]; then
+    remote=1; file=$REPLY
   else
     file=$(clean_path "$REPLY")
+    if [[ ! -e $file && $file =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+      remote=1; args+=(--repo "$file"); file=""
+      ask "   Asset pattern, e.g. 'Foo-*-x86_64.AppImage' (Enter = auto-detect): " || return 0
+      if [[ -n $REPLY ]]; then args+=(--asset "$(unquote "$REPLY")"); fi
+    elif [[ ! -f $file ]]; then
+      warn "file not found: $file"; return 0
+    fi
   fi
-  [[ -f $file ]] || { warn "file not found: $file"; return 0; }
   ask "   Display name (Enter = auto-detect): " || return 0
   if [[ -n $REPLY ]]; then args+=(--name "$REPLY"); fi
-  if ! confirm "Delete the original file after integrating?" y; then args+=(--no-move); fi
-  run_self add "${args[@]}" "$file"
+  if (( ! remote )) && ! confirm "Delete the original file after integrating?" y; then args+=(--no-move); fi
+  if [[ -n $file ]]; then args+=("$file"); fi
+  run_self add "${args[@]}"
 }
 
 menu_update() { # <check 0|1>
@@ -1077,7 +1361,7 @@ cmd_menu() {
   while true; do
     load_slugs; find_candidates
     echo
-    printf 'appimgr %s - %d integrated AppImage(s)\n' "$VERSION" "${#SLUGS[@]}"
+    printf 'appimgr v%s - %d integrated AppImage(s)\n' "$VERSION" "${#SLUGS[@]}"
     if ((first)); then
       first=0
       if ((${#SLUGS[@]})); then cmd_list; fi
@@ -1087,7 +1371,7 @@ cmd_menu() {
     fi
     cat <<'EOF'
 
-  1) Add / integrate an AppImage
+  1) Add / integrate an AppImage (file, link or GitHub repo)
   2) List apps (details)
   3) Run an app
   4) Check for updates
@@ -1125,7 +1409,7 @@ case "${1:-}" in
   run)               shift; cmd_run "$@" ;;
   remove|rm)         shift; cmd_remove "$@" ;;
   list|ls)           shift; cmd_list "$@" ;;
-  version|-v|--version) echo "appimgr $VERSION" ;;
+  version|-v|--version) echo "appimgr v$VERSION" ;;
   "")
     if [[ -t 0 && -t 1 ]]; then
       cmd_menu
