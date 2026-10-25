@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # appimgr - minimal AppImage -> app launcher integration
-VERSION="3.0.0"
+VERSION="3.0.1"
 #
-# NEW IN THIS VERSION (3.0.0):
+# NEW IN THIS VERSION (3.0.1):
+#   - Fix: 'add --repo' failed on repos whose GitHub release JSON comes back compact (one line):
+#     the download URL kept a trailing '"},{' and curl rejected it. The JSON value cleanup now
+#     strips closing quotes/braces/brackets too.
+#
+# PREVIOUS (3.0.0):
 #   - 'appimgr update' / 'update --all' now checks every app first, lists the ones that have an
 #     update, and asks ONCE (Enter = yes) before installing them all. -y still skips the question,
 #     --check still only reports. A failing app no longer stops the others; a summary is printed.
@@ -288,7 +293,7 @@ parse_source_args() { # <type> <args...> -> canonical source on stdout
 # Output lines: TAG<TAB>tag, PRE<TAB>true|false   and   ASSET<TAB>name<TAB>size<TAB>digest<TAB>url   ('-' = empty)
 gh_parse() {
   awk '
-    function val(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/"?,?[ \t\r]*$/, "", s); return s }
+    function val(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/"?[},\][{ \t\r]*$/, "", s); return s }
     /"tag_name"[ \t]*:/ && !gottag { gottag=1; print "TAG\t" val($0); next }
     /^[ \t]*"prerelease"[ \t]*:/ && !gotpre { gotpre=1; print "PRE\t" val($0); next }
     /^[ \t]*"name"[ \t]*:/   { name=val($0); next }
