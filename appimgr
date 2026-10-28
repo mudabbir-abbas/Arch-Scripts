@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # appimgr - minimal AppImage -> app launcher integration
-VERSION="3.0.1"
+VERSION="3.1.0"
 #
-# NEW IN THIS VERSION (3.0.1):
+# NEW IN THIS VERSION (3.1.0):
+#   - Repos that publish several kinds of releases in one place (e.g. bitwarden/clients: Desktop,
+#     Web, Browser, CLI) now work: if the newest release has no matching asset, 'add --repo' and
+#     'update' look through the 90 newest releases (prereleases skipped) and use the newest one
+#     that does. The version label is that release's tag (e.g. desktop-v2026.10.1).
+#
+# PREVIOUS (3.0.1):
 #   - Fix: 'add --repo' failed on repos whose GitHub release JSON comes back compact (one line):
 #     the download URL kept a trailing '"},{' and curl rejected it. The JSON value cleanup now
 #     strips closing quotes/braces/brackets too.
@@ -291,11 +297,11 @@ parse_source_args() { # <type> <args...> -> canonical source on stdout
 
 # Pulls tag + assets out of GitHub's release JSON without needing jq.
 # Output lines: TAG<TAB>tag, PRE<TAB>true|false   and   ASSET<TAB>name<TAB>size<TAB>digest<TAB>url   ('-' = empty)
-gh_parse() {
-  awk '
+gh_parse() { # [multi]  (multi=1: report every release of a releases list, not only the first)
+  awk -v multi="${1:-0}" '
     function val(s) { sub(/^[^:]*:[ \t]*"?/, "", s); sub(/"?[},\][{ \t\r]*$/, "", s); return s }
-    /"tag_name"[ \t]*:/ && !gottag { gottag=1; print "TAG\t" val($0); next }
-    /^[ \t]*"prerelease"[ \t]*:/ && !gotpre { gotpre=1; print "PRE\t" val($0); next }
+    /"tag_name"[ \t]*:/ && (multi || !gottag) { gottag=1; print "TAG\t" val($0); next }
+    /^[ \t]*"prerelease"[ \t]*:/ && (multi || !gotpre) { gotpre=1; print "PRE\t" val($0); next }
     /^[ \t]*"name"[ \t]*:/   { name=val($0); next }
     /^[ \t]*"size"[ \t]*:/   { size=val($0); next }
     /^[ \t]*"digest"[ \t]*:/ { digest=val($0); next }
@@ -318,9 +324,58 @@ gh_fetch() { # <OWNER/REPO> <tag|latest>
   printf '%s\n' "$json" | gh_parse
 }
 
+# For repos that publish several kinds of releases (e.g. bitwarden/clients: Desktop, Web, Browser, CLI)
+# the "latest" release may not be the one that has your app. gh_scan walks the recent releases
+# (newest first, prereleases skipped). For each it fills SC_TAG / SC_NAMES / SC_URLS / SC_DIGS and
+# calls the test function "$2"; it stops at the first release where that returns 0.
+SC_TAG=""; SC_NAMES=(); SC_URLS=(); SC_DIGS=()
+gh_scan() { # <OWNER/REPO> <test function>
+  local pg json parsed kind a b c d have=0 pre=0
+  for pg in 1 2 3; do
+    json=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$1/releases?per_page=30&page=$pg") || return 1
+    if (( $(printf '%s\n' "$json" | wc -l) < 5 )); then
+      json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
+    fi
+    parsed=$(printf '%s\n' "$json" | gh_parse 1)
+    [[ -n $parsed ]] || return 1
+    have=0
+    while IFS=$'\t' read -r kind a b c d; do
+      case $kind in
+        TAG)
+          if (( have && ! pre )) && "$2"; then return 0; fi
+          SC_TAG=$a; SC_NAMES=(); SC_URLS=(); SC_DIGS=(); have=1; pre=0 ;;
+        PRE)   if [[ $a == true ]]; then pre=1; fi ;;
+        ASSET) SC_NAMES+=("$a"); SC_URLS+=("$d"); SC_DIGS+=("$c") ;;
+      esac
+    done <<<"$parsed"
+    if (( have && ! pre )) && "$2"; then return 0; fi
+  done
+  return 1
+}
+
 hdr_last() { # <header block> <name> -> value of the last such header
   printf '%s\n' "$1" | awk -v k="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]'):" \
     'index(tolower($0), k)==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}'
+}
+
+# gh_scan test for latest_info (reads $pat from latest_info): take the release if it has a matching asset.
+li_test() {
+  local i n=0
+  L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""
+  for i in "${!SC_NAMES[@]}"; do
+    # shellcheck disable=SC2053
+    if [[ ${SC_NAMES[i]} == $pat ]]; then
+      n=$((n+1))
+      if [[ -z $L_URL ]]; then
+        L_NAME=${SC_NAMES[i]}; L_URL=${SC_URLS[i]}
+        if [[ ${SC_DIGS[i]} == sha256:* ]]; then L_DIGEST=${SC_DIGS[i]#sha256:}; fi
+      fi
+    fi
+  done
+  if (( n == 0 )); then return 1; fi
+  L_VERSION=$SC_TAG; L_MATCHES=$n
+  return 0
 }
 
 # Fills L_* for the given canonical source. Returns 1 (after a message) on failure.
@@ -351,9 +406,13 @@ latest_info() { # <canonical source>
       done <<<"$parsed"
       L_MATCHES=$n
       if [[ -z $L_VERSION ]]; then warn "unexpected response from GitHub for $repo"; return 1; fi
+      if [[ -z $L_URL && $tag == latest ]] && gh_scan "$repo" li_test; then
+        n=$L_MATCHES   # the newest release had no matching asset; an older one does
+      fi
       if [[ -z $L_URL ]]; then
         warn "no asset in release '$L_VERSION' matches '$pat'"
         if ((${#names[@]})); then warn "assets found: ${names[*]}"; else warn "this release has no assets"; fi
+        if [[ $tag == latest ]]; then warn "also searched the 90 newest releases: none has a matching asset"; fi
         return 1
       fi
       if (( n > 1 )); then warn "pattern matches $n assets, using $L_NAME - make the pattern more specific"; fi ;;
@@ -487,6 +546,40 @@ derive_pattern() { # <asset name> <tag>
   fi
 }
 
+# Fills idx[] with the indexes in names[] that are candidates (reads names, asset_arg from fetch_remote).
+pick_assets() {
+  local i lower m
+  idx=(); keep=()
+  for i in "${!names[@]}"; do
+    if [[ -n $asset_arg ]]; then
+      # shellcheck disable=SC2053
+      if [[ ${names[i]} == $asset_arg ]]; then idx+=("$i"); fi
+    else
+      lower=${names[i],,}
+      if [[ $lower == *.appimage ]]; then idx+=("$i"); fi
+    fi
+  done
+  if [[ -z $asset_arg ]] && ((${#idx[@]} > 1)); then   # prefer the asset for this CPU
+    case $(uname -m) in
+      x86_64)  m='x86_64|amd64|x64' ;;
+      aarch64) m='aarch64|arm64' ;;
+      *)       m=$(uname -m) ;;
+    esac
+    for i in "${idx[@]}"; do
+      lower=${names[i],,}
+      if [[ $lower =~ ($m) ]]; then keep+=("$i"); fi
+    done
+    if ((${#keep[@]})); then idx=("${keep[@]}"); fi
+  fi
+}
+
+# gh_scan test for fetch_remote: take the release if it has a candidate asset.
+fr_test() {
+  names=("${SC_NAMES[@]}")
+  pick_assets
+  ((${#idx[@]} > 0))
+}
+
 # Downloads into $DL_DIR and fills R_FILE / R_SOURCE (candidate) / R_VERSION / R_GENERIC / R_ASSET. Returns 1 after a message on failure.
 fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosource 0|1>
   local link=$1 repo=$2 asset_arg=$3 tag_arg=$4 nosource=$5
@@ -527,26 +620,10 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
     done <<<"$parsed"
 
     if [[ -z $url ]]; then   # repo mode: choose the asset
-      for i in "${!names[@]}"; do
-        if [[ -n $asset_arg ]]; then
-          # shellcheck disable=SC2053
-          if [[ ${names[i]} == $asset_arg ]]; then idx+=("$i"); fi
-        else
-          lower=${names[i],,}
-          if [[ $lower == *.appimage ]]; then idx+=("$i"); fi
-        fi
-      done
-      if [[ -z $asset_arg ]] && ((${#idx[@]} > 1)); then   # prefer the asset for this CPU
-        case $(uname -m) in
-          x86_64)  m='x86_64|amd64|x64' ;;
-          aarch64) m='aarch64|arm64' ;;
-          *)       m=$(uname -m) ;;
-        esac
-        for i in "${idx[@]}"; do
-          lower=${names[i],,}
-          if [[ $lower =~ ($m) ]]; then keep+=("$i"); fi
-        done
-        if ((${#keep[@]})); then idx=("${keep[@]}"); fi
+      pick_assets
+      if ((${#idx[@]} == 0)) && [[ -z $rtag || $rtag == latest ]] && gh_scan "$repo" fr_test; then
+        names=("${SC_NAMES[@]}"); urls=("${SC_URLS[@]}"); digs=("${SC_DIGS[@]}"); ver=$SC_TAG
+        info "newest release has no matching asset - using $ver instead"
       fi
       if ((${#idx[@]} == 0)); then
         if [[ -n $asset_arg ]]; then warn "no asset in release '$ver' matches '$asset_arg'"
