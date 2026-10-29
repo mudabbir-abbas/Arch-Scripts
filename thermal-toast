@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# thermal-toast: notify when the CPU package stays hot for too long.
+
+VERSION=1.0.1
+NAME="thermal-toast"
+
+THRESHOLD="${THERMAL_TOAST_THRESHOLD:-85}"   # deg C
+SUSTAIN="${THERMAL_TOAST_SUSTAIN:-60}"       # seconds above threshold before alerting
+COOLDOWN="${THERMAL_TOAST_COOLDOWN:-600}"    # seconds between alerts
+INTERVAL="${THERMAL_TOAST_INTERVAL:-5}"      # polling interval in seconds
+HYSTERESIS=3                                 # must drop this far below threshold to reset
+
+usage() {
+    cat <<EOF
+$NAME v$VERSION - toast when the CPU stays hot for too long
+
+Usage: $NAME [options]
+
+Options:
+  -t, --threshold C   Temperature threshold in deg C   (default: $THRESHOLD)
+  -s, --sustain S     Seconds above threshold to alert (default: $SUSTAIN)
+  -c, --cooldown S    Seconds between alerts           (default: $COOLDOWN)
+  -i, --interval S    Polling interval in seconds      (default: $INTERVAL)
+      --test          Send a test notification and exit
+  -V, --version       Print version and exit
+  -h, --help          Show this help and exit
+
+Environment overrides: THERMAL_TOAST_{THRESHOLD,SUSTAIN,COOLDOWN,INTERVAL}
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--threshold) THRESHOLD="$2"; shift 2 ;;
+        -s|--sustain)   SUSTAIN="$2";   shift 2 ;;
+        -c|--cooldown)  COOLDOWN="$2";  shift 2 ;;
+        -i|--interval)  INTERVAL="$2";  shift 2 ;;
+        --test)         TEST=1;         shift ;;
+        -V|--version)   echo "$NAME $VERSION"; exit 0 ;;
+        -h|--help)      usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+command -v notify-send >/dev/null || { echo "notify-send not found (install libnotify)" >&2; exit 1; }
+
+find_sensor() {
+    local h
+    for h in /sys/class/hwmon/hwmon*; do
+        if [[ "$(cat "$h/name" 2>/dev/null)" == "coretemp" && -r "$h/temp1_input" ]]; then
+            echo "$h/temp1_input"; return 0
+        fi
+    done
+    local z
+    for z in /sys/class/thermal/thermal_zone*; do
+        if [[ "$(cat "$z/type" 2>/dev/null)" == "x86_pkg_temp" ]]; then
+            echo "$z/temp"; return 0
+        fi
+    done
+    return 1
+}
+
+top_procs() {
+    # Second top iteration = current usage (the first is a since-boot average).
+    top -b -n 2 -d 1 -o %CPU 2>/dev/null | awk '
+        /^top -/ { n++ }
+        n == 2 && $1 ~ /^[0-9]+$/ && $12 != "top" && $12 != "awk" {
+            printf "%s (%s%%)\n", $12, $9
+            if (++c == 3) exit
+        }'
+}
+
+toast() {
+    notify-send -a "$NAME" -u critical -i temperature-warning "$1" "$2"
+}
+
+if [[ -n "$TEST" ]]; then
+    toast "CPU is hot (test)" "$NAME v$VERSION is working."
+    exit 0
+fi
+
+SENSOR="$(find_sensor)" || { echo "No CPU temperature sensor found" >&2; exit 1; }
+
+hot_since=0
+last_alert=-999999
+
+while true; do
+    raw="$(cat "$SENSOR" 2>/dev/null)" || { sleep "$INTERVAL"; continue; }
+    temp=$(( raw / 1000 ))
+    now=$SECONDS
+
+    if (( temp >= THRESHOLD )); then
+        (( hot_since == 0 )) && hot_since=$now
+        if (( now - hot_since >= SUSTAIN && now - last_alert >= COOLDOWN )); then
+            toast "CPU running hot: ${temp}°C" \
+                  "Above ${THRESHOLD}°C for $(( now - hot_since ))s. Top processes:
+$(top_procs)"
+            last_alert=$now
+        fi
+    elif (( temp < THRESHOLD - HYSTERESIS )); then
+        hot_since=0
+    fi
+
+    sleep "$INTERVAL"
+done

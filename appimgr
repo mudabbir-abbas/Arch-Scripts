@@ -1,33 +1,17 @@
 #!/usr/bin/env bash
-# appimgr - minimal AppImage -> app launcher integration
-VERSION="3.1.0"
+# DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (3.1.0):
-#   - Repos that publish several kinds of releases in one place (e.g. bitwarden/clients: Desktop,
-#     Web, Browser, CLI) now work: if the newest release has no matching asset, 'add --repo' and
-#     'update' look through the 90 newest releases (prereleases skipped) and use the newest one
-#     that does. The version label is that release's tag (e.g. desktop-v2026.10.1).
-#
-# PREVIOUS (3.0.1):
-#   - Fix: 'add --repo' failed on repos whose GitHub release JSON comes back compact (one line):
-#     the download URL kept a trailing '"},{' and curl rejected it. The JSON value cleanup now
-#     strips closing quotes/braces/brackets too.
-#
-# PREVIOUS (3.0.0):
-#   - 'appimgr update' / 'update --all' now checks every app first, lists the ones that have an
-#     update, and asks ONCE (Enter = yes) before installing them all. -y still skips the question,
-#     --check still only reports. A failing app no longer stops the others; a summary is printed.
-#     Apps whose newness cannot be determined are listed and skipped (use 'update <slug>').
-#     'update <slug>' is unchanged (asks for that one app).
-#
-# PREVIOUS (2.5.0):
-#   - 'appimgr update' with no <slug> now does the same as 'appimgr update --all' (also with
-#     --check / -y). Before, it printed the usage text and exited with an error.
-#
-# PREVIOUS (2.4.1):
-#   - Clearer wording when 'add' asks about an update source: says why it is asking and what
-#     the risk is (plain links may be fixed to one version, no * in the pattern, several
-#     matching assets, GitHub could not confirm). No behaviour change.
+# NEW IN THIS VERSION (3.1.1):
+#   - Fix: the scratch folder used while adding an AppImage (a full extraction can
+#     be hundreds of MB) is now created inside the AppImage folder on disk, not in
+#     /tmp, which is usually RAM on Arch. It is removed as before.
+#   - Fix: an app whose display name has no Latin letters (e.g. Japanese) no longer
+#     always gets the slug "app" (which made a second such app replace the first);
+#     the slug now falls back to the AppImage file name first.
+#   - Removed a dead assignment in the download code (no behavior change).
+#   - Header: the old per-version history is replaced by this entry; added a
+#     # DESC: line for shelf.
+VERSION="3.1.1"
 #
 set -euo pipefail
 
@@ -55,6 +39,10 @@ cleanup() {
   if [[ -n $DL_DIR ]]; then rm -rf -- "$DL_DIR"; fi
 }
 trap cleanup EXIT
+
+# Scratch folder on disk, inside the AppImage folder: /tmp is often RAM, and a full
+# extraction of a big AppImage can be hundreds of MB. Removed by cleanup().
+mk_tmp() { mkdir -p "$APPS_DIR" && mktemp -d "$APPS_DIR/.appimgr-tmp.XXXXXX"; }
 
 usage() {
 cat <<EOF
@@ -585,7 +573,7 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
   local link=$1 repo=$2 asset_arg=$3 tag_arg=$4 nosource=$5
   local url="" name="" digest="" ver="" pre=0 rtag="" parsed kind a b c d sum i lower m
   local names=() urls=() digs=() idx=() keep=()
-  R_FILE=""; R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=$name
+  R_FILE=""; R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=""
   need_cmd curl
 
   if [[ -n $link ]]; then
@@ -805,7 +793,7 @@ cmd_add() {
   fi
 
   mkdir -p "$APPS_DIR" "$ICONS_DIR" "$DESKTOP_DIR"
-  TMP_DIR=$(mktemp -d)
+  TMP_DIR=$(mk_tmp)
   STAGE_FILE="$APPS_DIR/.appimgr-stage.$$"
   local tmp=$TMP_DIR stage=$STAGE_FILE
 
@@ -860,9 +848,16 @@ cmd_add() {
   fi
 
   # --- names / paths ---
-  local display slug dest
+  local display slug dest fbase
   display="${name:-${dname:-$(name_from_file "$src")}}"
   slug="${slug_force:-$(slugify "$display")}"
+  if [[ -z $slug ]]; then   # name without Latin letters: use the file name instead
+    slug=$(slugify "$(name_from_file "$src")")
+  fi
+  if [[ -z $slug ]]; then
+    fbase=${src##*/}; fbase=${fbase%.[Aa]pp[Ii]mage}
+    slug=$(slugify "$fbase")
+  fi
   [[ -n $slug ]] || slug="app"
   dest="$APPS_DIR/$slug.AppImage"
 
@@ -1334,7 +1329,7 @@ cmd_icon() {
     --reset)
       path=$(desktop_path "$df")
       [[ -f $path ]] || die "AppImage binary missing: $path"
-      TMP_DIR=$(mktemp -d)
+      TMP_DIR=$(mk_tmp)
       icon=$(embedded_icon "$path" "$TMP_DIR")
       if [[ -z $icon ]]; then
         if [[ -d $TMP_DIR/squashfs-root ]]; then die "no icon found inside this AppImage (nothing changed)"
@@ -1351,7 +1346,7 @@ cmd_icon() {
     *)
       [[ -f $arg ]] || die "file not found: $arg"
       ext=$(icon_ext "$arg") || die "icon does not look like a PNG or SVG file: $arg"
-      TMP_DIR=$(mktemp -d)
+      TMP_DIR=$(mk_tmp)
       cp -- "$arg" "$TMP_DIR/new.$ext"
       mkdir -p "$ICONS_DIR/custom"
       find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true

@@ -1,4 +1,20 @@
 #!/usr/bin/env bash
+# DESC: Pack chosen files/folders into one archive and restore them to their original locations
+#
+# NEW IN THIS VERSION (2.0.1):
+#   - Fix: every successful backup left a temp file in /tmp (the cleanup list was
+#     emptied too early). It is now removed when fbackup exits.
+#   - Fix: 'restore' / 'list' no longer fall back to the newest archive when you
+#     typed something it could not understand; it stops with an error instead.
+#   - The command word (restore, list, config) may now come after options, e.g.
+#     'fbackup -v restore'. A file or folder really named like a command still
+#     works as a path.
+#   - 'config' now warns when sudo changed $HOME (same check as backup/restore).
+#   - tar's closing "Exiting with failure status" line is no longer shown as an
+#     extra warning; Ctrl+C prints "Interrupted." and exits with 130.
+#   - VERSION moved to the top (shelf reads only the first 40 lines); the
+#     history block is replaced by this entry.
+VERSION="2.0.1"
 #
 # fbackup - pack chosen files/folders into ONE archive, and put them back
 #           in their original locations later (creating folders as needed).
@@ -16,25 +32,6 @@
 #   Run 'fbackup --check' to see what is installed.
 #   - compression: zstd if installed, otherwise gzip, otherwise plain tar
 #   - no python, no realpath, no sed/grep, no KDE/GUI tools
-
-# Version (semantic: MAJOR.MINOR.PATCH). Bump it on every change.
-#
-# NEW IN THIS VERSION (2.0.0)
-#   - Saved paths: put the paths you always want in ~/.config/fbackup/paths.conf.
-#     Every time a backup starts, fbackup lists them and asks "Include? [Y/n]"
-#     (Enter or y = include, n = skip them this time).
-#   - New 'config' command to manage them: config [list|add|remove|edit]
-#     (plain 'fbackup config' opens a small interactive editor).
-#   - New --saved / --no-saved: always / never include saved paths, no question.
-#   - Running fbackup with no arguments now opens a menu (Enter = Backup)
-#     instead of going straight to the file picker.
-#   - 'list' without an archive now asks for one, like 'restore' does.
-#
-# History
-#   1.0.0  first versioned release: pure-bash (no python/kdialog), zstd->gzip->tar
-#          fallback, dependency preflight + --check, symlink warnings, sudo offer
-#          on permission errors, --home mode, restore checks archive contents
-VERSION="2.0.0"
 
 set -euo pipefail
 
@@ -119,6 +116,8 @@ Examples:
 Notes:
   * Archives are named fbackup-YYYYMMDD-HHMMSS.tar.zst (or .tar.gz / .tar if
     zstd / gzip are not installed). Restore works with any of them.
+  * The command word (restore, list, config) may also come after options,
+    e.g. "fbackup -v restore". A file really named "restore" still works as a path.
   * Paths inside your home are stored as HOME/..., so they restore into the
     current user's home even if the username changed. Other paths are stored
     and restored at their exact location.
@@ -156,7 +155,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-trap 'echo >&2; die "Interrupted."' INT TERM
+trap 'echo >&2; echo "Interrupted." >&2; exit 130' INT TERM
 
 # ---------- environment checks ----------
 tarc() { LC_ALL=C tar "$@"; }   # C locale: tar's messages stay parseable
@@ -642,6 +641,7 @@ config_menu() {
 
 do_config() {
   setup_home
+  check_sudo_home
   local sub=${ARGS[0]-}
   case $sub in
     '')        config_menu ;;
@@ -841,6 +841,7 @@ do_backup() {
   local denied=0
   while IFS= read -r l; do
     [[ -n $l ]] || continue
+    if [[ $l == "tar: Exiting with failure status"* ]]; then continue; fi
     tar_msg "$l"; warn "$REPLY"
     if [[ $l == *"Permission denied"* ]]; then denied=$((denied+1)); fi
   done <"$berr"
@@ -862,7 +863,8 @@ do_backup() {
   (( files > 0 )) || die "Nothing could be archived (all files unreadable?)."
 
   mv -- "$tmp" "$out" || die "Could not move the finished archive into place."
-  TMPS=()
+  # (TMPS stays as it is: removing the already-moved $tmp is a no-op, and the
+  #  tar error file "$berr" is deleted when fbackup exits)
   # When run through sudo, hand the archive back to the person who ran it.
   if (( EUID == 0 )) && [[ -n ${SUDO_USER-} ]] && have chown; then
     chown "$SUDO_USER:" -- "$out" 2>/dev/null || true
@@ -916,10 +918,15 @@ ask_archive() {
   newest_archive "$OUT_DIR"; newest=$REPLY
   if [[ -n $newest ]]; then prompt="Archive (drag it here, or Enter for newest: $(short "$newest")): "; fi
   read -r -e -p "$prompt" raw || true
+  trim "$raw"; raw=$REPLY
   PATHS=()
   add_text "$raw"
   REPLY=${PATHS[0]-}
-  if [[ -z $REPLY ]]; then REPLY=$newest; fi
+  if [[ -z $REPLY ]]; then
+    # only an EMPTY answer means "the newest"; text we could not read is an error
+    [[ -z $raw ]] || die "Could not understand that archive path: $raw"
+    REPLY=$newest
+  fi
 }
 
 do_restore() {
@@ -996,6 +1003,7 @@ do_restore() {
   local -A skipped=() failed=()
   local line path real nskip=0 nrest=0 nfail=0 denied=0
   while IFS= read -r line; do
+    if [[ $line == "tar: Exiting with failure status"* ]]; then continue; fi
     if [[ $line == "tar: "*": skipping existing file" ]]; then
       path=${line#tar: }; path=${path%: skipping existing file}
       if [[ -d /$path ]]; then continue; fi        # an existing folder is not interesting
@@ -1089,9 +1097,10 @@ do_list() {
 
 # ---------- main ----------
 CMD=backup
+CMD_SET=false
 MENU=false
 if (( $# == 0 )); then MENU=true; fi
-case "${1-}" in restore|list|config) CMD=$1; shift ;; esac
+case "${1-}" in restore|list|config) CMD=$1; CMD_SET=true; shift ;; esac
 
 while (( $# )); do
   case $1 in
@@ -1106,7 +1115,16 @@ while (( $# )); do
     -o|--output)    (( $# >= 2 )) || die "$1 needs a directory"; OUT_DIR=$2; shift ;;
     --)             shift; ARGS+=("$@"); break ;;
     -*)             die "Unknown option: $1 (try --help)" ;;
-    *)              ARGS+=("$1") ;;
+    *)
+      # a command word after options ("fbackup -v restore"), unless a file or
+      # folder with that exact name exists (then it is a path to back up)
+      if ! $CMD_SET && (( ${#ARGS[@]} == 0 )) \
+         && [[ $1 == restore || $1 == list || $1 == config ]] \
+         && [[ ! -e $1 && ! -L $1 ]]; then
+        CMD=$1; CMD_SET=true
+      else
+        ARGS+=("$1")
+      fi ;;
   esac
   shift
 done

@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
-# CHANGELOG (newest first)
-# 2.1.0 (2026-10-18): list and default run now only consider scripts (shebang or known extension), so files like readme.md are ignored; added list --all.
-# 2.0.1 (2026-10-18): Atomic installs (safe self-update, incl. --copy/restore); tidied --help layout.
-# 2.0.0 (2026-10-18): New scripts installed by name now drop known extensions (.sh, .py ...); added --keep-ext.
-
-VERSION="2.1.0"
+# NEW IN THIS VERSION (2.1.1):
+#   - Fix: 'ims restore <name>' with no backup used to list the current folder
+#     (empty glob) and could install an unrelated file over the script. It now
+#     reports "No backup found" and changes nothing.
+#   - Fix: backups are now ordered by the timestamp in their file name, not by
+#     file date (cp -p keeps the old date), so 'restore' toggles correctly on
+#     every run and pruning removes the oldest backups.
+#   - Fix: the extension list is defined once (KNOWN_EXT) instead of twice.
+#   - Dry-run summary now says "N would be installed/updated".
+#   - --version and --help print "ims v<version>"; changelog replaced by this entry.
+VERSION="2.1.1"
 NAME="ims"
 
 set -uo pipefail
@@ -31,7 +36,7 @@ err()  { printf '%s\n' "${R}✗${X} $*" >&2; }
 
 usage() {
     cat <<EOF
-${B}$NAME $VERSION${X} - Install My Scripts
+${B}$NAME v$VERSION${X} - Install My Scripts
 
 Moves scripts from ~/Downloads into ~/.local/bin, replacing the old copy
 and running chmod +x on it.
@@ -104,9 +109,7 @@ matches_name() {
     fi
     if [[ $b == *.* ]]; then
         stem=${b%.*}; ext=${b##*.}
-        case ${ext,,} in
-            sh|bash|zsh|fish|py|pl|rb|js|lua) [[ $stem == "$n" ]] && return 0 ;;
-        esac
+        if [[ ${ext,,} =~ ^($KNOWN_EXT)$ && $stem == "$n" ]]; then return 0; fi
     fi
     return 1
 }
@@ -125,10 +128,13 @@ find_match() {
 backup_file() {   # backup_file <path> <name>
     mkdir -p "$BACKUP_DIR" || return 1
     cp -p -- "$1" "$BACKUP_DIR/$2.$(date +%Y%m%d-%H%M%S)" || return 1
-    # prune old backups
-    local old
-    mapfile -t old < <(ls -1t "$BACKUP_DIR/$2".????????-?????? 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)))
-    ((${#old[@]})) && rm -f -- "${old[@]}"
+    # prune: the glob expands in name order, and the name carries the timestamp,
+    # so the oldest backups come first (file dates are not reliable: cp -p keeps them)
+    local all=()
+    all=("$BACKUP_DIR/$2".????????-??????)
+    if ((${#all[@]} > KEEP_BACKUPS)); then
+        rm -f -- "${all[@]:0:${#all[@]}-KEEP_BACKUPS}"
+    fi
     return 0
 }
 
@@ -145,7 +151,7 @@ atomic_put() {
     return 1
 }
 
-INSTALLED=0; UNCHANGED=0; FAILED=0
+INSTALLED=0; UNCHANGED=0; FAILED=0; WOULD=0
 
 install_one() {   # install_one <src> <name>
     local src=$1 name=$2 dest="$BIN_DIR/$2" old_v new_v label verb
@@ -166,6 +172,7 @@ install_one() {   # install_one <src> <name>
 
     if ((DRY)); then
         note "would $verb: ${src##*/} → $dest   [$label]"
+        ((WOULD++))
         return
     fi
 
@@ -188,10 +195,11 @@ install_one() {   # install_one <src> <name>
 }
 
 summary() {
-    local s="$INSTALLED installed/updated"
+    local s
+    if ((DRY)); then s="$WOULD would be installed/updated (dry run)"
+    else s="$INSTALLED installed/updated"; fi
     ((UNCHANGED)) && s+=", $UNCHANGED unchanged"
     ((FAILED))    && s+=", $FAILED failed"
-    ((DRY))       && s+=" (dry run)"
     printf '%s\n' "${D}$s${X}"
 }
 
@@ -258,9 +266,14 @@ cmd_list() {
 cmd_restore() {
     local name=${1:-}
     [[ -n $name ]] || { err "restore needs a script name"; return 2; }
-    local dest="$BIN_DIR/$name" latest
-    latest=$(ls -1t "$BACKUP_DIR/$name".????????-?????? 2>/dev/null | head -n1)
-    [[ -n $latest ]] || { err "No backup found for '$name' in $BACKUP_DIR"; return 1; }
+    local dest="$BIN_DIR/$name" latest backups=()
+    # the glob expands in name order = oldest first (the name ends in a timestamp)
+    backups=("$BACKUP_DIR/$name".????????-??????)
+    if ((${#backups[@]} == 0)); then
+        err "No backup found for '$name' in $BACKUP_DIR"
+        return 1
+    fi
+    latest=${backups[${#backups[@]}-1]}
     if ((DRY)); then note "would restore $name from ${latest##*/} (${D}$(get_ver "$latest")${X})"; return 0; fi
     local tmp; tmp=$(mktemp) || { err "mktemp failed"; return 1; }
     cp -p -- "$latest" "$tmp" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
@@ -276,7 +289,7 @@ pos=()
 while (($#)); do
     case $1 in
         -h|--help)    usage; exit 0 ;;
-        -v|--version) printf '%s %s\n' "$NAME" "$VERSION"; exit 0 ;;
+        -v|--version) printf '%s v%s\n' "$NAME" "$VERSION"; exit 0 ;;
         -n|--dry-run) DRY=1 ;;
         -c|--copy)    COPY=1 ;;
         --no-backup)  BACKUP=0 ;;
