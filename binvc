@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
+# DESC: Friendly git helper for the scripts repo in ~/.local/bin
 # binvc - friendly git helper for the ~/.local/bin scripts repo
 #
-# NEW IN THIS VERSION (2.0.0):
-#   - BREAKING: --version now prints "binvc 2.0.0" (was "binvc v1.1.x");
-#     --help and the menu title use the same "binvc <version>" style
-#   - push/sync only say "Pushed." when something was really uploaded,
-#     otherwise "Nothing to push" (fixes a misleading message)
-#   - -V now works as well as -v (it was documented before but missing)
-#   - this header now lists only the current version's changes
-#     (older history lives in git log / tags)
-VERSION="2.0.0"
+# NEW IN THIS VERSION (2.0.1):
+#   - Fix: an error inside the interactive menu (empty commit message, empty file
+#     name, no remote, ...) closed binvc completely; now it returns to the menu.
+#   - Fix: --help and --version no longer need git or the repo folder to exist.
+#   - Fix: 'binvc tag' returned an error status after a successful tag when there
+#     was no remote or you declined to push the tag.
+#   - Fix: the "shebang but not executable" check skipped file names with accents
+#     or special characters (git quotes them); it now reads NUL-separated names.
+#   - The remote is no longer assumed to be called "origin" (origin if it exists,
+#     otherwise the first remote).
+#   - --version, --help and the menu title print "binvc v<version>"; the 2.0.0
+#     entry is replaced by this one.
+VERSION="2.0.1"
 REPO="${BINVC_REPO:-$HOME/.local/bin}"
 
 if [ -t 1 ]; then
@@ -23,14 +28,22 @@ warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 confirm() { local a; read -r -p "$1 [y/N] " a; [[ $a =~ ^[Yy]$ ]]; }
 
-command -v git >/dev/null || die "git is not installed (sudo pacman -S git)"
-cd "$REPO" 2>/dev/null || die "folder not found: $REPO"
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
-  || die "$REPO is not a git repo yet (run: git init)"
+# git and the repo folder are only needed by real commands, not by --help/--version
+preflight() {
+  command -v git >/dev/null || die "git is not installed (sudo pacman -S git)"
+  cd "$REPO" 2>/dev/null || die "folder not found: $REPO"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$REPO is not a git repo yet (run: git init)"
+}
 
 has_remote()  { [ -n "$(git remote)" ]; }
 has_changes() { [ -n "$(git status --porcelain)" ]; }
 has_upstream() { git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; }
+
+# The remote to push to: "origin" if there is one, otherwise the first remote.
+remote_name() {
+  if git remote | grep -qx origin; then echo origin; else git remote | head -n1; fi
+}
 
 SECRET_PAT='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|(password|passwd|secret|api[_-]?key|token)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
 
@@ -40,7 +53,7 @@ secret_hits() {
 
 check_exec() {
   local f
-  git ls-files -c -o --exclude-standard | while IFS= read -r f; do
+  git ls-files -z -c -o --exclude-standard | while IFS= read -r -d '' f; do
     [ -f "$f" ] || continue
     if [ "$(head -c2 "$f" 2>/dev/null)" = '#!' ] && [ ! -x "$f" ]; then
       warn "$f has a shebang but is not executable (fix: chmod +x $f)"
@@ -159,7 +172,7 @@ cmd_push() {
   has_remote || die "no remote configured (GitHub link missing)"
   PUSHED_ANY=0
   if has_upstream; then push_run || { warn "push failed, nothing was uploaded"; return 1; }
-  else push_run -u origin HEAD || { warn "push failed, nothing was uploaded"; return 1; }
+  else push_run -u "$(remote_name)" HEAD || { warn "push failed, nothing was uploaded"; return 1; }
   fi
   push_run --tags || { warn "pushing tags failed"; return 1; }
   if [ "$PUSHED_ANY" = 1 ]; then info "Pushed."
@@ -238,7 +251,10 @@ cmd_tag() {
   [ -n "$m" ] || m="Release $t"
   git tag -a "$t" -m "$m" || return 1
   info "Created tag $t"
-  has_remote && confirm "Push tag to GitHub?" && git push origin "$t"
+  if has_remote && confirm "Push tag to GitHub?"; then
+    git push "$(remote_name)" "$t" || return 1
+  fi
+  return 0
 }
 
 cmd_tags() { git tag -n --sort=-v:refname; }
@@ -264,7 +280,7 @@ cmd_where() {
 
 usage() {
   cat <<EOF
-${B}binvc $VERSION${N} - git helper for $REPO
+${B}binvc v$VERSION${N} - git helper for $REPO
 
 Run with no arguments for an interactive menu.
 
@@ -288,14 +304,19 @@ Run with no arguments for an interactive menu.
   ignore               create a starter .gitignore
   where                show the GitHub link
   help                 this text
+  -v, --version        print the version
 EOF
 }
+
+# Run one menu action in its own subshell: an error (die) inside it ends only
+# that action, not the whole menu.
+run_item() { ( "$@" ) || true; }
 
 menu() {
   local c
   while true; do
     echo
-    echo "${B}binvc $VERSION${N}  ($REPO)"
+    echo "${B}binvc v$VERSION${N}  ($REPO)"
     cat <<'EOF'
   1) Status           7) Restore a file
   2) Show changes     8) Get older version of a file
@@ -309,19 +330,19 @@ EOF
     read -r -p "Choose: " c || break
     echo
     case "$c" in
-      1) cmd_status ;;
-      2) cmd_diff ;;
-      3) cmd_commit ;;
-      4) cmd_push ;;
-      5) cmd_sync ;;
-      6) cmd_log ;;
-      7) cmd_restore ;;
-      8) cmd_fetchfile ;;
-      9) cmd_undo ;;
-      10) cmd_tag ;;
-      11) cmd_scan ;;
-      12) cmd_ignore ;;
-      13) cmd_incoming ;;
+      1) run_item cmd_status ;;
+      2) run_item cmd_diff ;;
+      3) run_item cmd_commit ;;
+      4) run_item cmd_push ;;
+      5) run_item cmd_sync ;;
+      6) run_item cmd_log ;;
+      7) run_item cmd_restore ;;
+      8) run_item cmd_fetchfile ;;
+      9) run_item cmd_undo ;;
+      10) run_item cmd_tag ;;
+      11) run_item cmd_scan ;;
+      12) run_item cmd_ignore ;;
+      13) run_item cmd_incoming ;;
       q|Q) break ;;
       *) warn "unknown choice" ;;
     esac
@@ -331,6 +352,14 @@ EOF
 main() {
   local cmd="${1:-}"
   [ $# -gt 0 ] && shift
+  # these need neither git nor the repo
+  case "$cmd" in
+    version|-v|-V|--version) echo "binvc v$VERSION"; return 0 ;;
+    help|-h|--help)          usage; return 0 ;;
+    ""|status|st|s|incoming|in|diff|d|commit|c|push|p|pull|sync|log|l|show|restore|fetchfile|old|undo|tag|tags|scan|ignore|where) ;;
+    *) warn "unknown command: $cmd"; usage; exit 1 ;;
+  esac
+  preflight
   case "$cmd" in
     "")                menu ;;
     status|st|s)       cmd_status "$@" ;;
@@ -350,9 +379,6 @@ main() {
     scan)              cmd_scan ;;
     ignore)            cmd_ignore ;;
     where)             cmd_where ;;
-    version|-v|-V|--version) echo "binvc $VERSION" ;;
-    help|-h|--help)    usage ;;
-    *) warn "unknown command: $cmd"; usage; exit 1 ;;
   esac
 }
 
