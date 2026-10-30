@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
+# DESC: Save Niri window layouts as one-key profiles ("stages") and restore them later
+#
 # stage: save your Niri window layouts as one-key profiles ("stages") and bring
 # them back later. Interactive interface built on gum; stdlib-only Python.
 #
-# NEW IN THIS VERSION (3.0.1):
-#   - Fix: gum 2.x does not toggle checklist items with Space (only x or Tab).
-#     The checklist hint now says so, and gum's own key help is shown under lists.
-#
-# Earlier (3.0.0):
-#   - BREAKING: renamed niri-ws -> stage (command, ~/.config/niri/stage/, include
-#     block). `stage setup` migrates a niri-ws install once; niri-profiles support
-#     is gone.
-#   - BREAKING: new interface. Run `stage` with no arguments: Space-toggle window
-#     checklists, forms, menus and confirmations (needs `gum`: sudo pacman -S gum).
-#     All old prompt flows and the commands rebind, rename, edit, recapture, enable,
-#     disable and delete are replaced by that interface.
-#   - Kept as commands (scripting / keybinds): setup, capture NAME, restore NAME
-#     [--dry-run], list, show, confirm, status, debug, uninstall, --debug.
-#   - `capture NAME` (no prompts) saves every open window except your terminal.
-#   - Setup warns if another `stage` program is already in your PATH.
-#
-VERSION="3.0.1"
+# NEW IN THIS VERSION (3.0.2):
+#   - Fix: a saved window without an app_id (or launch command) made `restore`
+#     launch a new copy every time, wait the full timeout and report "not found";
+#     with no command at all it crashed mid-restore. Such windows are now skipped
+#     and listed as problems at once.
+#   - Fix: the shortcut-conflict scan treated "//" inside a quoted string (for
+#     example a URL in a bind) as a comment, so later binds went unseen. Strings
+#     are now ignored when looking for comments and braces.
+#   - Fix: `capture NAME` dropped every window of a single-process terminal (all
+#     its windows share one pid). When several windows match, only the focused one
+#     (the one you typed the command in) is left out.
+#   - Fix: writing a file (config.kdl, profiles) no longer resets its permissions.
+#   - Renamed a local variable that hid the act() function; removed an empty
+#     section header.
+#   - Header: the older version history is replaced by this entry; added a
+#     # DESC: line for shelf.
+VERSION="3.0.2"
 NAME="stage"
 LEGACY="niri-ws"
 
@@ -136,6 +137,10 @@ def write(path, text):
     real.parent.mkdir(parents=True, exist_ok=True)
     tmp = real.with_name(real.name + ".tmp")
     tmp.write_text(text)
+    try:  # keep the permissions of the file being replaced (e.g. a 600 config.kdl)
+        os.chmod(tmp, real.stat().st_mode & 0o7777)
+    except OSError:
+        pass
     os.replace(tmp, real)
 
 
@@ -361,6 +366,31 @@ def norm_combo(c):
 BIND_RE = re.compile(r'^\s*([A-Za-z0-9_+]+)(?:\s+[\w-]+=(?:"[^"]*"|\S+))*\s*\{')
 
 
+def kdl_code(line):
+    """The code part of one KDL line: a trailing // comment is cut off and the
+    text inside "quotes" is emptied, so a "//" or a brace inside a string (a URL,
+    a shell command) is not mistaken for a comment or a block."""
+    out, quoted, i = [], False, 0
+    while i < len(line):
+        c = line[i]
+        if quoted:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quoted = False
+                out.append(c)
+        elif c == '"':
+            quoted = True
+            out.append(c)
+        elif line.startswith("//", i):
+            break
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def scan_binds(path):
     found, depth, in_binds = [], 0, False
     try:
@@ -368,7 +398,7 @@ def scan_binds(path):
     except OSError:
         return found
     for raw in lines:
-        line = raw.split("//", 1)[0]
+        line = kdl_code(raw)
         if depth == 0 and re.match(r"\s*binds\s*\{", line):
             in_binds = True
         elif in_binds and depth == 1:
@@ -539,7 +569,12 @@ def capture_windows():
     wss = {w["id"]: w for w in niri_json("workspaces")}
     outs = niri_json("outputs")
     anc = ancestors()
-    own = [w for w in wins if w.get("pid") in anc] or [w for w in wins if w.get("is_focused")]
+    own = [w for w in wins if w.get("pid") in anc]
+    if len(own) > 1:  # one terminal process owning several windows: leave out only the one you typed in
+        focused = [w for w in own if w.get("is_focused")]
+        own = focused or own
+    if not own:
+        own = [w for w in wins if w.get("is_focused")]
     skip = {w["id"] for w in own}
     log(f"own-terminal windows excluded: {sorted(skip)} (ancestor pids: {sorted(anc)})")
     items = []
@@ -656,7 +691,16 @@ def cmd_restore(name, dry=False):
     before = niri_json("windows")
     base = {w["id"] for w in before}
     claimed, fails = {}, []
+    # A window saved without an app_id (or launch command) cannot be recognised once it
+    # is launched, so launching it would only wait out the timeout: report it instead.
+    skip = {i for i, w in enumerate(wins) if not (w.get("app_id") or "").strip() or not w.get("cmd")}
+    if skip:
+        log(f"restore: skipping windows without app_id/command: {sorted(skip)}")
     for i, w in enumerate(wins):
+        if i in skip:
+            if dry:
+                print(f"would skip: {w.get('label') or w.get('title') or '?'} (no app_id or launch command saved)")
+            continue
         if p.get("existing", "move") == "move" and not w.get("url"):
             used = set(claimed.values())
             m = next((x for x in before if x["id"] not in used and same_app(x, w)), None)
@@ -676,7 +720,7 @@ def cmd_restore(name, dry=False):
                              stderr=subprocess.DEVNULL, start_new_session=True)
         except OSError as e:
             fails.append(f"launch {cmd[:1]}: {e}")
-    pending = [i for i in range(len(wins)) if i not in claimed]
+    pending = [i for i in range(len(wins)) if i not in claimed and i not in skip]
     if dry:
         for i in pending:
             claimed[i] = f"<new:{wins[i]['app_id']}#{i}>"
@@ -756,7 +800,10 @@ def cmd_restore(name, dry=False):
     if dry:
         print("(dry run) nothing was changed.")
         return
-    msgs = [f"not found: {wins[i]['app_id']} ({shlex.join(wins[i]['cmd'])})" for i in pending] + fails
+    msgs = ([f"not found: {wins[i]['app_id']} ({shlex.join(wins[i]['cmd'])})" for i in pending]
+            + [f"cannot restore (no app_id or launch command saved): {wins[i].get('label') or wins[i].get('title') or '?'}"
+               for i in sorted(skip)]
+            + fails)
     if msgs:
         log("restore problems: " + " | ".join(msgs), force=True)
         print(f"Restored '{name}' with {len(msgs)} problem(s):", file=sys.stderr)
@@ -955,9 +1002,6 @@ def cmd_status():
     print(f"set up       : {'yes' if is_setup() else 'no'} (include mode: {st['bind_mode']})")
     print(f"profiles     : {len(profile_names())}")
     check_version(interactive=sys.stdin.isatty())
-
-
-# ---------------------------------------------------------------- menu
 
 
 # ---------------------------------------------------------------- interface (gum)
@@ -1276,31 +1320,31 @@ def ui_profile(name):
         banner()
         c = ui_choose(f"{name}    shortcut: {p.get('bind') or 'none'}    {len(p['windows'])} windows"
                       + ("    (disabled)" if not on else ""), [a for a, _ in actions])
-        act = dict(actions).get(c, "back")
-        if act == "back":
+        chosen = dict(actions).get(c, "back")
+        if chosen == "back":
             return
-        if act == "restore":
+        if chosen == "restore":
             run_action(cmd_restore, name)
-        elif act == "preview":
+        elif chosen == "preview":
             run_action(cmd_restore, name, True)
-        elif act == "show":
+        elif chosen == "show":
             run_action(cmd_show, name)
-        elif act == "edit":
+        elif chosen == "edit":
             run_action(ui_edit, name, wait=False)
-        elif act == "bind":
+        elif chosen == "bind":
             ok, b = pick_bind_ui(exclude=name, current=p.get("bind"))
             if ok:
                 run_action(cmd_rebind, name, b or "none", True)
-        elif act == "rename":
+        elif chosen == "rename":
             name = ui_rename(name)
-        elif act == "recap":
+        elif chosen == "recap":
             run_action(ui_capture, name, True)
-        elif act == "policy":
+        elif chosen == "policy":
             p["existing"] = "spawn" if p.get("existing", "move") == "move" else "move"
             run_action(mutate, lambda s: save_profile(p))
-        elif act == "toggle":
+        elif chosen == "toggle":
             run_action(cmd_enable, name, not on)
-        elif act == "delete" and ui_confirm(f"Delete profile '{name}'? This can't be undone.", False):
+        elif chosen == "delete" and ui_confirm(f"Delete profile '{name}'? This can't be undone.", False):
             run_action(cmd_delete, name)
             return
 
