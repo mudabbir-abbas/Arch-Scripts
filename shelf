@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # DESC: Menu launcher that lists and runs the scripts in ~/.local/bin
 #
-# NEW IN THIS VERSION (3.0.0):
-#   - Menu list is now compact: just name + version (description moved out)
-#   - Source-code preview replaced by an info panel (description, path, size,
-#     and the script's header comments); hidden by default, Tab toggles it
-#   - Menu header shortened; "shelf <version>" moved to the border label
-#   - New --info NAME flag (used by the panel; prints the same info card)
+# NEW IN THIS VERSION (3.0.1):
+#   - Fix: pressing Ctrl+C inside a launched script (one that does not catch it
+#     itself, like thermal-toast) also closed shelf; you now land back in the
+#     menu at the "[exit 130]" prompt.
+#   - Run without a terminal (e.g. "shelf | cat"), shelf prints the script table
+#     instead of exiting silently; an empty folder says "No scripts found".
+#   - --info and -d/--dir without a value give a clear message (exit status 2)
+#     instead of a raw shell error.
+#   - --version, --help and the menu title print "shelf v<version>"; the 3.0.0
+#     entry is replaced by this one.
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 NAME="shelf"
 
 DIR="${SHELF_DIR:-$HOME/.local/bin}"
@@ -17,7 +21,7 @@ SELF="$(basename "$SELF_PATH")"
 
 usage() {
     cat <<EOF
-$NAME $VERSION
+$NAME v$VERSION
 Menu launcher for the scripts in a directory (default: ~/.local/bin).
 
 Usage: $NAME [options]
@@ -33,6 +37,8 @@ Menu keys (fzf):
   Enter   run script          Ctrl-A  run with arguments
   Ctrl-H  run with --help     Ctrl-E  open in \$EDITOR
   Tab     show/hide info      Esc     quit
+
+Without a terminal (for example "$NAME | cat") the script table is printed.
 
 Metadata (read from the first lines of each script, never executed):
   VERSION="1.2.3"             -> shown next to the name ("-" if missing)
@@ -99,8 +105,12 @@ run_script() {
     local name=$1; shift
     clear
     printf '── %s %s ──\n\n' "$name" "$*"
+    # While the script runs, shelf itself must survive Ctrl+C: a handler (unlike
+    # "ignore") is reset to the default in the child, so the script still gets it.
+    trap : INT
     "$DIR/$name" "$@"
     local rc=$?
+    trap - INT
     printf '\n[exit %d] Press Enter to return…' "$rc"
     read -r _
 }
@@ -110,7 +120,7 @@ menu_fzf() {
     export SHELF_DIR="$DIR"
     while true; do
         out=$(table | fzf --height=100% --reverse --border --info=hidden \
-            --border-label=" $NAME $VERSION " \
+            --border-label=" $NAME v$VERSION " \
             --header="Enter run · ^A args · ^H help · ^E edit · Tab info" \
             --expect=ctrl-a,ctrl-h,ctrl-e \
             --bind=tab:toggle-preview \
@@ -134,7 +144,7 @@ menu_select() {
     local -a names
     mapfile -t names < <(build_rows | cut -f1)
     ((${#names[@]})) || { echo "No scripts found in $DIR"; return 1; }
-    echo "$NAME $VERSION (install fzf for a better menu)"
+    echo "$NAME v$VERSION (install fzf for a better menu)"
     PS3="Run which? (Ctrl-D to quit) "
     select n in "${names[@]}"; do
         [[ -n $n ]] && run_script "$n"
@@ -146,11 +156,13 @@ LIST=0
 INFO_NAME=""
 while (($#)); do
     case $1 in
-        --version)  echo "$NAME $VERSION"; exit 0 ;;
+        --version)  echo "$NAME v$VERSION"; exit 0 ;;
         -h|--help)  usage; exit 0 ;;
         -l|--list)  LIST=1 ;;
-        --info)     shift; INFO_NAME="${1:?--info needs a script name}" ;;
-        -d|--dir)   shift; DIR="${1:?--dir needs a path}" ;;
+        --info)     (($# >= 2)) || { echo "$NAME: --info needs a script name" >&2; exit 2; }
+                    shift; INFO_NAME=$1 ;;
+        -d|--dir)   (($# >= 2)) || { echo "$NAME: $1 needs a path" >&2; exit 2; }
+                    shift; DIR=$1 ;;
         *)          echo "$NAME: unknown option '$1'" >&2; usage >&2; exit 2 ;;
     esac
     shift
@@ -160,9 +172,12 @@ done
 
 if [[ -n $INFO_NAME ]]; then show_info "$INFO_NAME"; exit $?; fi
 
-if ((LIST)); then
+# --list, or no terminal to show a menu on: print the table
+if ((LIST)) || [[ ! -t 0 || ! -t 1 ]]; then
     { printf 'NAME\tVERSION\tDESCRIPTION\n'; build_rows; } | column -t -s $'\t'
     exit 0
 fi
+
+[[ -n $(build_rows) ]] || { echo "No scripts found in $DIR"; exit 1; }
 
 if command -v fzf >/dev/null 2>&1; then menu_fzf; else menu_select; fi
