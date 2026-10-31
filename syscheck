@@ -25,10 +25,14 @@
 #   Offline, internet checks are skipped. Slow link? DL_NET=400 syscheck (max 600 s per limit;
 #   variables: DL_LOCAL, DL_SLOW, DL_NET, NET_BUDGET)
 #
-# NEW IN THIS VERSION (4.3.0, over 4.2.0):
-#   - Deadlines on every check; a timed-out check is never reported as healthy
-#   - Internet checks share a 10-minute budget and are skipped at once when offline
-#   - Ctrl+C stops a running check immediately; the previous-boot journal read has a deadline too
+# NEW IN THIS VERSION (4.3.1):
+#   - Fix: --full now marks a check that hit its deadline as [CHECK], like the other modes
+#   - Fix: boot phases over a minute ("1min 3.2s (firmware)") were read as 3.2s, which
+#     hid a slow firmware or loader phase; minutes are now counted
+#   - --version and --help print "syscheck v<version>"; VERSION moved up (shelf reads only
+#     the first 40 lines); the changelog at the end of the file is removed
+NAME="syscheck"
+VERSION="4.3.1"
 #
 # Read-only: it changes nothing and installs nothing.
 # Privacy: hostname, username, real name, LAN IPs, MAC addresses, Wi-Fi/VPN
@@ -36,13 +40,10 @@
 # report is written. The unmasked data only ever exists in a private temp file
 # that is deleted when the script ends.
 
-NAME="syscheck"
-VERSION="4.3.0"
-
 usage() {
-    echo "$NAME $VERSION"
+    echo "$NAME v$VERSION"
     echo
-    awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?(DESC: *)?/,""); print }' "$0"
+    awk 'NR>1 { if ($0 ~ /^(NAME|VERSION)=/) next; if ($0 !~ /^#/) exit; sub(/^# ?(DESC: *)?/,""); print }' "$0"
 }
 
 DIR=""
@@ -52,7 +53,7 @@ SUMONLY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help)      usage; exit 0 ;;
-        -v|--version)   echo "$NAME $VERSION"; exit 0 ;;
+        -v|--version)   echo "$NAME v$VERSION"; exit 0 ;;
         -f|--full|--detailed|--detail|--details|--verbose) FULL=1; shift ;;
         -s|--summary)   SUMONLY=1; shift ;;
         -d|--directory)
@@ -109,7 +110,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'clear_line; echo "Interrupted. Nothing was saved."; exit 130' INT TERM
 
-echo "${C_BOLD}System check (Arch + Niri)${C_OFF} ${C_DIM}$NAME $VERSION${C_OFF}  (read-only, nothing is changed)"
+echo "${C_BOLD}System check (Arch + Niri)${C_OFF} ${C_DIM}$NAME v$VERSION${C_OFF}  (read-only, nothing is changed)"
 echo
 if ! grep -qiE '^(ID|ID_LIKE)=.*arch' /etc/os-release 2>/dev/null; then
     echo "${C_WARN}Note: this does not look like Arch or an Arch derivative. Package checks will fail;"
@@ -254,7 +255,10 @@ _emit() {
 run() {
     _exec "$1" "$2"
     local tag=""
-    if [ "$TIMED_OUT" -eq 1 ] && [ "$FULL" -eq 0 ]; then BAD+=("$1"); WHY+=("$(why)"); tag="CHECK"; fi
+    if [ "$TIMED_OUT" -eq 1 ]; then
+        tag="CHECK"
+        if [ "$FULL" -eq 0 ]; then BAD+=("$1"); WHY+=("$(why)"); fi
+    fi
     _emit "$1" "$2" "$tag"
 }
 
@@ -278,7 +282,7 @@ runq() {
         { echo; echo "--- $1"; echo "OK: ${MSG:-$4}"; } >> "$RAW"
     else
         if [ "$FULL" -eq 1 ]; then
-            _emit "$1" "$2"
+            _emit "$1" "$2" "$([ "$TIMED_OUT" -eq 1 ] && echo CHECK)"
         else
             BAD+=("$1"); WHY+=("$(why)")
             if [ "$SUMONLY" -eq 1 ]; then
@@ -344,7 +348,7 @@ SUDO_ENV="env $(printf '%q' "TPMFILT=$TPMFILT") $(printf '%q' "KNOWN_TPM=$KNOWN_
 {
     echo "SYSTEM CHECK REPORT"
     echo "Generated: $(date)"
-    echo "Script: $NAME $VERSION (bash $BASH_VERSION)"
+    echo "Script: $NAME v$VERSION (bash $BASH_VERSION)"
     if [ "$FULL" -eq 1 ]; then echo "Mode: FULL (every detail included)"
     elif [ "$SUMONLY" -eq 1 ]; then echo "Mode: summary only (one line per check; run without --summary for details of problems)"
     else echo "Mode: default (healthy checks are one line, problems keep full details; --summary is shorter, --full is longer)"; fi
@@ -380,7 +384,7 @@ runq "Audio (PipeWire user services)" 'for u in pipewire.socket pipewire-pulse.s
 
 # ===============================================================
 section "Boot time"
-runq "Boot time" 'o=$(systemd-analyze | head -2); echo "$o"; f=$(echo "$o" | sed -nE "1s/.* ([0-9.]+)s \(firmware\).*/\1/p"); l=$(echo "$o" | sed -nE "1s/.* ([0-9.]+)s \(loader\).*/\1/p"); awk -v f="${f:-0}" -v l="${l:-0}" "BEGIN{ if (f>10) print \"SLOW firmware phase (>10s): look at BIOS Fast Boot / POST settings\"; if (l>3.5) print \"SLOW loader phase (>3.5s): check UKI size on the ESP, loader.conf timeout, TPM measurement of the UKI\" }"' 'MSG="$(echo "$out" | head -1 | sed "s/^Startup finished in //")"; echo "$out" | grep -q "^Startup finished" && ! echo "$out" | grep -q "^SLOW"' ""
+runq "Boot time" 'o=$(systemd-analyze | head -2); echo "$o"; h=$(echo "$o" | head -1); tosec() { echo "$1" | awk "{ t=0; for (i=1; i<=NF; i++) { v=\$i; if (v ~ /min\$/) { sub(/min\$/, \"\", v); t+=v*60 } else if (v ~ /ms\$/) { sub(/ms\$/, \"\", v); t+=v/1000 } else if (v ~ /us\$/) { sub(/us\$/, \"\", v); t+=v/1000000 } else if (v ~ /h\$/) { sub(/h\$/, \"\", v); t+=v*3600 } else if (v ~ /s\$/) { sub(/s\$/, \"\", v); t+=v } } printf \"%.1f\", t }"; }; f=$(tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(firmware\).*/\2/p")"); l=$(tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(loader\).*/\2/p")"); awk -v f="${f:-0}" -v l="${l:-0}" "BEGIN{ if (f>10) print \"SLOW firmware phase (>10s): look at BIOS Fast Boot / POST settings\"; if (l>3.5) print \"SLOW loader phase (>3.5s): check UKI size on the ESP, loader.conf timeout, TPM measurement of the UKI\" }"' 'MSG="$(echo "$out" | head -1 | sed "s/^Startup finished in //")"; echo "$out" | grep -q "^Startup finished" && ! echo "$out" | grep -q "^SLOW"' ""
 runq "Slow units at boot (1 s or more)" 'cc=$(systemd-analyze critical-chain --no-pager 2>/dev/null); systemd-analyze blame --no-pager | grep -E "^ *[0-9.]+(s|min) " | head -8 | while read -r l; do u=${l##* }; if echo "$cc" | grep -qF -- "$u"; then echo "$l   [on the critical path: delays boot]"; else echo "$l   [runs in parallel: does not delay boot]"; fi; done' 'if [ -z "$out" ]; then MSG="no unit slower than 1s"; true; else MSG="$(echo "$out" | wc -l) unit(s) over 1s, none on the critical path (parallel)"; ! echo "$out" | grep -q "on the critical path"; fi' ""
 srun "Boot loader and firmware" 'bootctl status 2>&1 | grep -E "Secure Boot:|TPM2 Support:|Product:|Current Entry:|Default Entry:" | sort -u'
 srun "loader.conf (menu timeout counts towards boot time)" 'cat "$(bootctl --print-esp-path 2>/dev/null)/loader/loader.conf" 2>&1'
@@ -405,7 +409,7 @@ PREV_LOG="$(cat "$CHK")"
 SHUT_BAD=0
 if [ "$PREV_RC" -eq 124 ] || [ "$PREV_RC" -eq 137 ]; then
     [ "$FULL" -eq 0 ] && { BAD+=("Shutdown duration"); WHY+=("timed out after ${DL_SLOW}s reading the previous boot journal, result unknown"); }
-    printf '\n--- Shutdown duration%s\nTimed out after %ss while reading the previous boot journal: the shutdown time and stop-timeout checks were skipped.\n' "$([ "$FULL" -eq 0 ] && echo '  [CHECK]')" "$DL_SLOW" >> "$RAW"
+    printf '\n--- Shutdown duration  [CHECK]\nTimed out after %ss while reading the previous boot journal: the shutdown time and stop-timeout checks were skipped.\n' "$DL_SLOW" >> "$RAW"
 elif [ -z "$PREV_LOG" ]; then
     printf '\n--- Shutdown duration\nNo previous boot in journal (journal may not be persistent).\n' >> "$RAW"
 else
@@ -660,25 +664,3 @@ echo
 echo "Masked: ${N_IP4} LAN IPv4, ${N_IP6} IPv6, ${N_MAC} MAC, ${N_NAME} name(s), ${N_UUID} UUID(s), ${N_SER} serial line(s)."
 echo "Quick skim before sharing is still wise: folder and file names (home folder sizes,"
 echo "journal lines) can contain personal words that no filter can recognise."
-
-# ---------- changelog (older entries; the current one is in the header) ----------
-# 4.2.0  boot loader: ESP copy compared with the one systemd ships; NVMe "Percentage Used" is only a note
-#        on drives known to over-report it (BC501), health judged by spare/media errors/critical warning;
-#        Secret Service: any provider counts, not just the gnome-keyring package
-# 4.1.0  false-alarm fixes: display-manager regex, "qs" process name, fwupd "No updatable devices", empty
-#        Bluetooth OK line, shutdown time of 0s; coredumps flag only this boot (7-day history);
-#        bluez adv_monitor and shutdown-time nm_dispatcher noise ignored; per-boot start/last line
-# 4.0.0  BREAKING: -v now means --version (it was an alias of --full); use --verbose or -f
-#        header trimmed so VERSION sits within the first 40 lines (shelf launcher); added "# DESC:" line
-# 3.5.0  VERSION variable + --version flag, executable file, version in report header
-# 3.4.0 (over 3.3):
-#   - Primary target is now Niri + Dank Material Shell (dms-greeter on greetd) instead of KDE Plasma
-#   - New section "Niri, shell and greeter": installed vs running niri, niri config validity (niri validate),
-#     DMS/quickshell running, greetd + dms-greeter wiring, portals/keyring/Xwayland packages, PipeWire user services
-#   - New checks: running kernel still installed (reboot pending after an upgrade), Plymouth hook + splash wiring,
-#     a power daemon is active (power-profiles-daemon)
-#   - Fix: checks run through sudo lost TPMFILT/KNOWN_TPM (sudo resets the environment), so the filter became an
-#     empty pattern that hid EVERY line of "Kernel errors (dmesg)": it always said "none". Now passed through sudo.
-#   - Fix: display-manager detection never reached its fallback message; generic hostnames (archlinux, arch) are no
-#     longer masked (it would have mangled "Arch Linux" and archlinux.org throughout the report)
-#   - Removed KDE-only parts (plasmashell, drkonqi filter) and Fedora leftovers (tuned)
