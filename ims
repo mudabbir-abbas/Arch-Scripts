@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
-# NEW IN THIS VERSION (2.1.1):
-#   - Fix: 'ims restore <name>' with no backup used to list the current folder
-#     (empty glob) and could install an unrelated file over the script. It now
-#     reports "No backup found" and changes nothing.
-#   - Fix: backups are now ordered by the timestamp in their file name, not by
-#     file date (cp -p keeps the old date), so 'restore' toggles correctly on
-#     every run and pruning removes the oldest backups.
-#   - Fix: the extension list is defined once (KNOWN_EXT) instead of twice.
-#   - Dry-run summary now says "N would be installed/updated".
-#   - --version and --help print "ims v<version>"; changelog replaced by this entry.
-VERSION="2.1.1"
+# NEW IN THIS VERSION (2.1.2):
+#   - Fix: two backups of the same script within one second overwrote each other, so
+#     'ims restore <name>' run twice in a row lost a version and the toggle installed
+#     the wrong one. A further backup in the same second now gets a counter, for example
+#     foo.20261104-101500-01, which continues after the highest one already used (even if
+#     older ones were pruned). Existing backups keep working.
+#   - Backups are listed by one helper (list_backups) that accepts only real backup
+#     names and sorts them in the C locale, so the order no longer depends on the
+#     locale and stray files such as foo.<stamp>.bak are ignored.
+VERSION="2.1.2"
 NAME="ims"
 
 set -uo pipefail
@@ -125,15 +124,54 @@ find_match() {
     printf '%s' "$best"
 }
 
+# list_backups <name> -> fills BK with the backups of that script, oldest first.
+# A backup is <name>.YYYYMMDD-HHMMSS, or <name>.YYYYMMDD-HHMMSS-NN when several were made in
+# the same second. Only names of exactly that form count (so foo.sh.<stamp> or foo.<stamp>.bak
+# are not foo's backups), and the order is fixed by sorting in the C locale, not by the glob.
+BK=()
+list_backups() {
+    local f s found=()
+    BK=()
+    for f in "$BACKUP_DIR/$1".*; do
+        s=${f##*/}; s=${s#"$1".}
+        if [[ $s =~ ^[0-9]{8}-[0-9]{6}(-[0-9]{2})?$ ]]; then found+=("$f"); fi
+    done
+    if ((${#found[@]})); then
+        mapfile -t BK < <(printf '%s\n' "${found[@]}" | LC_ALL=C sort)
+    fi
+}
+
 backup_file() {   # backup_file <path> <name>
     mkdir -p "$BACKUP_DIR" || return 1
-    cp -p -- "$1" "$BACKUP_DIR/$2.$(date +%Y%m%d-%H%M%S)" || return 1
-    # prune: the glob expands in name order, and the name carries the timestamp,
-    # so the oldest backups come first (file dates are not reliable: cp -p keeps them)
-    local all=()
-    all=("$BACKUP_DIR/$2".????????-??????)
-    if ((${#all[@]} > KEEP_BACKUPS)); then
-        rm -f -- "${all[@]:0:${#all[@]}-KEEP_BACKUPS}"
+    local stamp target f s k last=-1
+    stamp=$(date +%Y%m%d-%H%M%S)
+    # A backup from this same second may exist already. Number the new one after the highest
+    # number used in that second (-01, -02, ...). Simply testing whether the plain name exists is
+    # not enough: pruning may already have removed it, and a new plain name would sort before
+    # the numbered ones and be pruned at once.
+    list_backups "$2"
+    for f in ${BK[@]+"${BK[@]}"}; do
+        s=${f##*/}; s=${s#"$2".}
+        if [[ $s == "$stamp" ]]; then
+            if ((last < 0)); then last=0; fi
+        elif [[ $s == "$stamp"-* ]]; then
+            k=$((10#${s##*-}))
+            if ((k > last)); then last=$k; fi
+        fi
+    done
+    if ((last < 0)); then
+        target="$BACKUP_DIR/$2.$stamp"
+    else
+        last=$((last+1))
+        if ((last > 99)); then warn "$2: too many backups within one second"; return 1; fi
+        printf -v target '%s/%s.%s-%02d' "$BACKUP_DIR" "$2" "$stamp" "$last"
+    fi
+    cp -p -- "$1" "$target" || return 1
+    # prune: the oldest backups come first (the name carries the timestamp; file dates are not
+    # reliable because cp -p keeps them)
+    list_backups "$2"
+    if ((${#BK[@]} > KEEP_BACKUPS)); then
+        rm -f -- "${BK[@]:0:${#BK[@]}-KEEP_BACKUPS}"
     fi
     return 0
 }
@@ -266,14 +304,14 @@ cmd_list() {
 cmd_restore() {
     local name=${1:-}
     [[ -n $name ]] || { err "restore needs a script name"; return 2; }
-    local dest="$BIN_DIR/$name" latest backups=()
-    # the glob expands in name order = oldest first (the name ends in a timestamp)
-    backups=("$BACKUP_DIR/$name".????????-??????)
-    if ((${#backups[@]} == 0)); then
+    local dest="$BIN_DIR/$name" latest
+    # oldest first, so the last one is the newest backup
+    list_backups "$name"
+    if ((${#BK[@]} == 0)); then
         err "No backup found for '$name' in $BACKUP_DIR"
         return 1
     fi
-    latest=${backups[${#backups[@]}-1]}
+    latest=${BK[${#BK[@]}-1]}
     if ((DRY)); then note "would restore $name from ${latest##*/} (${D}$(get_ver "$latest")${X})"; return 0; fi
     local tmp; tmp=$(mktemp) || { err "mktemp failed"; return 1; }
     cp -p -- "$latest" "$tmp" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
