@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 # DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (3.1.1):
-#   - Fix: the scratch folder used while adding an AppImage (a full extraction can
-#     be hundreds of MB) is now created inside the AppImage folder on disk, not in
-#     /tmp, which is usually RAM on Arch. It is removed as before.
-#   - Fix: an app whose display name has no Latin letters (e.g. Japanese) no longer
-#     always gets the slug "app" (which made a second such app replace the first);
-#     the slug now falls back to the AppImage file name first.
-#   - Removed a dead assignment in the download code (no behavior change).
-#   - Header: the old per-version history is replaced by this entry; added a
-#     # DESC: line for shelf.
-VERSION="3.1.1"
+# NEW IN THIS VERSION (3.2.0):
+#   - Faster 'appimgr update': the update checks run in parallel (4 at a time; -j N or
+#     APPIMGR_JOBS) and are printed in app order. Ctrl+C stops the jobs and cleans up.
+#   - Downloads use aria2c when it is installed: several connections per file, and for
+#     'update' all files at once with one progress line. Otherwise curl, as before.
+#     --no-aria2 or APPIMGR_DOWNLOADER=curl forces curl. A file that fails in the batch is
+#     downloaded again on its own (aria2c, then curl). Installing still happens one app
+#     at a time. Free disk space is checked before a batch download.
+#   - GITHUB_TOKEN (environment only) raises GitHub's limit from 60 to 5000 requests per
+#     hour. It is sent only to api.github.com, never printed, and not passed on to AppImages.
+#   - A GitHub rate limit (with reset time), a rejected token or a missing repo is now
+#     reported as such. When the API failed while searching older releases, the message
+#     wrongly said that no release had a matching asset.
+#   - Fix: check_one built the .desktop path from the caller's $slug (a "local a=$1 b=$a"
+#     line expands both before assigning); it only worked because callers happened to
+#     pass the same value.
+VERSION="3.2.0"
 #
 set -euo pipefail
 
@@ -28,17 +34,27 @@ die()  { echo "error: $*" >&2; exit 1; }
 warn() { echo "warning: $*" >&2; }
 info() { echo ":: $*"; }
 
-TMP_DIR=""; STAGE_FILE=""; DL_DIR=""
-SAVED=()
+TMP_DIR=""; STAGE_FILE=""; DL_DIR=""; SCRATCH=""; BATCH_DIR=""
+SAVED=(); PF=()
 L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""; L_MATCHES=0
 STATUS=""; DL_ETAG=""
+JOBS="${APPIMGR_JOBS:-4}"
+USE_ARIA=1
+GH_TOKEN=""; GH_BODY=""; GH_PARSED=""; GH_ERR=""; GH_RESET=""
+RL_QUIET=0     # 1 inside parallel check jobs: rate-limit / bad-token messages are printed once by the parent
 
 cleanup() {
+  local p
+  for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null || true; done
   if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
   if [[ -n $STAGE_FILE ]]; then rm -f -- "$STAGE_FILE"; fi
   if [[ -n $DL_DIR ]]; then rm -rf -- "$DL_DIR"; fi
+  if [[ -n $SCRATCH ]]; then rm -rf -- "$SCRATCH"; fi
+  if [[ -n $BATCH_DIR ]]; then rm -rf -- "$BATCH_DIR"; fi
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # Scratch folder on disk, inside the AppImage folder: /tmp is often RAM, and a full
 # extraction of a big AppImage can be hundreds of MB. Removed by cleanup().
@@ -55,7 +71,9 @@ Usage:
   appimgr add --repo OWNER/REPO [--asset 'PATTERN'] [--tag TAG] [options]
                                            Download from a GitHub release and integrate
   appimgr update <slug> [--check] [-y]     Update from the saved update source
-  appimgr update [--all] [--check] [-y]    Check every app with a source, list updates, ask once, install all
+  appimgr update [--all] [--check] [-y] [-j N]
+                                           Check every app with a source (in parallel), list updates,
+                                           ask once, download them together, install all
                                            (no <slug> = all)
   appimgr update <slug> <file> [options]   Replace with a local file instead
   appimgr rollback <slug>                  Swap back to the previous version
@@ -89,13 +107,28 @@ Options for add <link> / --repo (downloads):
 Options for update <slug|--all>:
       --check           Only check for updates, install nothing
   -y, --yes             Don't ask before installing
+  -j, --jobs N          Run N update checks at the same time (default 4, max 16)
+
+Options for add (downloads) and update:
+      --no-aria2        Download with curl even if aria2c is installed
+
+Downloads:
+  If aria2c is installed it is used automatically: several connections per file, and
+  'update' fetches all files at once with a single progress line. A file that fails is
+  downloaded again on its own (aria2c, then curl). Installing always happens one app at a time.
 
 Layout:
   $APPS_DIR/<slug>.AppImage
   $APPS_DIR/.icons/  .meta/  .backup/
   $DESKTOP_DIR/appimage-<slug>.desktop
 
-Env: APPIMGR_DIR overrides the AppImage dir
+Environment:
+  GITHUB_TOKEN        A GitHub token (no special rights needed). Raises the API limit from
+                      60 to 5000 requests per hour; useful with many apps. Sent only to
+                      api.github.com, never printed, not passed on to AppImages.
+  APPIMGR_JOBS        Default for --jobs
+  APPIMGR_DOWNLOADER  Set to curl to never use aria2c
+  APPIMGR_DIR         Overrides the AppImage dir
 EOF
 }
 
@@ -133,6 +166,27 @@ confirm() { # <prompt> <default when not interactive: y|n>; Enter = yes
   read -r -p "   $1 [Y/n] " ans || return 1
   [[ -z $ans || $ans == [Yy] || $ans == [Yy][Ee][Ss] ]]
 }
+
+# The token is read once from the environment and then removed from it, so that
+# programs we start (AppImages, aria2c, ...) never inherit it.
+init_token() {
+  local t=${GITHUB_TOKEN:-}
+  unset GITHUB_TOKEN
+  if [[ -z $t ]]; then return 0; fi
+  if [[ $t =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    GH_TOKEN=$t
+  else
+    warn "GITHUB_TOKEN contains unexpected characters - ignoring it"
+  fi
+}
+
+set_jobs() { # <N>
+  if [[ ! $1 =~ ^[0-9]+$ ]] || (( 10#$1 < 1 )); then die "jobs must be a whole number of 1 or more, got '$1'"; fi
+  JOBS=$((10#$1))
+  if (( JOBS > 16 )); then JOBS=16; fi
+}
+
+use_aria() { (( USE_ARIA )) && command -v aria2c >/dev/null 2>&1; }
 
 # ---------- small metadata store: $APPS_DIR/.meta/<slug>.conf (key=value) ----------
 meta_get() { # <slug> <key>
@@ -299,17 +353,71 @@ gh_parse() { # [multi]  (multi=1: report every release of a releases list, not o
     }'
 }
 
-# Fetches a release's JSON and prints the gh_parse lines. Silent; returns 1 on failure.
+# One request to api.github.com. Success: 0, the JSON is in GH_BODY. Failure: 1 after a
+# warning that says why, and GH_ERR = network | auth | ratelimit | forbidden | notfound | http.
+# The token goes in through a curl config on a pipe, so it never shows up in the process
+# list, and it is sent only to the API address given here (never to asset downloads).
+# Called directly (not inside $(...)) so that GH_ERR and GH_RESET reach the caller.
+GH_SENT=$'\n@@gh@@'
+gh_api() { # <url>
+  local url=$1 out meta body code rem reset rc=0
+  local fmt="$GH_SENT|%{http_code}|%header{x-ratelimit-remaining}|%header{x-ratelimit-reset}"
+  GH_BODY=""; GH_ERR=""; GH_RESET=""
+  if [[ -n $GH_TOKEN ]]; then
+    out=$(curl -sSL --connect-timeout 15 --max-time 60 -H 'Accept: application/vnd.github+json' \
+          -K <(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN") -w "$fmt" "$url" 2>/dev/null) || rc=$?
+  else
+    out=$(curl -sSL --connect-timeout 15 --max-time 60 -H 'Accept: application/vnd.github+json' \
+          -w "$fmt" "$url" 2>/dev/null) || rc=$?
+  fi
+  if (( rc )) || [[ $out != *"$GH_SENT"* ]]; then
+    GH_ERR=network
+    warn "could not reach GitHub (network problem${rc:+, curl exit $rc})"
+    return 1
+  fi
+  meta=${out##*"$GH_SENT"}; meta=${meta#|}
+  body=${out%"$GH_SENT"*}
+  IFS='|' read -r code rem reset <<<"$meta" || true
+  case $code in
+    200) GH_BODY=$body; return 0 ;;
+    401) GH_ERR=auth; if (( ! RL_QUIET )); then warn "GitHub rejected the token (HTTP 401): check GITHUB_TOKEN"; fi ;;
+    403|429)
+      if [[ $rem == 0 || $body == *"rate limit"* ]]; then
+        GH_ERR=ratelimit
+        if [[ $reset =~ ^[0-9]+$ ]]; then GH_RESET=$(date -d "@$reset" +%H:%M 2>/dev/null || true); fi
+        if (( ! RL_QUIET )); then
+          warn "GitHub API rate limit reached${GH_RESET:+ (resets at $GH_RESET)}"
+          if [[ -z $GH_TOKEN ]]; then warn "set GITHUB_TOKEN to raise the limit from 60 to 5000 requests per hour"; fi
+        fi
+      else
+        GH_ERR=forbidden; warn "GitHub refused the request (HTTP $code)"
+      fi ;;
+    404) GH_ERR=notfound; warn "not found on GitHub (HTTP 404): wrong repo or tag?" ;;
+    *)   GH_ERR=http; warn "GitHub answered HTTP ${code:-?}" ;;
+  esac
+  return 1
+}
+
+# Closing line after a failed query (gh_api has already said why). Silent for a rate limit or a
+# rejected token inside the parallel check jobs: the parent reports those once for all apps.
+gh_fail() { # <OWNER/REPO> <tag>
+  if [[ $GH_ERR == ratelimit || $GH_ERR == auth ]] && (( RL_QUIET )); then return 0; fi
+  warn "could not query GitHub for $1 (tag: $2)"
+}
+
+# Fetches a release's JSON and leaves the gh_parse lines in GH_PARSED. Returns 1 on failure.
 gh_fetch() { # <OWNER/REPO> <tag|latest>
   local api json lines
+  GH_PARSED=""
   if [[ $2 == latest ]]; then api="https://api.github.com/repos/$1/releases/latest"
   else api="https://api.github.com/repos/$1/releases/tags/$2"; fi
-  json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "$api") || return 1
+  gh_api "$api" || return 1
+  json=$GH_BODY
   lines=$(printf '%s\n' "$json" | wc -l)
   if (( lines < 5 )); then   # compact JSON -> one key per line
     json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
   fi
-  printf '%s\n' "$json" | gh_parse
+  GH_PARSED=$(printf '%s\n' "$json" | gh_parse)
 }
 
 # For repos that publish several kinds of releases (e.g. bitwarden/clients: Desktop, Web, Browser, CLI)
@@ -320,8 +428,8 @@ SC_TAG=""; SC_NAMES=(); SC_URLS=(); SC_DIGS=()
 gh_scan() { # <OWNER/REPO> <test function>
   local pg json parsed kind a b c d have=0 pre=0
   for pg in 1 2 3; do
-    json=$(curl -fsSL -H 'Accept: application/vnd.github+json' \
-      "https://api.github.com/repos/$1/releases?per_page=30&page=$pg") || return 1
+    gh_api "https://api.github.com/repos/$1/releases?per_page=30&page=$pg" || return 1
+    json=$GH_BODY
     if (( $(printf '%s\n' "$json" | wc -l) < 5 )); then
       json=$(printf '%s' "$json" | sed -E 's/,"/,\n"/g; s/\{"/{\n"/g; s/\["/[\n"/g')
     fi
@@ -374,8 +482,7 @@ latest_info() { # <canonical source>
     github)
       local repo tag pat parsed kind a b c d n=0 names=()
       IFS='|' read -r repo tag pat <<<"$rest"
-      parsed=$(gh_fetch "$repo" "$tag") \
-        || { warn "could not query GitHub for $repo (tag: $tag): network, rate limit, or wrong repo/tag"; return 1; }
+      if gh_fetch "$repo" "$tag"; then parsed=$GH_PARSED; else gh_fail "$repo" "$tag"; return 1; fi
       while IFS=$'\t' read -r kind a b c d; do
         case $kind in
           TAG) L_VERSION=$a ;;
@@ -394,8 +501,12 @@ latest_info() { # <canonical source>
       done <<<"$parsed"
       L_MATCHES=$n
       if [[ -z $L_VERSION ]]; then warn "unexpected response from GitHub for $repo"; return 1; fi
-      if [[ -z $L_URL && $tag == latest ]] && gh_scan "$repo" li_test; then
-        n=$L_MATCHES   # the newest release had no matching asset; an older one does
+      if [[ -z $L_URL && $tag == latest ]]; then
+        if gh_scan "$repo" li_test; then
+          n=$L_MATCHES   # the newest release had no matching asset; an older one does
+        elif [[ -n $GH_ERR ]]; then
+          gh_fail "$repo" "$tag"; return 1   # the API failed: do not claim that nothing matches
+        fi
       fi
       if [[ -z $L_URL ]]; then
         warn "no asset in release '$L_VERSION' matches '$pat'"
@@ -406,7 +517,7 @@ latest_info() { # <canonical source>
       if (( n > 1 )); then warn "pattern matches $n assets, using $L_NAME - make the pattern more specific"; fi ;;
     url)
       local hdr lm
-      hdr=$(curl -fsSIL "$rest") || { warn "could not reach $rest"; return 1; }
+      hdr=$(curl -fsSIL --connect-timeout 15 --max-time 60 "$rest") || { warn "could not reach $rest"; return 1; }
       hdr=$(printf '%s\n' "$hdr" | tr -d '\r')
       L_URL=$rest
       L_NAME=${rest%%\?*}; L_NAME=${L_NAME##*/}
@@ -445,14 +556,35 @@ check_status() { # <slug> <path> <canonical source>
   esac
 }
 
-download() { # <url> <outfile>   (sets DL_ETAG)
+# Downloads one file (sets DL_ETAG when curl is used). aria2c if installed, else curl.
+download() { # <url> <outfile>
   local hdr
+  DL_ETAG=""
+  if use_aria; then
+    if aria2c -x4 -s4 -k1M -c --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
+         --console-log-level=warn --summary-interval=0 --download-result=hide \
+         -d "$(dirname -- "$2")" -o "$(basename -- "$2")" -- "$1"; then
+      return 0
+    fi
+    warn "aria2c failed, trying curl"
+    rm -f -- "$2" "$2.aria2"
+  fi
   hdr=$(mktemp)
   if ! curl -fL --retry 2 --progress-bar -D "$hdr" -o "$2" "$1"; then
     rm -f -- "$hdr" "$2"; warn "download failed: $1"; return 1
   fi
   DL_ETAG=$(tr -d '\r' <"$hdr" | awk 'index(tolower($0), "etag:")==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}')
   rm -f -- "$hdr"
+}
+
+# Checks the downloaded file against the release's sha256 digest (L_DIGEST), when there is one.
+verify_download() { # <slug> <file>
+  local sum
+  if [[ -n $L_DIGEST ]]; then
+    sum=$(sha256sum -- "$2" | cut -d' ' -f1)
+    if [[ $sum != "$L_DIGEST" ]]; then warn "$1: checksum mismatch - aborting, nothing changed"; return 1; fi
+    info "sha256 verified"
+  fi
 }
 
 # ---------- custom icons ----------
@@ -591,10 +723,10 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
 
   # --- GitHub release metadata (needed to pick an asset; best effort for a direct file link) ---
   if [[ -n $repo ]]; then
-    parsed=$(gh_fetch "$repo" "${rtag:-latest}") || parsed=""
+    if gh_fetch "$repo" "${rtag:-latest}"; then parsed=$GH_PARSED; else parsed=""; fi
     if [[ -z $parsed ]]; then
       if [[ -z $url ]]; then
-        warn "could not query GitHub for $repo (tag: ${rtag:-latest}): network, rate limit, or wrong repo/tag"
+        gh_fail "$repo" "${rtag:-latest}"
         return 1
       fi
       info "could not read release info from GitHub - skipping checksum and update source"
@@ -614,6 +746,7 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
         info "newest release has no matching asset - using $ver instead"
       fi
       if ((${#idx[@]} == 0)); then
+        if [[ -n $GH_ERR ]]; then return 1; fi   # the API failed while searching; gh_api said why
         if [[ -n $asset_arg ]]; then warn "no asset in release '$ver' matches '$asset_arg'"
         else warn "no .AppImage asset in release '$ver'"; fi
         if ((${#names[@]})); then warn "assets found: ${names[*]}"; else warn "this release has no assets"; fi
@@ -764,6 +897,7 @@ cmd_add() {
       --move)     move=1; shift ;;
       --no-move)  move=0; shift ;;
       --no-fuse)  nofuse=1; forced=1; shift ;;
+      --no-aria2) USE_ARIA=0; shift ;;
       --repo)     repo_arg=${2:?missing value for $1}; shift 2 ;;
       --asset)    asset_arg=${2:?missing value for $1}; shift 2 ;;
       --tag)      tag_arg=${2:?missing value for $1}; shift 2 ;;
@@ -985,8 +1119,9 @@ EOF
 # CK_SAVED (installed version label) and the L_* variables. Prints only warnings.
 CK=""; CK_SAVED=""
 check_one() { # <slug>
-  local slug=$1 df="$DESKTOP_DIR/appimage-$slug.desktop" src path
-  CK=error; CK_SAVED=""
+  local slug=$1 df src path
+  df="$DESKTOP_DIR/appimage-$slug.desktop"   # (not in the local line: $slug would still be the caller's value there)
+  CK=error; CK_SAVED=""; GH_ERR=""; GH_RESET=""
   [[ -f $df ]] || { warn "not integrated: $slug (see: appimgr list)"; return 0; }
   src=$(meta_get "$slug" source)
   if [[ -z $src ]]; then CK=nosource; return 0; fi
@@ -999,25 +1134,36 @@ check_one() { # <slug>
   CK=$STATUS
 }
 
-# Downloads and installs what the L_* variables describe for <slug>.
-install_one() { # <slug> <canonical source>
-  local slug=$1 src=$2 sum type
-  mkdir -p "$APPS_DIR"
-  DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
-  info "downloading $L_NAME"
-  download "$L_URL" "$DL_DIR/$L_NAME" || return 1
-  if [[ -n $L_DIGEST ]]; then
-    sum=$(sha256sum -- "$DL_DIR/$L_NAME" | cut -d' ' -f1)
-    if [[ $sum != "$L_DIGEST" ]]; then warn "$slug: checksum mismatch - aborting, nothing changed"; return 1; fi
-    info "sha256 verified"
+# Prints what a parallel check job found, as shell assignments (%q-quoted, so reading it back is safe).
+dump_result() {
+  local v
+  for v in CK CK_SAVED L_VERSION L_URL L_NAME L_SIZE L_DIGEST L_ETAG GH_ERR GH_RESET; do
+    printf '%s=%q\n' "$v" "${!v}"
+  done
+}
+
+# Installs what the L_* variables describe for <slug>. With a third argument that file is used
+# (already downloaded by prefetch_batch); otherwise it is downloaded here.
+install_one() { # <slug> <canonical source> [<downloaded file>]
+  local slug=$1 src=$2 file=${3:-} own=0 type
+  if [[ -z $file ]]; then
+    own=1
+    mkdir -p "$APPS_DIR"
+    DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
+    info "downloading $L_NAME"
+    download "$L_URL" "$DL_DIR/$L_NAME" || return 1
+    file=$DL_DIR/$L_NAME
+  else
+    DL_ETAG=""
   fi
+  verify_download "$slug" "$file" || return 1
 
   saved_opts "$slug"
-  cmd_add --slug "$slug" "${SAVED[@]}" "$DL_DIR/$L_NAME"
+  cmd_add --slug "$slug" "${SAVED[@]}" "$file"
   meta_set "$slug" version "$L_VERSION"
   type=${src%%|*}
   if [[ $type == url ]]; then meta_set "$slug" etag "${DL_ETAG:-$L_ETAG}"; fi
-  rm -rf -- "$DL_DIR"; DL_DIR=""
+  if (( own )); then rm -rf -- "$DL_DIR"; DL_DIR=""; fi
 }
 
 # Single app: check, show the result, ask, install.
@@ -1038,16 +1184,84 @@ update_one() { # <slug> <check_only 0|1> <yes 0|1> <quiet_if_no_source 0|1>
   install_one "$slug" "$(meta_get "$slug" source)"
 }
 
-# All apps: check everything first, list what is ready, ask ONCE, then install them all.
+# Downloads every pending update at once with a single aria2c run into BATCH_DIR/<index>/.
+# Fills PF[i] with the finished file of app i; an app whose download failed gets no entry and is
+# downloaded again with curl by install_one. Reads B_SLUG, B_URL, B_NAME, B_SIZE from update_batch.
+prefetch_batch() {
+  local i name list cnt=0 total=0 avail rc=0
+  PF=()
+  mkdir -p "$APPS_DIR"
+  BATCH_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
+  list="$BATCH_DIR/aria2.in"
+  : > "$list"
+  for i in "${!B_SLUG[@]}"; do
+    name=${B_NAME[i]}
+    if [[ -z $name || $name == */* ]]; then continue; fi
+    mkdir -p "$BATCH_DIR/$i"
+    printf '%s\n  dir=%s\n  out=%s\n' "${B_URL[i]}" "$BATCH_DIR/$i" "$name" >> "$list"
+    cnt=$((cnt+1))
+    if [[ ${B_SIZE[i]} =~ ^[0-9]+$ ]]; then total=$((total + B_SIZE[i])); fi
+  done
+  if (( cnt == 0 )); then return 0; fi
+
+  if (( total >= 1048576 )); then info "downloading $cnt file(s) with aria2c, about $((total / 1048576)) MiB"
+  else info "downloading $cnt file(s) with aria2c"; fi
+  if (( total > 0 )); then
+    avail=$(df -B1 --output=avail -- "$APPS_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
+    if [[ -n $avail ]] && (( avail < total + total / 2 )); then
+      warn "low disk space: $((avail / 1048576)) MiB free in $APPS_DIR, the updates need about $((total / 1048576)) MiB plus room to install"
+    fi
+  fi
+  aria2c -i "$list" -j 3 -x4 -s4 -k1M -c --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
+    --console-log-level=warn --summary-interval=0 --download-result=hide || rc=$?
+  for i in "${!B_SLUG[@]}"; do
+    name=${B_NAME[i]}
+    if [[ -f $BATCH_DIR/$i/$name && ! -e $BATCH_DIR/$i/$name.aria2 ]]; then PF[i]=$BATCH_DIR/$i/$name; fi
+  done
+  if (( rc )); then warn "aria2c reported problems; a missing file is downloaded again on its own"; fi
+}
+
+# All apps: check everything first (in parallel), list what is ready, ask ONCE, download
+# everything together, then install them one by one.
 update_batch() { # <check_only 0|1> <yes 0|1>
-  local check=$1 yes=$2 f slug i n ok=0 rc
-  local B_SLUG=() B_SRC=() B_URL=() B_NAME=() B_DIGEST=() B_VER=() B_ETAG=()
-  local unk=() err=() failed=()
+  local check=$1 yes=$2 f slug i n k ok=0 rc running=0 reset_hm=""
+  local B_SLUG=() B_SRC=() B_URL=() B_NAME=() B_DIGEST=() B_VER=() B_ETAG=() B_SIZE=()
+  local unk=() err=() failed=() rl=() slugs=() badtoken=0
   for f in "$DESKTOP_DIR"/appimage-*.desktop; do
     [[ -f $f ]] || continue
     grep -q '^X-AppImage-Managed=appimgr' "$f" || continue
-    slug=${f##*/appimage-}; slug=${slug%.desktop}
-    check_one "$slug"
+    slug=${f##*/appimage-}; slugs+=("${slug%.desktop}")
+  done
+  k=${#slugs[@]}
+  if (( k == 0 )); then info "nothing to update"; return 0; fi
+
+  # --- phase 1: checks, JOBS at a time. Each job writes its messages and its result to files. ---
+  SCRATCH=$(mktemp -d)
+  if (( k > 1 )); then info "checking $k app(s), up to $JOBS at a time ..."; fi
+  for i in "${!slugs[@]}"; do
+    while (( running >= JOBS )); do wait -n || true; running=$((running - 1)); done
+    ( RL_QUIET=1; check_one "${slugs[i]}"; dump_result >"$SCRATCH/$i.res" ) >"$SCRATCH/$i.msg" 2>&1 &
+    running=$((running + 1))
+  done
+  wait || true
+
+  # --- results, in app order ---
+  for i in "${!slugs[@]}"; do
+    slug=${slugs[i]}
+    CK=error; CK_SAVED=""; GH_ERR=""; GH_RESET=""
+    L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""
+    if [[ -s $SCRATCH/$i.msg ]]; then cat -- "$SCRATCH/$i.msg" >&2; fi
+    if [[ -f $SCRATCH/$i.res ]]; then
+      # shellcheck source=/dev/null
+      source "$SCRATCH/$i.res"
+    else
+      warn "$slug: the check did not finish"
+    fi
+    if [[ $CK == error && ( $GH_ERR == ratelimit || $GH_ERR == auth ) ]]; then
+      rl+=("$slug"); reset_hm=${GH_RESET:-$reset_hm}
+      if [[ $GH_ERR == auth ]]; then badtoken=1; fi
+      continue
+    fi
     case $CK in
       nosource) ;;
       error)    err+=("$slug") ;;
@@ -1055,15 +1269,28 @@ update_batch() { # <check_only 0|1> <yes 0|1>
       update)
         info "$slug: update available: ${CK_SAVED:-installed} -> ${L_VERSION:-latest}"
         B_SLUG+=("$slug"); B_SRC+=("$(meta_get "$slug" source)"); B_URL+=("$L_URL"); B_NAME+=("$L_NAME")
-        B_DIGEST+=("$L_DIGEST"); B_VER+=("$L_VERSION"); B_ETAG+=("$L_ETAG") ;;
+        B_DIGEST+=("$L_DIGEST"); B_VER+=("$L_VERSION"); B_ETAG+=("$L_ETAG"); B_SIZE+=("$L_SIZE") ;;
       *)        unk+=("$slug") ;;
     esac
   done
+  rm -rf -- "$SCRATCH"; SCRATCH=""
 
+  if (( ${#rl[@]} )); then
+    if (( badtoken )); then
+      warn "GitHub rejected the token (HTTP 401), check GITHUB_TOKEN: could not check ${rl[*]}"
+    else
+      warn "GitHub API rate limit reached${reset_hm:+ (resets at $reset_hm)}: could not check ${rl[*]}"
+      if [[ -z $GH_TOKEN ]]; then warn "set GITHUB_TOKEN to raise the limit from 60 to 5000 requests per hour"; fi
+    fi
+  fi
   if (( ${#err[@]} )); then warn "could not check: ${err[*]}"; fi
   if (( ${#unk[@]} )); then info "cannot tell if newer (skipped; force with 'appimgr update <slug>'): ${unk[*]}"; fi
   n=${#B_SLUG[@]}
-  if (( n == 0 )); then info "nothing to update"; return 0; fi
+  if (( n == 0 )); then
+    if (( ${#rl[@]} + ${#err[@]} )); then info "no updates among the apps that could be checked"
+    else info "nothing to update"; fi
+    return 0
+  fi
   if (( check )); then info "$n update(s) available: ${B_SLUG[*]}"; return 0; fi
 
   info "$n update(s) ready: ${B_SLUG[*]}"
@@ -1071,17 +1298,23 @@ update_batch() { # <check_only 0|1> <yes 0|1>
     if ! confirm "Install all $n?" n; then info "skipped"; return 0; fi
   fi
 
+  # --- phase 2: download everything together (aria2c), phase 3: install one by one ---
+  PF=()
+  if use_aria; then prefetch_batch; fi
   for (( i = 0; i < n; i++ )); do
     slug=${B_SLUG[i]}
     L_URL=${B_URL[i]}; L_NAME=${B_NAME[i]}; L_DIGEST=${B_DIGEST[i]}; L_VERSION=${B_VER[i]}; L_ETAG=${B_ETAG[i]}
     info "[$((i+1))/$n] $slug"
-    # own subshell so one failing app (even a die) does not stop the others
+    # own subshell so one failing app (even a die) does not stop the others; it must not
+    # clean up the shared download folder, so BATCH_DIR is blanked there
     set +e
-    ( set -e; trap cleanup EXIT; install_one "$slug" "${B_SRC[i]}" )
+    ( set -e; BATCH_DIR=""; SCRATCH=""; trap cleanup EXIT; install_one "$slug" "${B_SRC[i]}" "${PF[i]:-}" )
     rc=$?
     set -e
     if (( rc )); then failed+=("$slug"); else ok=$((ok+1)); fi
+    if [[ -n $BATCH_DIR ]]; then rm -rf -- "$BATCH_DIR/$i"; fi
   done
+  if [[ -n $BATCH_DIR ]]; then rm -rf -- "$BATCH_DIR"; BATCH_DIR=""; fi
   info "updated $ok of $n"
   if (( ${#failed[@]} )); then warn "failed: ${failed[*]}"; return 1; fi
   return 0
@@ -1094,6 +1327,8 @@ cmd_update() {
       --all)      all=1; shift ;;
       --check)    check=1; shift ;;
       -y|--yes)   yes=1; shift ;;
+      -j|--jobs)  set_jobs "${2:?missing value for $1}"; shift 2 ;;
+      --no-aria2) USE_ARIA=0; shift ;;
       -n|--name|-a|--args|-i|--icon) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
       --no-fuse|--no-move|--move) pass+=("$1"); shift ;;
       -*)         die "unknown option: $1" ;;
@@ -1105,6 +1340,7 @@ cmd_update() {
         shift ;;
     esac
   done
+  set_jobs "$JOBS"   # also checks APPIMGR_JOBS
 
   if [[ -z $slug ]]; then
     if (( ${#pass[@]} )); then die "options ${pass[0]} ... only work with: appimgr update <slug> <file>"; fi
@@ -1361,7 +1597,9 @@ cmd_icon() {
 # ---------- interactive menu (no arguments, on a terminal) ----------
 SLUGS=(); CANDS=(); PICKED=""
 
-run_self() { "$BASH" "$SELF" "$@" || true; }   # fresh process: errors don't kill the menu
+# fresh process: errors don't kill the menu. The token was removed from the environment at
+# startup, so it is handed to this one child explicitly.
+run_self() { GITHUB_TOKEN=$GH_TOKEN "$BASH" "$SELF" "$@" || true; }
 
 ask() { # <prompt> -> REPLY (trimmed); returns 1 on EOF
   read -r -p "$1" REPLY || { echo; return 1; }
@@ -1549,6 +1787,9 @@ EOF
     esac
   done
 }
+
+init_token
+if [[ ${APPIMGR_DOWNLOADER:-} == curl ]]; then USE_ARIA=0; fi
 
 case "${1:-}" in
   add)               shift; cmd_add "$@" ;;
