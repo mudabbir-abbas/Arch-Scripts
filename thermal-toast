@@ -1,79 +1,176 @@
 #!/usr/bin/env bash
-# DESC: Notify when the CPU package stays hot for too long
+# DESC: Notify when the CPU package stays hot for too long (installs and manages itself as a user service)
 # thermal-toast: notify when the CPU package stays hot for too long.
 #
-# NEW IN THIS VERSION (1.0.2):
-#   - Fix: an option without a value (e.g. "thermal-toast -t") looped forever at
-#     100% CPU; it now stops with a message (exit status 2).
-#   - Fix: values that are not whole numbers (letters, empty, 0 for the polling
-#     interval or the threshold, also from the THERMAL_TOAST_* variables) no longer
-#     cause constant alerts or a busy loop; they are rejected with a message. Leading
-#     zeros ("085") are read as decimal.
-#   - Fix: a variable named TEST in the environment could turn the script into a
-#     one-time test run; it is no longer read.
-#   - Fix: if the CPU was already hot on the first reading, the alert came one polling
-#     interval late and its "for Ns" figure was a few seconds short.
-#   - Prints one line when started from a terminal, so you can tell it is watching.
-#   - --version prints "thermal-toast v<version>"; VERSION is now quoted; added a
-#     # DESC: line for shelf.
-VERSION="1.0.2"
+# NEW IN THIS VERSION (2.0.0):
+#   - New: the script manages itself as a systemd user service: install, uninstall,
+#     start, stop, restart, enable, disable, reload, status and log. No unit file to
+#     write by hand.
+#   - New: a settings file (~/.config/thermal-toast/config). "config set NAME VALUE"
+#     edits it and reloads a running service; "reload" re-reads it without a restart.
+#     Priority: option > THERMAL_TOAST_* variable > settings file > default.
+#   - New: "run" starts the watcher explicitly (the service uses it).
+#   - Changed: with no arguments on a terminal it now opens a menu (it used to start
+#     watching at once). Without a terminal, or with only options, it still watches,
+#     so an existing autostart line keeps working.
+#   - The start line is also printed when not on a terminal, so the journal shows the
+#     settings in use.
+VERSION="2.0.0"
 NAME="thermal-toast"
 
-THRESHOLD="${THERMAL_TOAST_THRESHOLD:-85}"   # deg C
-SUSTAIN="${THERMAL_TOAST_SUSTAIN:-60}"       # seconds above threshold before alerting
-COOLDOWN="${THERMAL_TOAST_COOLDOWN:-600}"    # seconds between alerts
-INTERVAL="${THERMAL_TOAST_INTERVAL:-5}"      # polling interval in seconds
-HYSTERESIS=3                                 # must drop this far below threshold to reset
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+CFG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+CONF_DIR="$CFG_HOME/$NAME"
+CONF_FILE="$CONF_DIR/config"
+UNIT="$NAME.service"
+UNIT_DIR="$CFG_HOME/systemd/user"
+UNIT_FILE="$UNIT_DIR/$UNIT"
+
+VARS=(THRESHOLD SUSTAIN COOLDOWN INTERVAL)
+THRESHOLD=85     # deg C
+SUSTAIN=60       # seconds above threshold before alerting
+COOLDOWN=600     # seconds between alerts
+INTERVAL=5       # polling interval in seconds
+HYSTERESIS=3     # must drop this far below threshold to reset
+
+declare -A SRC=([THRESHOLD]=default [SUSTAIN]=default [COOLDOWN]=default [INTERVAL]=default)
+declare -A LOCKED=()   # set by an option or a variable: the settings file may not change it
+CLI_VARS=()            # settings given as options (install saves them)
+ARGS=()
 DO_TEST=0
+OPTS_GIVEN=0
+PURGE=0
+FOLLOW=0
+RELOAD=0
+SLEEP_PID=""
+ERRMSG=""
 
 usage() {
     cat <<EOF
 $NAME v$VERSION - toast when the CPU stays hot for too long
 
-Usage: $NAME [options]
+Usage: $NAME [command] [options]
+
+Run with no arguments on a terminal for a menu.
+
+Commands:
+  run                  Watch in this terminal (Ctrl+C stops). Also what you get when
+                       you give only options, or run without a terminal
+  install              Create the user service, enable it (starts at login) and start it.
+                       Options given here are saved in the settings file
+  uninstall [--purge]  Stop and remove the service (--purge also deletes the settings)
+  start | stop | restart
+  enable | disable     Start the service at login, or not
+  reload               Re-read the settings file in the running service (no restart)
+  status               Service state, current temperature and the settings in use
+  config               Show the settings
+  config set NAME VAL  Change a setting (threshold, sustain, cooldown, interval);
+                       reloads the running service
+  log [-f]             Show the service log (-f = follow)
+  test                 Send a test notification and exit (same as --test)
 
 Options:
-  -t, --threshold C   Temperature threshold in deg C   (default: $THRESHOLD)
-  -s, --sustain S     Seconds above threshold to alert (default: $SUSTAIN)
-  -c, --cooldown S    Seconds between alerts           (default: $COOLDOWN)
-  -i, --interval S    Polling interval in seconds      (default: $INTERVAL)
+  -t, --threshold C   Temperature threshold in deg C   (default: 85)
+  -s, --sustain S     Seconds above threshold to alert (default: 60)
+  -c, --cooldown S    Seconds between alerts           (default: 600)
+  -i, --interval S    Polling interval in seconds      (default: 5)
       --test          Send a test notification and exit
   -V, --version       Print version and exit
   -h, --help          Show this help and exit
 
 All values are whole numbers (threshold and interval at least 1).
+Settings file: $CONF_FILE
 Environment overrides: THERMAL_TOAST_{THRESHOLD,SUSTAIN,COOLDOWN,INTERVAL}
 EOF
 }
+
+die()  { echo "$NAME: $*" >&2; exit 1; }
+warn() { echo "$NAME: $*" >&2; }
 
 need_val() { # called as: need_val "$@"  ($1 = the option, $2 = its value)
     [[ $# -ge 2 ]] || { echo "$NAME: $1 needs a value (try --help)" >&2; exit 2; }
 }
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -t|--threshold) need_val "$@"; THRESHOLD="$2"; shift 2 ;;
-        -s|--sustain)   need_val "$@"; SUSTAIN="$2";   shift 2 ;;
-        -c|--cooldown)  need_val "$@"; COOLDOWN="$2";  shift 2 ;;
-        -i|--interval)  need_val "$@"; INTERVAL="$2";  shift 2 ;;
-        --test)         DO_TEST=1;      shift ;;
-        -V|--version)   echo "$NAME v$VERSION"; exit 0 ;;
-        -h|--help)      usage; exit 0 ;;
-        *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
-    esac
-done
+# ---------- settings ----------
 
-# every number must be a whole number; "085" is 85, not octal
-for _v in THRESHOLD SUSTAIN COOLDOWN INTERVAL; do
-    case "${!_v}" in
-        ''|*[!0-9]*) echo "$NAME: ${_v,,} must be a whole number, got '${!_v}' (try --help)" >&2; exit 2 ;;
+# check_num NAME VALUE -> 0 with the whole number in REPLY ("085" is 85), or 1 with ERRMSG
+check_num() {
+    local n=$1 v=$2 min=0
+    case $n in THRESHOLD|INTERVAL) min=1 ;; esac
+    case $v in
+        ''|*[!0-9]*) ERRMSG="${n,,} must be a whole number, got '$v'"; return 1 ;;
     esac
-    printf -v "$_v" '%s' "$((10#${!_v}))"
-done
-if (( THRESHOLD < 1 )); then echo "$NAME: threshold must be at least 1" >&2; exit 2; fi
-if (( INTERVAL < 1 )); then echo "$NAME: interval must be at least 1" >&2; exit 2; fi
+    if (( ${#v} > 9 )); then ERRMSG="${n,,} is too large: '$v'"; return 1; fi
+    v=$((10#$v))
+    if (( v < min )); then ERRMSG="${n,,} must be at least $min"; return 1; fi
+    REPLY=$v
+}
 
-command -v notify-send >/dev/null || { echo "notify-send not found (install libnotify)" >&2; exit 1; }
+# options and THERMAL_TOAST_* variables: a bad value is an error
+apply_locked() {
+    local v e
+    for v in "${VARS[@]}"; do
+        e="THERMAL_TOAST_$v"
+        if [[ -n ${!e+x} && -z ${LOCKED[$v]-} ]]; then
+            printf -v "$v" '%s' "${!e}"; LOCKED[$v]=1; SRC[$v]=environment
+        fi
+    done
+    for v in "${VARS[@]}"; do
+        [[ -n ${LOCKED[$v]-} ]] || continue
+        check_num "$v" "${!v}" || { echo "$NAME: $ERRMSG (try --help)" >&2; exit 2; }
+        printf -v "$v" '%s' "$REPLY"
+    done
+}
+
+# settings file: a bad line is reported and skipped (the old value stays)
+load_config() {
+    [[ -r $CONF_FILE ]] || return 0
+    local line key val
+    while IFS= read -r line || [[ -n $line ]]; do
+        line="${line%%#*}"
+        [[ $line == *=* ]] || continue
+        key="${line%%=*}"; val="${line#*=}"
+        key="${key//[[:space:]]/}"; key="${key^^}"; val="${val//[[:space:]]/}"
+        case $key in
+            THRESHOLD|SUSTAIN|COOLDOWN|INTERVAL) ;;
+            *) warn "config: ignoring unknown setting '$key'"; continue ;;
+        esac
+        [[ -z ${LOCKED[$key]-} ]] || continue
+        if check_num "$key" "$val"; then
+            printf -v "$key" '%s' "$REPLY"; SRC[$key]="config file"
+        else
+            warn "config: $ERRMSG (kept $key=${!key})"
+        fi
+    done <"$CONF_FILE"
+}
+
+config_set() { # NAME VALUE (already checked)
+    mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR"
+    if [[ ! -f $CONF_FILE ]]; then
+        cat >"$CONF_FILE" <<EOF || die "cannot write $CONF_FILE"
+# thermal-toast settings: whole numbers, one per line.
+# Apply changes to a running service with: thermal-toast reload
+EOF
+    fi
+    if [[ -s $CONF_FILE && -n "$(tail -c1 "$CONF_FILE")" ]]; then echo >>"$CONF_FILE"; fi
+    if grep -qiE "^[[:space:]]*$1[[:space:]]*=" "$CONF_FILE"; then
+        sed -i -E "s/^[[:space:]]*$1[[:space:]]*=.*/$1=$2/I" "$CONF_FILE"
+    else
+        printf '%s=%s\n' "$1" "$2" >>"$CONF_FILE"
+    fi
+}
+
+show_settings() {
+    load_config
+    local v
+    echo "Settings ($([[ -f $CONF_FILE ]] && echo "$CONF_FILE" || echo "no settings file yet: $CONF_FILE")):"
+    printf '  threshold  %4s °C   (%s)\n' "$THRESHOLD" "${SRC[THRESHOLD]}"
+    printf '  sustain    %4s s    (%s)\n' "$SUSTAIN"   "${SRC[SUSTAIN]}"
+    printf '  cooldown   %4s s    (%s)\n' "$COOLDOWN"  "${SRC[COOLDOWN]}"
+    printf '  interval   %4s s    (%s)\n' "$INTERVAL"  "${SRC[INTERVAL]}"
+}
+
+# ---------- sensor and notification ----------
 
 find_sensor() {
     local h
@@ -105,36 +202,282 @@ toast() {
     notify-send -a "$NAME" -u critical -i temperature-warning "$1" "$2"
 }
 
-if (( DO_TEST )); then
-    toast "CPU is hot (test)" "$NAME v$VERSION is working."
-    exit 0
-fi
+need_notify() {
+    command -v notify-send >/dev/null || die "notify-send not found (install libnotify)"
+}
 
-SENSOR="$(find_sensor)" || { echo "No CPU temperature sensor found" >&2; exit 1; }
+# ---------- the watcher ----------
 
-if [[ -t 1 ]]; then
-    echo "Watching CPU temperature (alert above ${THRESHOLD}°C for ${SUSTAIN}s, check every ${INTERVAL}s). Ctrl+C to stop."
-fi
+# wait one polling interval; a reload signal ends the wait early
+nap() {
+    sleep "$INTERVAL" & SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    kill "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=""
+}
 
-hot_since=-1
-last_alert=-999999
+cmd_run() {
+    need_notify
+    local sensor raw temp now hot_since=-1 last_alert=-999999
+    sensor="$(find_sensor)" || die "No CPU temperature sensor found"
+    load_config
 
-while true; do
-    raw="$(cat "$SENSOR" 2>/dev/null)" || { sleep "$INTERVAL"; continue; }
-    temp=$(( raw / 1000 ))
-    now=$SECONDS
+    trap 'RELOAD=1' HUP
+    trap 'exit 0' INT TERM
+    trap '[[ -n $SLEEP_PID ]] && kill "$SLEEP_PID" 2>/dev/null' EXIT
 
-    if (( temp >= THRESHOLD )); then
-        (( hot_since < 0 )) && hot_since=$now
-        if (( now - hot_since >= SUSTAIN && now - last_alert >= COOLDOWN )); then
-            toast "CPU running hot: ${temp}°C" \
-                  "Above ${THRESHOLD}°C for $(( now - hot_since ))s. Top processes:
-$(top_procs)"
-            last_alert=$now
+    echo "$NAME v$VERSION: watching CPU temperature (alert above ${THRESHOLD}°C for ${SUSTAIN}s, check every ${INTERVAL}s)."
+    if [[ -t 1 ]]; then echo "Ctrl+C to stop."; fi
+
+    while true; do
+        if (( RELOAD )); then
+            RELOAD=0
+            load_config
+            echo "$NAME: settings reloaded (alert above ${THRESHOLD}°C for ${SUSTAIN}s, check every ${INTERVAL}s)."
         fi
-    elif (( temp < THRESHOLD - HYSTERESIS )); then
-        hot_since=-1
-    fi
+        raw="$(cat "$sensor" 2>/dev/null)" || { nap; continue; }
+        temp=$(( raw / 1000 ))
+        now=$SECONDS
 
-    sleep "$INTERVAL"
+        if (( temp >= THRESHOLD )); then
+            (( hot_since < 0 )) && hot_since=$now
+            if (( now - hot_since >= SUSTAIN && now - last_alert >= COOLDOWN )); then
+                toast "CPU running hot: ${temp}°C" \
+                      "Above ${THRESHOLD}°C for $(( now - hot_since ))s. Top processes:
+$(top_procs)"
+                last_alert=$now
+            fi
+        elif (( temp < THRESHOLD - HYSTERESIS )); then
+            hot_since=-1
+        fi
+
+        nap
+    done
+}
+
+cmd_test() {
+    need_notify
+    toast "CPU is hot (test)" "$NAME v$VERSION is working."
+}
+
+# ---------- service management ----------
+
+sctl() { systemctl --user "$@"; }
+
+need_systemd() {
+    command -v systemctl >/dev/null || die "systemctl not found"
+    sctl show-environment >/dev/null 2>&1 \
+        || die "no systemd user session reachable (run this from your desktop session)"
+}
+
+is_installed() { [[ -f $UNIT_FILE ]]; }
+
+need_installed() {
+    is_installed || die "the service is not installed yet. Run: $NAME install"
+    need_systemd
+}
+
+state_line() {
+    if ! is_installed; then echo "service not installed"; return; fi
+    command -v systemctl >/dev/null || { echo "service installed"; return; }
+    echo "service installed, $(sctl is-enabled "$UNIT" 2>/dev/null || true), $(sctl is-active "$UNIT" 2>/dev/null || true)"
+}
+
+cmd_install() {
+    need_systemd
+    [[ $SELF != *[[:space:]]* ]] || die "the script path contains spaces ($SELF); move it to a path without spaces"
+    [[ $SELF != /tmp/* ]] || warn "the script is in /tmp; the service will break when it disappears"
+    command -v notify-send >/dev/null || warn "notify-send not found: install libnotify, or alerts cannot show"
+    local v
+    for v in ${CLI_VARS[@]+"${CLI_VARS[@]}"}; do config_set "$v" "${!v}"; done
+    mkdir -p "$UNIT_DIR" || die "cannot create $UNIT_DIR"
+    cat >"$UNIT_FILE" <<EOF || die "cannot write $UNIT_FILE"
+[Unit]
+Description=$NAME: notify when the CPU stays hot
+
+[Service]
+Type=simple
+ExecStart=$SELF run
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
+EOF
+    sctl daemon-reload
+    sctl enable "$UNIT" 2>&1 | tail -n1
+    sctl restart "$UNIT" || die "the service did not start (see: $NAME log)"
+    echo "Installed, enabled and started. Check it with: $NAME status"
+    if (( ${#CLI_VARS[@]} )); then echo "Your options were saved in $CONF_FILE"; fi
+}
+
+cmd_uninstall() {
+    if ! is_installed; then echo "The service is not installed."; else
+        need_systemd
+        sctl disable --now "$UNIT" 2>&1 | tail -n1
+        rm -f -- "$UNIT_FILE"
+        sctl daemon-reload
+        sctl reset-failed "$UNIT" 2>/dev/null || true
+        echo "Service removed."
+    fi
+    if (( PURGE )); then
+        rm -rf -- "$CONF_DIR"; echo "Settings deleted."
+    elif [[ -d $CONF_DIR ]]; then
+        echo "Your settings were kept in $CONF_DIR (--purge deletes them)."
+    fi
+}
+
+cmd_ctl() { # start | stop | restart | enable | disable
+    need_installed
+    sctl "$1" "$UNIT" || die "$1 failed (see: $NAME log)"
+    echo "$1: done ($(state_line))"
+}
+
+cmd_reload() {
+    need_installed
+    sctl is-active --quiet "$UNIT" || die "the service is not running (start it with: $NAME start)"
+    ( load_config )   # prints problems in the settings file, if any
+    sctl reload "$UNIT" || die "reload failed"
+    echo "Reload signal sent. Confirm with: $NAME log"
+}
+
+cmd_status() {
+    echo "$NAME v$VERSION"
+    echo "$(state_line)"
+    if is_installed && ! grep -qxF "ExecStart=$SELF run" "$UNIT_FILE"; then
+        warn "the service points to a different copy of the script; run '$NAME install' to update it"
+    fi
+    local s
+    if s="$(find_sensor)"; then
+        echo "CPU temperature now: $(( $(cat "$s") / 1000 ))°C"
+    else
+        echo "CPU temperature now: no sensor found"
+    fi
+    show_settings
+}
+
+cmd_config() {
+    case ${ARGS[0]-} in
+        ''|show) show_settings ;;
+        set)
+            (( ${#ARGS[@]} == 3 )) || die "usage: $NAME config set NAME VALUE (threshold, sustain, cooldown, interval)"
+            local key=${ARGS[1]^^}
+            case $key in THRESHOLD|SUSTAIN|COOLDOWN|INTERVAL) ;; *) die "unknown setting '${ARGS[1]}' (threshold, sustain, cooldown, interval)" ;; esac
+            check_num "$key" "${ARGS[2]}" || die "$ERRMSG"
+            config_set "$key" "$REPLY"
+            echo "Saved ${key,,}=$REPLY."
+            if is_installed && command -v systemctl >/dev/null && sctl is-active --quiet "$UNIT" 2>/dev/null; then
+                sctl reload "$UNIT" && echo "The running service picked it up."
+            else
+                echo "It applies the next time the service starts."
+            fi ;;
+        *) die "unknown config command '${ARGS[0]}' (use: config, config set NAME VALUE)" ;;
+    esac
+}
+
+cmd_log() {
+    need_installed
+    if (( FOLLOW )); then journalctl --user -u "$UNIT" -f
+    else journalctl --user -u "$UNIT" -n 40 --no-pager; fi
+}
+
+# ---------- menu ----------
+
+# one menu action in its own subshell: an error inside it ends only that action
+run_item() { ( "$@" ) || true; }
+
+menu_setting() {
+    local n v
+    read -r -p "Setting (threshold, sustain, cooldown, interval): " n || return 0
+    [[ -n $n ]] || return 0
+    read -r -p "New value: " v || return 0
+    ARGS=(set "$n" "$v")
+    cmd_config
+}
+
+menu_watch() {
+    trap : INT      # Ctrl+C stops the watcher, not the menu
+    run_item cmd_run
+    trap - INT
+}
+
+menu() {
+    local c
+    while true; do
+        echo
+        echo "$NAME v$VERSION  ($(state_line))"
+        cat <<'EOF'
+  1) Status                  7) Change a setting
+  2) Install the service     8) Show the log
+  3) Start                   9) Send a test notification
+  4) Stop                   10) Watch here in this terminal
+  5) Restart                11) Uninstall the service
+  6) Reload settings         q) Quit
+EOF
+        read -r -p "Choose: " c || break
+        echo
+        case "$c" in
+            1)  run_item cmd_status ;;
+            2)  run_item cmd_install ;;
+            3)  run_item cmd_ctl start ;;
+            4)  run_item cmd_ctl stop ;;
+            5)  run_item cmd_ctl restart ;;
+            6)  run_item cmd_reload ;;
+            7)  run_item menu_setting ;;
+            8)  run_item cmd_log ;;
+            9)  run_item cmd_test ;;
+            10) menu_watch ;;
+            11) run_item cmd_uninstall ;;
+            q|Q|"") break ;;
+            *)  warn "unknown choice" ;;
+        esac
+    done
+}
+
+# ---------- main ----------
+
+CMD=""
+if [[ $# -gt 0 && $1 != -* ]]; then CMD=$1; shift; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--threshold) need_val "$@"; THRESHOLD="$2"; LOCKED[THRESHOLD]=1; SRC[THRESHOLD]=option; CLI_VARS+=(THRESHOLD); OPTS_GIVEN=1; shift 2 ;;
+        -s|--sustain)   need_val "$@"; SUSTAIN="$2";   LOCKED[SUSTAIN]=1;   SRC[SUSTAIN]=option;   CLI_VARS+=(SUSTAIN);   OPTS_GIVEN=1; shift 2 ;;
+        -c|--cooldown)  need_val "$@"; COOLDOWN="$2";  LOCKED[COOLDOWN]=1;  SRC[COOLDOWN]=option;  CLI_VARS+=(COOLDOWN);  OPTS_GIVEN=1; shift 2 ;;
+        -i|--interval)  need_val "$@"; INTERVAL="$2";  LOCKED[INTERVAL]=1;  SRC[INTERVAL]=option;  CLI_VARS+=(INTERVAL);  OPTS_GIVEN=1; shift 2 ;;
+        --test)         DO_TEST=1; OPTS_GIVEN=1; shift ;;
+        --purge)        PURGE=1; shift ;;
+        -f|--follow)    FOLLOW=1; shift ;;
+        -V|--version)   echo "$NAME v$VERSION"; exit 0 ;;
+        -h|--help)      usage; exit 0 ;;
+        -*)             echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+        *)              ARGS+=("$1"); shift ;;
+    esac
 done
+
+apply_locked
+
+if [[ -z $CMD ]]; then
+    if (( OPTS_GIVEN )); then CMD=run
+    elif [[ -t 0 && -t 1 ]]; then CMD=menu
+    else CMD=run
+    fi
+fi
+if (( DO_TEST )) && [[ $CMD == run ]]; then CMD=test; fi
+
+case "$CMD" in
+    run)                              cmd_run ;;
+    test)                             cmd_test ;;
+    install)                          cmd_install ;;
+    uninstall)                        cmd_uninstall ;;
+    start|stop|restart|enable|disable) cmd_ctl "$CMD" ;;
+    reload)                           cmd_reload ;;
+    status)                           cmd_status ;;
+    config)                           cmd_config ;;
+    log)                              cmd_log ;;
+    menu)                             menu ;;
+    help)                             usage ;;
+    *)  echo "Unknown command: $CMD" >&2; usage >&2; exit 1 ;;
+esac

@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
+# DESC: Install My Scripts: move updated scripts (and marked plain files like PLANS.md) from ~/Downloads to ~/.local/bin
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
-# NEW IN THIS VERSION (2.1.2):
-#   - Fix: two backups of the same script within one second overwrote each other, so
-#     'ims restore <name>' run twice in a row lost a version and the toggle installed
-#     the wrong one. A further backup in the same second now gets a counter, for example
-#     foo.20261104-101500-01, which continues after the highest one already used (even if
-#     older ones were pruned). Existing backups keep working.
-#   - Backups are listed by one helper (list_backups) that accepts only real backup
-#     names and sorts them in the C locale, so the order no longer depends on the
-#     locale and stray files such as foo.<stamp>.bak are ignored.
-VERSION="2.1.2"
+# NEW IN THIS VERSION (2.2.0):
+#   - New: ims now also handles plain (non-script) files such as PLANS.md. They install
+#     like scripts (backup, atomic replace, restore) but are never made executable and get
+#     no "no shebang" warning.
+#   - Plain 'ims' updates such a file from ~/Downloads only when the Downloads copy carries
+#     the marker "ims-managed" in its first 20 lines (for example <!-- ims-managed -->).
+#     Without it the file is skipped with a note. Naming it ('ims PLANS.md') skips the
+#     marker check.
+#   - 'ims list' also shows a plain file when a marked update is waiting for it; --all still
+#     shows every non-script file.
+#   - Added a # DESC: line for shelf; the 2.1.2 entry is replaced by this one.
+VERSION="2.2.0"
 NAME="ims"
 
 set -uo pipefail
@@ -21,6 +24,7 @@ DL_DIR="${IMS_DL_DIR:-$HOME/Downloads}"
 BACKUP_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ims/backups"
 KEEP_BACKUPS=3
 KNOWN_EXT="sh|bash|zsh|fish|py|pl|rb|js|lua"
+MARKER="ims-managed"
 
 if [[ -t 1 ]]; then
     G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; B=$'\e[1m'; X=$'\e[0m'
@@ -38,13 +42,15 @@ usage() {
 ${B}$NAME v$VERSION${X} - Install My Scripts
 
 Moves scripts from ~/Downloads into ~/.local/bin, replacing the old copy
-and running chmod +x on it.
+and running chmod +x on it. Plain files (PLANS.md, ...) are handled too.
 
 Usage:
   $NAME                    Update every script in ~/.local/bin that has a
-                         matching file in ~/Downloads
+                         matching file in ~/Downloads (plain files only
+                         when the Downloads copy has the "$MARKER" marker)
   $NAME <scriptname>       Only look for <scriptname> in ~/Downloads
                          (new scripts install without .sh/.py etc.)
+                         Also the way to install a plain file: $NAME PLANS.md
   $NAME list               List scripts in ~/.local/bin with version, date
                          and any update waiting in ~/Downloads
                          (-a/--all also shows non-script files)
@@ -57,7 +63,7 @@ Options:
   -a, --all              With list: include non-script files too
   -n, --dry-run          Show what would happen, change nothing
   -c, --copy             Copy instead of move (keep file in ~/Downloads)
-      --no-backup        Don't back up the script being replaced
+      --no-backup        Don't back up the file being replaced
       --keep-ext         Keep the extension when installing a NEW script
                          by name (default: "$NAME foo.sh" installs as "foo")
 
@@ -68,12 +74,19 @@ Matching:
   match wins. Identical files are skipped; .part/.crdownload are ignored.
 
 Scripts:
-  Only files that start with #! or have a known extension are considered;
-  other files in ~/.local/bin (readme.md, binaries, ...) are left alone.
+  Only files that start with #! or have a known extension are scripts.
+
+Plain files (PLANS.md, notes, ...):
+  Installed like scripts, but never made executable. Plain "$NAME" replaces
+  an existing plain file only if the copy in ~/Downloads contains
+  "$MARKER" in its first 20 lines, e.g.  <!-- $MARKER -->
+  Without the marker it is skipped with a note. "$NAME PLANS.md" (naming
+  the file) skips the marker check. Other files in ~/.local/bin
+  (binaries, ...) are left alone.
 
 Notes:
   $NAME can safely update itself (installs are atomic renames).
-  Backups: $BACKUP_DIR (last $KEEP_BACKUPS per script)
+  Backups: $BACKUP_DIR (last $KEEP_BACKUPS per file)
   Env:     IMS_BIN_DIR, IMS_DL_DIR override the default directories.
 EOF
 }
@@ -94,6 +107,11 @@ is_script() {
         [[ ${ext,,} =~ ^($KNOWN_EXT)$ ]] && return 0
     fi
     return 1
+}
+
+# has_marker <file> -> 0 if the file carries the ownership marker in its first 20 lines
+has_marker() {
+    head -n 20 -- "$1" 2>/dev/null | grep -qaF -- "$MARKER"
 }
 
 # matches_name <file> <scriptname>  -> 0 if the Downloads file is a candidate for that script
@@ -124,7 +142,7 @@ find_match() {
     printf '%s' "$best"
 }
 
-# list_backups <name> -> fills BK with the backups of that script, oldest first.
+# list_backups <name> -> fills BK with the backups of that file, oldest first.
 # A backup is <name>.YYYYMMDD-HHMMSS, or <name>.YYYYMMDD-HHMMSS-NN when several were made in
 # the same second. Only names of exactly that form count (so foo.sh.<stamp> or foo.<stamp>.bak
 # are not foo's backups), and the order is fixed by sorting in the C locale, not by the glob.
@@ -176,13 +194,14 @@ backup_file() {   # backup_file <path> <name>
     return 0
 }
 
-# atomic_put <src> <dest>: stage next to dest, chmod +x, then rename over it.
-# A running script (e.g. ims updating itself) keeps its old inode, so it is never
-# corrupted mid-run.
+# atomic_put <src> <dest> [plain 0|1]: stage next to dest, set the mode (chmod +x for
+# scripts, 644 for plain files), then rename over it. A running script (e.g. ims updating
+# itself) keeps its old inode, so it is never corrupted mid-run.
 atomic_put() {
-    local tmp
+    local tmp plain=${3:-0}
     tmp=$(mktemp "$(dirname -- "$2")/.ims.XXXXXX") || return 1
-    if cp -p -- "$1" "$tmp" && chmod +x -- "$tmp" && mv -f -- "$tmp" "$2"; then
+    if cp -p -- "$1" "$tmp" && { if ((plain)); then chmod 644 -- "$tmp"; else chmod +x -- "$tmp"; fi; } \
+        && mv -f -- "$tmp" "$2"; then
         return 0
     fi
     rm -f -- "$tmp"
@@ -192,8 +211,9 @@ atomic_put() {
 INSTALLED=0; UNCHANGED=0; FAILED=0; WOULD=0
 
 install_one() {   # install_one <src> <name>
-    local src=$1 name=$2 dest="$BIN_DIR/$2" old_v new_v label verb
+    local src=$1 name=$2 dest="$BIN_DIR/$2" old_v new_v label verb plain=0
     new_v=$(get_ver "$src")
+    if ! is_script "$src" && ! is_script "$dest"; then plain=1; fi
 
     if [[ -e $dest ]]; then
         if cmp -s -- "$src" "$dest"; then
@@ -201,10 +221,10 @@ install_one() {   # install_one <src> <name>
             ((UNCHANGED++)); return
         fi
         old_v=$(get_ver "$dest")
-        label="$name  ${old_v} → ${new_v}"
+        if ((plain)); then label="$name  (plain file)"; else label="$name  ${old_v} → ${new_v}"; fi
         verb="replace"
     else
-        label="$name  (new, ${new_v})"
+        if ((plain)); then label="$name  (new, plain file)"; else label="$name  (new, ${new_v})"; fi
         verb="install"
     fi
 
@@ -223,12 +243,14 @@ install_one() {   # install_one <src> <name>
     local self=0
     [[ $dest -ef ${BASH_SOURCE[0]} ]] && self=1
 
-    atomic_put "$src" "$dest" || { err "$name: failed to write $dest"; ((FAILED++)); return; }
+    atomic_put "$src" "$dest" "$plain" || { err "$name: failed to write $dest"; ((FAILED++)); return; }
     ((COPY)) || rm -f -- "$src" || warn "$name: installed, but could not remove ${src##*/}"
 
     ok "$label   ${D}(from ${src##*/})${X}"
     ((self)) && note "$NAME updated itself; the new version applies on the next run"
-    [[ $(head -c2 -- "$dest") == "#!" ]] || warn "$name: no shebang on first line"
+    if ((!plain)); then
+        [[ $(head -c2 -- "$dest") == "#!" ]] || warn "$name: no shebang on first line"
+    fi
     ((INSTALLED++))
 }
 
@@ -247,10 +269,17 @@ cmd_default() {
     local f name src found=0
     for f in "$BIN_DIR"/*; do
         [[ -f $f ]] || continue
-        is_script "$f" || continue
         name=${f##*/}
         src=$(find_match "$name")
         [[ -n $src ]] || continue
+        if ! is_script "$f"; then
+            # plain file: only with the ownership marker (naming it explicitly skips this check)
+            cmp -s -- "$src" "$f" && continue
+            if ! has_marker "$src"; then
+                note "$name: ${src##*/} in $DL_DIR has no '$MARKER' marker, skipped (install it with: $NAME $name)"
+                continue
+            fi
+        fi
         found=1
         install_one "$src" "$name"
     done
@@ -283,20 +312,32 @@ cmd_named() {
 
 cmd_list() {
     [[ -d $BIN_DIR ]] || { err "$BIN_DIR does not exist"; return 1; }
-    local f name src n=0 hidden=0 flags
+    local f name src n=0 hidden=0 flags pending isscript
     printf '%s\n' "${B}$(printf '%-30s %-10s %-11s %s' NAME VERSION MODIFIED NOTES)${X}"
     for f in "$BIN_DIR"/*; do
         [[ -f $f || -L $f ]] || continue
-        if ! ((ALL)) && ! is_script "$f"; then ((hidden++)); continue; fi
         name=${f##*/}; flags=""
-        [[ -x $f ]] || flags+="not-executable "
         src=$(find_match "$name")
-        if [[ -n $src ]] && ! cmp -s -- "$src" "$f"; then flags+="${Y}update in Downloads (${src##*/})${X}"; fi
+        isscript=0; is_script "$f" && isscript=1
+        pending=0
+        if [[ -n $src ]] && ! cmp -s -- "$src" "$f"; then pending=1; fi
+        if ((!isscript)) && ! ((ALL)); then
+            # a plain file is listed without --all only when a marked update is waiting
+            if ! ((pending)) || ! has_marker "$src"; then ((hidden++)); continue; fi
+        fi
+        if ((isscript)) && [[ ! -x $f ]]; then flags+="not-executable "; fi
+        if ((pending)); then
+            if ((isscript)) || has_marker "$src"; then
+                flags+="${Y}update in Downloads (${src##*/})${X}"
+            else
+                flags+="${Y}in Downloads without '$MARKER' marker (${src##*/}); install with: $NAME $name${X}"
+            fi
+        fi
         printf '%-30s %-10s %-11s %s\n' "$name" "$(get_ver "$f")" "$(date -r "$f" +%F 2>/dev/null)" "$flags"
         ((n++))
     done
     ((n)) || note "No scripts in $BIN_DIR"
-    ((n)) && printf '%s\n' "${D}$n script(s) in $BIN_DIR${X}"
+    ((n)) && printf '%s\n' "${D}$n file(s) in $BIN_DIR${X}"
     ((hidden)) && note "$hidden non-script file(s) hidden (use: $NAME list --all)"
     return 0
 }
@@ -304,7 +345,7 @@ cmd_list() {
 cmd_restore() {
     local name=${1:-}
     [[ -n $name ]] || { err "restore needs a script name"; return 2; }
-    local dest="$BIN_DIR/$name" latest
+    local dest="$BIN_DIR/$name" latest plain=0
     # oldest first, so the last one is the newest backup
     list_backups "$name"
     if ((${#BK[@]} == 0)); then
@@ -313,10 +354,11 @@ cmd_restore() {
     fi
     latest=${BK[${#BK[@]}-1]}
     if ((DRY)); then note "would restore $name from ${latest##*/} (${D}$(get_ver "$latest")${X})"; return 0; fi
+    if ! is_script "$dest" && ! is_script "$latest"; then plain=1; fi
     local tmp; tmp=$(mktemp) || { err "mktemp failed"; return 1; }
     cp -p -- "$latest" "$tmp" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
     [[ -e $dest ]] && { backup_file "$dest" "$name" || warn "could not back up current $name"; }
-    atomic_put "$tmp" "$dest" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
+    atomic_put "$tmp" "$dest" "$plain" || { rm -f -- "$tmp"; err "restore failed"; return 1; }
     rm -f -- "$tmp"
     ok "$name restored to $(get_ver "$dest") ${D}(from ${latest##*/})${X}"
 }
