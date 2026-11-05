@@ -2,18 +2,16 @@
 # DESC: Install My Scripts: move updated scripts (and marked plain files like PLANS.md) from ~/Downloads to ~/.local/bin
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
-# NEW IN THIS VERSION (2.2.0):
-#   - New: ims now also handles plain (non-script) files such as PLANS.md. They install
-#     like scripts (backup, atomic replace, restore) but are never made executable and get
-#     no "no shebang" warning.
-#   - Plain 'ims' updates such a file from ~/Downloads only when the Downloads copy carries
-#     the marker "ims-managed" in its first 20 lines (for example <!-- ims-managed -->).
-#     Without it the file is skipped with a note. Naming it ('ims PLANS.md') skips the
-#     marker check.
-#   - 'ims list' also shows a plain file when a marked update is waiting for it; --all still
-#     shows every non-script file.
-#   - Added a # DESC: line for shelf; the 2.1.2 entry is replaced by this one.
-VERSION="2.2.0"
+# NEW IN THIS VERSION (2.3.0):
+#   - New: fish tab completion. 'ims completions' prints the script and
+#     'ims completions --install' writes it to ~/.config/fish/completions/ims.fish.
+#     After that, 'ims <Tab>' lists every file in ~/Downloads (not files from the current
+#     folder), plus the subcommands and the scripts already installed. 'ims restore <Tab>'
+#     lists the scripts that have a backup, and the options complete too.
+#   - The completion follows IMS_DL_DIR, IMS_BIN_DIR and XDG_STATE_HOME like ims itself.
+#   - 'completions' is now a reserved word, like 'list' and 'restore'.
+#   - The 2.2.0 entry is replaced by this one.
+VERSION="2.3.0"
 NAME="ims"
 
 set -uo pipefail
@@ -56,6 +54,10 @@ Usage:
                          (-a/--all also shows non-script files)
   $NAME restore <name>     Roll back <name> to its latest backup
                          (run again to toggle back)
+  $NAME completions        Print the fish tab-completion script
+  $NAME completions --install
+                         Install it as ~/.config/fish/completions/$NAME.fish
+                         ($NAME <Tab> then lists the files in ~/Downloads)
   $NAME -h, --help         Show this help
   $NAME -v, --version      Show version
 
@@ -66,6 +68,7 @@ Options:
       --no-backup        Don't back up the file being replaced
       --keep-ext         Keep the extension when installing a NEW script
                          by name (default: "$NAME foo.sh" installs as "foo")
+      --install          With completions: write the file instead of printing it
 
 Matching:
   A Downloads file matches script "foo" if it is named foo, or foo.<ext>
@@ -83,6 +86,12 @@ Plain files (PLANS.md, notes, ...):
   Without the marker it is skipped with a note. "$NAME PLANS.md" (naming
   the file) skips the marker check. Other files in ~/.local/bin
   (binaries, ...) are left alone.
+
+Tab completion (fish):
+  After "$NAME completions --install", "$NAME <Tab>" offers every file in
+  ~/Downloads, the subcommands and the scripts already installed;
+  "$NAME restore <Tab>" offers the scripts that have a backup.
+  "completions" is a reserved word, like "list" and "restore".
 
 Notes:
   $NAME can safely update itself (installs are atomic renames).
@@ -363,8 +372,125 @@ cmd_restore() {
     ok "$name restored to $(get_ver "$dest") ${D}(from ${latest##*/})${X}"
 }
 
+# ---- fish tab completion ----
+# The script below is pure fish: nothing from ims runs when you press Tab, it only lists
+# folders. Printed by 'ims completions', written by 'ims completions --install'.
+fish_completions() {
+    printf '# fish completions for %s (written by %s v%s: regenerate with "%s completions --install")\n' \
+        "$NAME" "$NAME" "$VERSION" "$NAME"
+    cat <<'FISHEOF'
+
+function __ims_dl_dir
+    if set -q IMS_DL_DIR; and test -n "$IMS_DL_DIR"
+        echo $IMS_DL_DIR
+    else
+        echo $HOME/Downloads
+    end
+end
+
+function __ims_bin_dir
+    if set -q IMS_BIN_DIR; and test -n "$IMS_BIN_DIR"
+        echo $IMS_BIN_DIR
+    else
+        echo $HOME/.local/bin
+    end
+end
+
+function __ims_backup_dir
+    if set -q XDG_STATE_HOME; and test -n "$XDG_STATE_HOME"
+        echo $XDG_STATE_HOME/ims/backups
+    else
+        echo $HOME/.local/state/ims/backups
+    end
+end
+
+# the words typed so far that are not options (without "ims" itself)
+function __ims_positionals
+    set -l toks (commandline -opc)
+    set -e toks[1]
+    for t in $toks
+        string match -q -- '-*' $t; and continue
+        echo $t
+    end
+end
+
+function __ims_at_first
+    test (count (__ims_positionals)) -eq 0
+end
+
+function __ims_at_restore_arg
+    set -l p (__ims_positionals)
+    test (count $p) -eq 1; and test "$p[1]" = restore
+end
+
+function __ims_in_completions
+    set -l p (__ims_positionals)
+    test (count $p) -ge 1; and test "$p[1]" = completions
+end
+
+# every file in the Downloads folder (bare names: ims looks them up there itself)
+function __ims_downloads
+    command find -L (__ims_dl_dir) -maxdepth 1 -type f ! -name '.*' -printf '%f\tin Downloads\n' 2>/dev/null | sort
+end
+
+# files already in the bin folder (to update just one script)
+function __ims_installed
+    command find -L (__ims_bin_dir) -maxdepth 1 -type f ! -name '.*' -printf '%f\tinstalled\n' 2>/dev/null | sort
+end
+
+# names that have a backup: <name>.YYYYMMDD-HHMMSS[-NN]
+function __ims_backed_up
+    for f in (command find (__ims_backup_dir) -maxdepth 1 -type f -printf '%f\n' 2>/dev/null)
+        string replace -rf -- '\.[0-9]{8}-[0-9]{6}(-[0-9]{2})?$' '' $f
+    end | sort -u | while read -l n
+        printf '%s\thas a backup\n' $n
+    end
+end
+
+# no file completion from the current folder
+complete -c ims -f
+
+complete -c ims -n __ims_at_first -a list -d 'List scripts with version and pending updates'
+complete -c ims -n __ims_at_first -a restore -d 'Roll back a script to its latest backup'
+complete -c ims -n __ims_at_first -a completions -d 'Print or install these fish completions'
+complete -c ims -n __ims_at_first -a '(__ims_downloads)'
+complete -c ims -n __ims_at_first -a '(__ims_installed)'
+complete -c ims -n __ims_at_restore_arg -a '(__ims_backed_up)'
+
+complete -c ims -s h -l help -d 'Show help'
+complete -c ims -s v -l version -d 'Show version'
+complete -c ims -s n -l dry-run -d 'Show what would happen, change nothing'
+complete -c ims -s c -l copy -d 'Copy instead of move'
+complete -c ims -l no-backup -d "Don't back up the file being replaced"
+complete -c ims -l keep-ext -d 'Keep the extension when installing a new script'
+complete -c ims -s a -l all -d 'With list: include non-script files'
+complete -c ims -n __ims_in_completions -l install -d 'Write the file instead of printing it'
+FISHEOF
+}
+
+cmd_completions() {
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions" file tmp
+    file="$dir/$NAME.fish"
+    if ((!INSTALL)); then
+        fish_completions
+        return 0
+    fi
+    if ((DRY)); then note "would write $file"; return 0; fi
+    mkdir -p -- "$dir" || { err "cannot create $dir"; return 1; }
+    tmp=$(mktemp "$dir/.ims.XXXXXX") || { err "cannot write in $dir"; return 1; }
+    if fish_completions >"$tmp" && chmod 644 -- "$tmp" && mv -f -- "$tmp" "$file"; then
+        ok "fish completions installed: $file"
+        note "Open a new fish shell (or run: source $file) to use them"
+        command -v fish >/dev/null 2>&1 || warn "fish was not found on this system"
+        return 0
+    fi
+    rm -f -- "$tmp"
+    err "could not write $file"
+    return 1
+}
+
 # ---- argument parsing ----
-DRY=0; COPY=0; BACKUP=1; KEEP_EXT=0; ALL=0
+DRY=0; COPY=0; BACKUP=1; KEEP_EXT=0; ALL=0; INSTALL=0
 pos=()
 while (($#)); do
     case $1 in
@@ -375,6 +501,7 @@ while (($#)); do
         --no-backup)  BACKUP=0 ;;
         --keep-ext)   KEEP_EXT=1 ;;
         -a|--all)     ALL=1 ;;
+        --install)    INSTALL=1 ;;
         --)           shift; pos+=("$@"); break ;;
         -*)           err "Unknown option: $1 (try $NAME --help)"; exit 2 ;;
         *)            pos+=("$1") ;;
@@ -388,6 +515,9 @@ case "${pos[0]-}" in
     "")        cmd_default ;;
     list|ls)   cmd_list ;;
     restore)   cmd_restore "${pos[1]-}" ;;
+    completions)
+               ((${#pos[@]} > 1)) && { err "completions takes no name (try $NAME --help)"; exit 2; }
+               cmd_completions ;;
     *)         ((${#pos[@]} > 1)) && { err "Too many arguments (try $NAME --help)"; exit 2; }
                cmd_named "${pos[0]}" ;;
 esac
