@@ -2,16 +2,18 @@
 # DESC: Install My Scripts: move updated scripts (and marked plain files like PLANS.md) from ~/Downloads to ~/.local/bin
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
-# NEW IN THIS VERSION (2.3.0):
-#   - New: fish tab completion. 'ims completions' prints the script and
-#     'ims completions --install' writes it to ~/.config/fish/completions/ims.fish.
-#     After that, 'ims <Tab>' lists every file in ~/Downloads (not files from the current
-#     folder), plus the subcommands and the scripts already installed. 'ims restore <Tab>'
-#     lists the scripts that have a backup, and the options complete too.
-#   - The completion follows IMS_DL_DIR, IMS_BIN_DIR and XDG_STATE_HOME like ims itself.
-#   - 'completions' is now a reserved word, like 'list' and 'restore'.
-#   - The 2.2.0 entry is replaced by this one.
-VERSION="2.3.0"
+# NEW IN THIS VERSION (2.4.0):
+#   - New: install a file from anywhere, not only ~/Downloads. An argument that contains a
+#     slash is a path to the file itself: 'ims ~/code/foo.py' installs it as 'foo' (the known
+#     extension is dropped for a new script, like 'ims foo.py' does; --keep-ext keeps it).
+#     Like Downloads files it is moved, with a backup of the file it replaces; -c/--copy
+#     keeps the original, -n/--dry-run shows what would happen.
+#   - Before, 'ims some/dir/foo' silently ignored the folder and looked for foo in ~/Downloads;
+#     it now installs the file you named.
+#   - The fish completion now completes ordinary paths when the word you are typing starts
+#     with ~ . or / or already contains a slash. Reinstall it: ims completions --install
+#   - The 2.3.0 entry is replaced by this one.
+VERSION="2.4.0"
 NAME="ims"
 
 set -uo pipefail
@@ -49,6 +51,9 @@ Usage:
   $NAME <scriptname>       Only look for <scriptname> in ~/Downloads
                          (new scripts install without .sh/.py etc.)
                          Also the way to install a plain file: $NAME PLANS.md
+  $NAME <path/to/file>     Install a file from anywhere (any argument with a slash):
+                         $NAME ~/code/foo.py installs it as "foo". Moved, like
+                         Downloads files; add -c to keep the original
   $NAME list               List scripts in ~/.local/bin with version, date
                          and any update waiting in ~/Downloads
                          (-a/--all also shows non-script files)
@@ -296,22 +301,46 @@ cmd_default() {
     ((FAILED == 0))
 }
 
-cmd_named() {
-    local name=${1##*/} target src ext
-    [[ -d $DL_DIR ]] || { err "$DL_DIR does not exist"; return 1; }
-    target=$name
-    # "ims foo.sh": use the installed name if it exists; otherwise drop the
-    # known extension for a new install (unless --keep-ext)
+# install_name <filename> -> prints the name a new file is installed under: an installed
+# script of that name wins; otherwise a known extension is dropped (unless --keep-ext)
+install_name() {
+    local name=$1 target=$1 ext
     if [[ ! -e $BIN_DIR/$target && $name == *.* ]]; then
         ext=${name##*.}
         if [[ ${ext,,} =~ ^($KNOWN_EXT)$ ]] && { [[ -e $BIN_DIR/${name%.*} ]] || ((!KEEP_EXT)); }; then
             target=${name%.*}
         fi
     fi
+    printf '%s' "$target"
+}
+
+cmd_named() {
+    local name=$1 target src
+    [[ -d $DL_DIR ]] || { err "$DL_DIR does not exist"; return 1; }
+    # "ims foo.sh": use the installed name if it exists; otherwise drop the
+    # known extension for a new install (unless --keep-ext)
+    target=$(install_name "$name")
     src=$(find_match "$target")
     if [[ -z $src && $target != "$name" ]]; then src=$(find_match "$name"); fi
     if [[ -z $src ]]; then
         err "No file matching '$name' found in $DL_DIR"
+        return 1
+    fi
+    install_one "$src" "$target"
+    summary
+    ((FAILED == 0))
+}
+
+# "ims ~/code/foo.py": the argument is the file itself, wherever it is
+cmd_path() {
+    local src=$1 name target
+    [[ $src == '~/'* ]] && src="$HOME/${src#'~/'}"   # a quoted ~ is not expanded by the shell
+    if [[ ! -e $src ]]; then err "No such file: $src"; return 1; fi
+    if [[ ! -f $src ]]; then err "Not a regular file: $src"; return 1; fi
+    name=${src##*/}
+    target=$(install_name "$name")
+    if [[ $src -ef $BIN_DIR/$target ]]; then
+        err "$src is already the installed file"
         return 1
     fi
     install_one "$src" "$target"
@@ -447,8 +476,15 @@ function __ims_backed_up
     end
 end
 
-# no file completion from the current folder
+# the word being typed looks like a path (~/x, ./x, /x, dir/x): complete ordinary paths
+function __ims_at_first_path
+    __ims_at_first; or return 1
+    string match -qr '^[~./]|/' -- (commandline -ct)
+end
+
+# no file completion from the current folder, except for words that look like paths
 complete -c ims -f
+complete -c ims -n __ims_at_first_path -F
 
 complete -c ims -n __ims_at_first -a list -d 'List scripts with version and pending updates'
 complete -c ims -n __ims_at_first -a restore -d 'Roll back a script to its latest backup'
@@ -519,5 +555,5 @@ case "${pos[0]-}" in
                ((${#pos[@]} > 1)) && { err "completions takes no name (try $NAME --help)"; exit 2; }
                cmd_completions ;;
     *)         ((${#pos[@]} > 1)) && { err "Too many arguments (try $NAME --help)"; exit 2; }
-               cmd_named "${pos[0]}" ;;
+               if [[ ${pos[0]} == */* ]]; then cmd_path "${pos[0]}"; else cmd_named "${pos[0]}"; fi ;;
 esac
