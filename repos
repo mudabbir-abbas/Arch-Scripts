@@ -1,0 +1,957 @@
+#!/usr/bin/env bash
+# DESC: Friendly git helper for several repos: set up, switch, remove, plus everyday git (was binvc)
+# repos - friendly git helper (formerly "binvc"): keeps a list of your repos and does the everyday git work
+#
+# NEW IN THIS VERSION (3.0.0):
+#   - Renamed from binvc to repos. Install this file as "repos" and delete the old binvc.
+#   - New: a list of repos with one "active" repo that all everyday commands act on.
+#     Your old ~/.local/bin repo is registered automatically as "scripts" on first run.
+#   - New: new (git init + .gitignore + first commit + optional GitHub repo via gh),
+#     add, clone, list, use (switch), current, link, unlink, forget, remove.
+#   - remove DELETES the folder (after unlinking it from GitHub) and needs the repo
+#     name typed to confirm; the GitHub repo itself is never deleted. forget only
+#     drops the repo from the list and keeps its files.
+#   - Mutating commands print which repo they are working on.
+#   - BINVC_REPO still works as a one-off override (REPOS_REPO is the new name).
+VERSION="3.0.0"
+NAME="repos"
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/$NAME"
+LIST_FILE="$CONF_DIR/repos.list"      # one repo per line: name<TAB>path
+ACTIVE_FILE="$CONF_DIR/active"        # name of the active repo
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")"
+REPO=""; RNAME=""; REPLY=""; PICKED=""; MODE=""
+
+if [ -t 1 ]; then
+  B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+else
+  B=''; G=''; Y=''; R=''; N=''
+fi
+
+info() { printf '%s==>%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%swarning:%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+confirm() { local a; read -r -p "$1 [y/N] " a; [[ $a =~ ^[Yy]$ ]]; }
+
+tilde() { local t='~'; printf '%s' "${1/#$HOME/$t}"; }
+is_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+# ask PROMPT [DEFAULT] -> REPLY (trimmed; DEFAULT when empty). Returns 1 on EOF.
+ask() {
+  local d=${2:-}
+  read -r -e -p "$1${d:+ [$d]} " REPLY || { echo; return 1; }
+  REPLY=${REPLY#"${REPLY%%[![:space:]]*}"}
+  REPLY=${REPLY%"${REPLY##*[![:space:]]}"}
+  [ -n "$REPLY" ] || REPLY=$d
+  return 0
+}
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+bad_path()   { case $1 in *$'\t'*|*$'\n'*) return 0 ;; esac; return 1; }
+
+# abs_path PATH -> REPLY: absolute, ~ expanded, tidy
+abs_path() {
+  local p=$1
+  case $p in '~') p=$HOME ;; '~/'*) p=$HOME/${p#'~/'} ;; esac
+  REPLY=$(realpath -m -- "$p" 2>/dev/null) || REPLY=$p
+}
+
+need_git() { command -v git >/dev/null || die "git is not installed (sudo pacman -S git)"; }
+
+# ---------- the list of repos ----------
+reg_init() {
+  [ -f "$LIST_FILE" ] && return 0
+  local p=${BINVC_REPO:-$HOME/.local/bin}
+  mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR"
+  printf 'scripts\t%s\n' "$p" >"$LIST_FILE" || die "cannot write $LIST_FILE"
+  printf 'scripts\n' >"$ACTIVE_FILE"
+  info "First run: your scripts repo ($(tilde "$p")) is now in the list as 'scripts'." >&2
+}
+
+reg_path()    { [ -f "$LIST_FILE" ] || return 1; K="$1" awk -F'\t' '$1==ENVIRON["K"] {print $2; f=1; exit} END{exit !f}' "$LIST_FILE"; }
+reg_has()     { reg_path "$1" >/dev/null; }
+reg_by_path() { [ -f "$LIST_FILE" ] || return 1; P="$1" awk -F'\t' '$2==ENVIRON["P"] {print $1; f=1; exit} END{exit !f}' "$LIST_FILE"; }
+reg_names()   { [ -f "$LIST_FILE" ] && cut -f1 "$LIST_FILE" || true; }
+reg_count()   { local c; c=$(grep -c . "$LIST_FILE" 2>/dev/null || true); echo "${c:-0}"; }
+reg_add()     { mkdir -p "$CONF_DIR" && printf '%s\t%s\n' "$1" "$2" >>"$LIST_FILE"; }
+reg_del() {
+  local t
+  t=$(mktemp "$CONF_DIR/.tmp.XXXXXX") || return 1
+  K="$1" awk -F'\t' '$1!=ENVIRON["K"]' "$LIST_FILE" >"$t" && mv -f -- "$t" "$LIST_FILE" || { rm -f -- "$t"; return 1; }
+}
+
+active_name() { if [ -f "$ACTIVE_FILE" ]; then head -n1 "$ACTIVE_FILE"; fi; }
+set_active()  { mkdir -p "$CONF_DIR" && printf '%s\n' "$1" >"$ACTIVE_FILE"; }
+
+# after a repo left the list: fix the active one
+fix_active_after_delete() {
+  [ "$(active_name)" = "$1" ] || return 0
+  rm -f -- "$ACTIVE_FILE"
+  case $(reg_count) in
+    0) info "No repos left in the list." ;;
+    1) set_active "$(reg_names | head -n1)"; info "Active repo is now: $(active_name)" ;;
+    *) warn "no active repo now. Choose one: $NAME use NAME" ;;
+  esac
+}
+
+# pick_repo PROMPT -> PICKED (needs a terminal)
+pick_repo() {
+  PICKED=""
+  local names=() n i act p
+  mapfile -t names < <(reg_names)
+  (( ${#names[@]} )) || { warn "no repos in the list yet (create one: $NAME new NAME)"; return 1; }
+  is_tty || { warn "no terminal to ask in: give the repo name"; return 1; }
+  act=$(active_name)
+  for i in "${!names[@]}"; do
+    n=${names[i]}; p=$(reg_path "$n")
+    printf '  %2d) %s %-18s %s\n' $((i+1)) "$([ "$n" = "$act" ] && echo '*' || echo ' ')" "$n" "$(tilde "$p")"
+  done
+  ask "$1 (number or name, Enter = cancel):" || return 1
+  [ -n "$REPLY" ] || return 1
+  if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && (( 10#$REPLY >= 1 && 10#$REPLY <= ${#names[@]} )); then
+    PICKED=${names[10#$REPLY-1]}; return 0
+  fi
+  if reg_has "$REPLY"; then PICKED=$REPLY; return 0; fi
+  warn "unknown repo: $REPLY"; return 1
+}
+
+# ---------- the active repo ----------
+# Finds the active repo, goes into its folder and checks it. Every everyday git command starts here.
+need_repo() {
+  need_git
+  local ov=${REPOS_REPO:-${BINVC_REPO:-}}
+  if [ -n "$ov" ]; then
+    REPO=$ov; RNAME="override"
+  else
+    reg_init
+    RNAME=$(active_name)
+    [ -n "$RNAME" ] || die "no active repo. Choose one: $NAME use NAME (see: $NAME list)"
+    REPO=$(reg_path "$RNAME") || die "the active repo '$RNAME' is not in the list (see: $NAME list)"
+  fi
+  cd "$REPO" 2>/dev/null || die "folder not found: $REPO (moved or deleted? drop it with: $NAME forget $RNAME)"
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$(tilde "$REPO") is not a git repo yet (run git init there, or switch: $NAME use NAME)"
+  if [ -t 2 ]; then printf '%s==>%s repo %s%s%s (%s)\n' "$G" "$N" "$B" "$RNAME" "$N" "$(tilde "$REPO")" >&2; fi
+  return 0
+}
+
+has_remote()  { [ -n "$(git remote)" ]; }
+has_changes() { [ -n "$(git status --porcelain)" ]; }
+has_upstream() { git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; }
+
+# The remote to push to: "origin" if there is one, otherwise the first remote.
+remote_name() {
+  if git remote | grep -qx origin; then echo origin; else git remote | head -n1; fi
+}
+
+SECRET_PAT='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|(password|passwd|secret|api[_-]?key|token)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+["'"'"']'
+
+secret_hits() {
+  git diff --cached -U0 | grep -E '^\+[^+]' | grep -Ei "$SECRET_PAT" || true
+}
+
+check_exec() {
+  local f
+  git ls-files -z -c -o --exclude-standard | while IFS= read -r -d '' f; do
+    [ -f "$f" ] || continue
+    if [ "$(head -c2 "$f" 2>/dev/null)" = '#!' ] && [ ! -x "$f" ]; then
+      warn "$f has a shebang but is not executable (fix: chmod +x $f)"
+    fi
+  done
+}
+
+# ---------- everyday commands (act on the active repo) ----------
+
+# Contact GitHub and download its news (changes none of your files).
+fetch_remote() {
+  has_remote || return 1
+  info "Contacting GitHub (needs network)..."
+  if timeout 20 git fetch -q; then return 0; fi
+  warn "could not reach GitHub (offline or ssh problem). Showing the last known state."
+  return 1
+}
+
+# recommend <online 0|1> <dirty 0|1> <ahead> <behind|-1 if unknown>
+recommend() {
+  local online=$1 dirty=$2 ahead=$3 behind=$4 rec why
+  if ! has_remote; then
+    if [ "$dirty" = 1 ]; then rec="$NAME commit \"message\""; why="no GitHub link, so changes can only be saved locally (link one: $NAME link)"
+    else rec="nothing to do"; why="everything is committed locally (link GitHub with: $NAME link)"; fi
+  elif ! has_upstream; then
+    if [ "$dirty" = 1 ]; then rec="$NAME sync \"message\""; why="commit your edits and upload them (sets up the GitHub link)"
+    else rec="$NAME push"; why="branch is not uploaded to GitHub yet"; fi
+  elif [ "$online" = 0 ]; then
+    if [ "$dirty" = 1 ]; then rec="$NAME commit \"message\""; why="offline: save locally now, run sync once you are online"
+    elif [ "$ahead" -gt 0 ]; then rec="$NAME push (when online)"; why="$ahead commit(s) not uploaded yet"
+    else rec="nothing needed"; why="clean, but GitHub could not be checked"; fi
+  elif [ "$dirty" = 1 ]; then
+    rec="$NAME sync \"message\""
+    if [ "$behind" -gt 0 ]; then why="commits your edits, brings in $behind newer commit(s) from GitHub, then uploads"
+    else why="commits your edits and uploads them"; fi
+  elif [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+    rec="$NAME sync"; why="you are $ahead ahead and $behind behind: pull then push"
+  elif [ "$ahead" -gt 0 ]; then
+    rec="$NAME push"; why="$ahead commit(s) are only on this laptop"
+  elif [ "$behind" -gt 0 ]; then
+    rec="$NAME pull"; why="GitHub has $behind newer commit(s) (see them with: $NAME incoming)"
+  else
+    rec="nothing to do"; why="laptop and GitHub are identical"
+  fi
+  printf '%sSuggested:%s %s  (%s)\n' "$B" "$N" "$rec" "$why"
+}
+
+cmd_status() {
+  local online=0 dirty=0 ahead=0 behind=-1
+  if [ "${1:-}" != "-n" ] && [ "${1:-}" != "--offline" ]; then
+    fetch_remote && online=1
+  else
+    info "Offline mode: not contacting GitHub (information may be outdated)."
+  fi
+  info "Branch and changes"
+  git status -sb
+  has_changes && dirty=1 || info "Working folder is clean."
+  if has_upstream; then
+    read -r ahead behind < <(git rev-list --left-right --count 'HEAD...@{u}')
+  fi
+  check_exec
+  echo
+  recommend "$online" "$dirty" "$ahead" "$behind"
+}
+
+cmd_incoming() {
+  has_remote || die "no remote configured (link one: $NAME link)"
+  fetch_remote || warn "showing what was known at the last successful contact"
+  has_upstream || die "this branch is not linked to GitHub yet (run: $NAME push)"
+  if [ "$(git rev-list --count 'HEAD..@{u}')" = 0 ]; then
+    info "GitHub has nothing new for you."
+    return 0
+  fi
+  info "Commits on GitHub that you don't have:"
+  git log --oneline 'HEAD..@{u}'
+  info "What they change:"
+  git diff 'HEAD...@{u}'
+  info "Apply them with: $NAME pull"
+}
+
+cmd_diff() {
+  info "Untracked (new) files:"
+  git ls-files -o --exclude-standard | sed 's/^/  /'
+  info "Changes to tracked files:"
+  git diff HEAD "$@"
+}
+
+cmd_commit() {
+  has_changes || { info "Nothing to commit."; return 0; }
+  check_exec
+  git add -A
+  git status --short
+  local hits msg
+  hits=$(secret_hits)
+  if [ -n "$hits" ]; then
+    warn "possible secrets in this commit:"
+    printf '%s\n' "$hits" | cut -c1-160
+    confirm "Commit anyway?" || { git reset -q; info "Cancelled, nothing committed."; return 1; }
+  fi
+  msg="$*"
+  [ -n "$msg" ] || read -r -p "Commit message: " msg
+  [ -n "$msg" ] || { git reset -q; die "empty message, cancelled"; }
+  git commit -q -m "$msg" && info "Committed: $msg"
+}
+
+# Run "git push" and set PUSHED_ANY=1 if at least one ref/tag was really updated.
+# --porcelain output is locale independent: a leading "=" means already up to date.
+push_run() {
+  local out rc=0
+  out=$(git push --porcelain "$@") || rc=$?
+  if printf '%s\n' "$out" | grep -qE $'^[ +*-]\t'; then PUSHED_ANY=1; fi
+  return $rc
+}
+
+cmd_push() {
+  has_remote || die "no remote configured (link one: $NAME link)"
+  PUSHED_ANY=0
+  if has_upstream; then push_run || { warn "push failed, nothing was uploaded"; return 1; }
+  else push_run -u "$(remote_name)" HEAD || { warn "push failed, nothing was uploaded"; return 1; }
+  fi
+  push_run --tags || { warn "pushing tags failed"; return 1; }
+  if [ "$PUSHED_ANY" = 1 ]; then info "Pushed."
+  else info "Nothing to push, GitHub already has everything."; fi
+}
+
+cmd_pull() {
+  has_remote || die "no remote configured (link one: $NAME link)"
+  git pull --rebase --autostash
+}
+
+cmd_sync() {
+  cmd_commit "$@" || return 1
+  if has_remote; then
+    if has_upstream; then
+      git pull --rebase --autostash || { warn "pull failed, not pushing"; return 1; }
+    fi
+    cmd_push
+  else
+    warn "no remote, committed locally only (link one: $NAME link)"
+  fi
+}
+
+cmd_log() {
+  git log --oneline --decorate -n "${1:-15}"
+}
+
+cmd_show() {
+  [ -n "${1:-}" ] || die "usage: $NAME show <commit>"
+  git show --stat "$1"
+}
+
+cmd_restore() {
+  local f="${1:-}"
+  [ -n "$f" ] || read -r -p "File to discard changes in: " f
+  [ -n "$f" ] || die "no file given"
+  git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || die "$f is not tracked by git"
+  git diff --stat HEAD -- "$f"
+  confirm "Discard ALL uncommitted changes in $f? This cannot be undone." || return 0
+  git restore --staged --worktree -- "$f" && info "Restored $f to last commit."
+}
+
+cmd_fetchfile() {
+  local f="${1:-}" c="${2:-}"
+  [ -n "$f" ] || read -r -p "File name: " f
+  [ -n "$f" ] || die "no file given"
+  if [ -z "$c" ]; then
+    info "History of $f:"
+    git log --oneline -n 15 -- "$f"
+    read -r -p "Commit to restore from: " c
+  fi
+  [ -n "$c" ] || die "no commit given"
+  confirm "Overwrite $f with its version from $c?" || return 0
+  git restore --source="$c" -- "$f" && info "Done. Review with '$NAME diff', then commit."
+}
+
+cmd_undo() {
+  git rev-parse HEAD~1 >/dev/null 2>&1 || die "no earlier commit to go back to"
+  if has_upstream && [ "$(git rev-list --count '@{u}..HEAD')" = 0 ]; then
+    die "last commit is already pushed. Use: git revert HEAD"
+  fi
+  git log --oneline -n 1
+  confirm "Undo this commit (your file changes are kept)?" || return 0
+  git reset --soft HEAD~1 && info "Commit undone, changes are staged again."
+}
+
+cmd_tag() {
+  local t="${1:-}" m="${2:-}"
+  if [ -z "$t" ]; then
+    info "Existing tags:"; git tag -l --sort=-v:refname | head -10
+    read -r -p "New version (e.g. 1.2.0): " t
+  fi
+  [ -n "$t" ] || die "no version given"
+  [[ $t == v* ]] || t="v$t"
+  [ -n "$m" ] || read -r -p "Tag message: " m
+  [ -n "$m" ] || m="Release $t"
+  git tag -a "$t" -m "$m" || return 1
+  info "Created tag $t"
+  if has_remote && confirm "Push tag to GitHub?"; then
+    git push "$(remote_name)" "$t" || return 1
+  fi
+  return 0
+}
+
+cmd_tags() { git tag -n --sort=-v:refname; }
+
+cmd_scan() {
+  info "Scanning all tracked files for possible secrets..."
+  local out
+  out=$(git ls-files -z | xargs -0 grep -nEIi "$SECRET_PAT" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out" | cut -c1-160; warn "review the lines above"
+  else info "Nothing suspicious found."; fi
+}
+
+# create a starter .gitignore in the current folder; returns 1 if one already exists
+make_ignore() {
+  [ -e .gitignore ] && return 1
+  printf '%s\n' '*~' '*.bak' '*.swp' '*.log' '.env' > .gitignore
+}
+
+cmd_ignore() {
+  if [ -e .gitignore ]; then info ".gitignore already exists:"; cat .gitignore; return 0; fi
+  make_ignore
+  info "Created .gitignore (backup, swap, log and .env files are now skipped)."
+}
+
+cmd_where() {
+  echo "Repo:   $RNAME"
+  echo "Folder: $REPO"
+  if has_remote; then git remote -v; else echo "GitHub: not linked (link one: $NAME link)"; fi
+}
+
+# ---------- GitHub link ----------
+
+# choose_mode: asks how to link GitHub. Sets MODE to gh | url | none (empty without a terminal).
+choose_mode() {
+  MODE=""
+  is_tty || return 0
+  echo "  GitHub link:"
+  echo "    1) create a new GitHub repo with the gh tool"
+  echo "    2) link an existing GitHub repo (paste its URL)"
+  echo "    3) none / cancel"
+  ask "Choose:" 3 || { MODE=none; return 0; }
+  case $REPLY in 1) MODE=gh ;; 2) MODE=url ;; *) MODE=none ;; esac
+}
+
+# First upload after linking. Runs inside the repo folder.
+push_initial() {
+  git rev-parse HEAD >/dev/null 2>&1 || { info "Nothing committed yet, so nothing to upload."; return 0; }
+  local heads
+  if ! heads=$(timeout 20 git ls-remote --heads origin 2>/dev/null); then
+    warn "could not reach the remote (offline, wrong URL or no access). It is linked but not uploaded: later run $NAME push"
+    return 1
+  fi
+  if [ -n "$heads" ]; then
+    warn "that GitHub repo already has commits, so nothing was uploaded."
+    warn "Review it first: $NAME incoming, then merge on purpose (git pull --rebase origin main --allow-unrelated-histories)."
+    return 1
+  fi
+  if git push -q -u origin HEAD; then info "Uploaded."; else warn "upload failed; try later: $NAME push"; return 1; fi
+}
+
+# setup_remote MODE URL NAME VISIBILITY   (runs inside the repo folder)
+setup_remote() {
+  local mode=$1 url=$2 name=$3 vis=$4 gname v
+  case $mode in
+    none|"") info "Kept local. Link GitHub later with: $NAME link"; return 0 ;;
+  esac
+  if has_remote; then warn "this repo is already linked (see: $NAME where). Remove the link first: $NAME unlink"; return 1; fi
+  case $mode in
+    url)
+      if [ -z "$url" ]; then
+        is_tty || { warn "no URL given"; return 1; }
+        ask "GitHub URL (https://github.com/OWNER/REPO.git or git@github.com:OWNER/REPO.git):" || return 1
+        url=$REPLY
+      fi
+      [[ $url == *://* || $url == git@*:* || $url == /* ]] || { warn "that does not look like a git URL: $url"; return 1; }
+      git remote add origin "$url" || return 1
+      info "Linked: origin -> $url"
+      push_initial ;;
+    gh)
+      command -v gh >/dev/null || { warn "gh (GitHub CLI) is not installed. Run: sudo pacman -S github-cli, then: gh auth login, then: $NAME link --github"; return 1; }
+      gh auth status >/dev/null 2>&1 || { warn "gh is not logged in. Run: gh auth login, then: $NAME link --github"; return 1; }
+      gname=$name
+      if is_tty; then ask "GitHub repo name:" "$name" || return 1; gname=$REPLY; fi
+      v=$vis
+      if [ -z "$v" ]; then
+        v=private
+        if is_tty; then ask "Visibility (private/public):" private || return 1; v=$REPLY; fi
+      fi
+      case $v in private|public) ;; *) warn "visibility must be private or public"; return 1 ;; esac
+      if [ "$v" = public ] && is_tty && ! confirm "Public means everyone can read it. Continue?"; then
+        info "Cancelled, kept local."; return 1
+      fi
+      info "Creating $v GitHub repo '$gname' and uploading..."
+      if gh repo create "$gname" "--$v" --source=. --remote=origin --push; then
+        info "GitHub repo created and uploaded."
+      else
+        warn "the GitHub repo was not created (name taken? nothing committed yet?). The local repo is fine. Retry: $NAME link --github"
+        return 1
+      fi ;;
+    *) warn "unknown link mode: $mode"; return 1 ;;
+  esac
+}
+
+cmd_link() {
+  local mode="" url="" vis=""
+  while (($#)); do
+    case $1 in
+      --github)  mode=gh ;;
+      --public)  vis=public ;;
+      --private) vis=private ;;
+      -*)        die "unknown option for link: $1" ;;
+      *)         mode=url; url=$1 ;;
+    esac
+    shift
+  done
+  if [ -z "$mode" ]; then
+    choose_mode
+    mode=$MODE
+    [ -n "$mode" ] || die "usage: $NAME link URL   or   $NAME link --github [--public|--private]"
+  fi
+  setup_remote "$mode" "$url" "$(basename "$REPO")" "$vis"
+}
+
+cmd_unlink() {
+  local r
+  has_remote || { info "This repo is not linked to GitHub."; return 0; }
+  git remote -v
+  confirm "Remove the GitHub link (files and history stay, the GitHub repo is not touched)?" || { info "Cancelled."; return 0; }
+  for r in $(git remote); do git remote remove "$r"; done
+  info "Unlinked. Link again any time: $NAME link"
+}
+
+# ---------- managing the list of repos ----------
+
+cmd_list() {
+  reg_init
+  local act n p br ch st mark ahead behind
+  act=$(active_name)
+  if [ "$(reg_count)" = 0 ]; then info "No repos yet. Create one: $NAME new NAME"; return 0; fi
+  printf '%s\n' "${B}  NAME               BRANCH    STATE / PATH${N}"
+  while IFS=$'\t' read -r n p <&3; do
+    [ -n "$n" ] || continue
+    mark=' '; [ "$n" = "$act" ] && mark='*'
+    if [ ! -d "$p" ]; then
+      br="-"; st="${R}folder missing${N}"
+    elif ! git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      br="-"; st="not a git repo"
+    else
+      br=$(git -C "$p" branch --show-current 2>/dev/null); br=${br:-detached}
+      ch=$(git -C "$p" status --porcelain 2>/dev/null | wc -l)
+      if (( ch )); then st="$ch uncommitted"; else st="clean"; fi
+      if [ -z "$(git -C "$p" remote 2>/dev/null)" ]; then
+        st+=", no GitHub link"
+      elif git -C "$p" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+        read -r ahead behind < <(git -C "$p" rev-list --left-right --count 'HEAD...@{u}')
+        if (( ahead )); then st+=", $ahead to push"; fi
+        if (( behind )); then st+=", $behind to pull (as of the last fetch)"; fi
+      else
+        st+=", not uploaded yet"
+      fi
+    fi
+    printf '%s %-18s %-9s %s  %s\n' "$mark" "$n" "$br" "$st" "$(tilde "$p")"
+  done 3<"$LIST_FILE"
+  echo "(* = active repo; switch with: $NAME use NAME)"
+}
+
+cmd_use() {
+  reg_init
+  local n=${1:-} p
+  if [ -z "$n" ]; then pick_repo "Switch to which repo" || return 1; n=$PICKED; fi
+  reg_has "$n" || die "unknown repo '$n' (see: $NAME list)"
+  p=$(reg_path "$n")
+  set_active "$n"
+  info "Active repo: $n ($(tilde "$p"))"
+  [ -d "$p" ] || warn "its folder does not exist right now: $p"
+}
+
+cmd_current() {
+  reg_init
+  local n
+  n=$(active_name)
+  [ -n "$n" ] || die "no active repo (see: $NAME list)"
+  printf '%s  %s\n' "$n" "$(reg_path "$n" || echo '?')"
+}
+
+# new [NAME] [PATH] [--github|--remote URL|--local] [--public|--private]
+cmd_new() {
+  local name="" path="" mode="" url="" vis="" d outer top skipc="" hits
+  while (($#)); do
+    case $1 in
+      --github)  mode=gh ;;
+      --remote)  [ $# -ge 2 ] || die "--remote needs a URL"; mode=url; url=$2; shift ;;
+      --local)   mode=none ;;
+      --public)  vis=public ;;
+      --private) vis=private ;;
+      -*)        die "unknown option for new: $1" ;;
+      *)         if [ -z "$name" ]; then name=$1; elif [ -z "$path" ]; then path=$1; else die "too many arguments for new"; fi ;;
+    esac
+    shift
+  done
+  need_git
+  reg_init
+  git config user.name >/dev/null 2>&1 && git config user.email >/dev/null 2>&1 \
+    || die "git does not know your name and email yet. Set them once: git config --global user.name \"Your Name\"  and  git config --global user.email you@example.com"
+
+  if [ -z "$name" ]; then
+    is_tty || die "usage: $NAME new NAME [PATH] [--github|--remote URL|--local]"
+    ask "Name for the new repo:" || return 1; name=$REPLY
+  fi
+  valid_name "$name" || die "invalid name '$name' (letters, digits, . _ -, starting with a letter or digit)"
+  if reg_has "$name"; then die "a repo called '$name' is already in the list (see: $NAME list)"; fi
+  if [ -z "$path" ]; then
+    path=$PWD/$name
+    if is_tty; then ask "Folder:" "$(tilde "$path")" || return 1; path=$REPLY; fi
+  fi
+  abs_path "$path"; path=$REPLY
+  bad_path "$path" && die "tabs and newlines in paths are not supported"
+  [ "$path" != / ] && [ "$path" != "$HOME" ] || die "choose a folder of its own, not $path"
+  if d=$(reg_by_path "$path"); then die "that folder is already in the list as '$d'"; fi
+  if [ -e "$path" ] && [ ! -d "$path" ]; then die "$path exists and is not a folder"; fi
+
+  # nearest existing folder, to see whether we would be nested inside another repo
+  d=$path; while [ ! -d "$d" ]; do d=$(dirname "$d"); done
+  outer=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null || true)
+  if [ -d "$path" ] && [ -n "$outer" ] && [ "$outer" = "$(cd "$path" && pwd -P)" ]; then
+    die "$(tilde "$path") is already a git repo. Add it to the list instead: $NAME add $(tilde "$path")"
+  fi
+  if [ -n "$outer" ]; then warn "that folder is inside another git repo ($(tilde "$outer")); the new repo would be nested in it."; fi
+  if [ -d "$path" ] && [ -n "$(ls -A -- "$path" 2>/dev/null)" ]; then
+    confirm "The folder already has files. Turn it into a repo and commit them (nothing is deleted)?" \
+      || { info "Cancelled, nothing was changed."; return 1; }
+  fi
+
+  mkdir -p -- "$path" || die "cannot create $path"
+  path=$(cd "$path" && pwd -P) || die "cannot enter $path"
+  cd "$path" || die "cannot enter $path"
+  git init -q -b main 2>/dev/null || git init -q || die "git init failed"
+  make_ignore || true
+  git add -A
+  hits=$(secret_hits)
+  if [ -n "$hits" ]; then
+    warn "possible secrets in the first commit:"
+    printf '%s\n' "$hits" | cut -c1-160
+    confirm "Commit anyway?" || { git reset -q; skipc=1; warn "repo created, nothing committed yet"; }
+  fi
+  if [ -z "$skipc" ]; then
+    if git diff --cached --quiet; then info "Nothing to commit yet."
+    elif git commit -q -m "Initial commit"; then info "First commit made."
+    else warn "the first commit failed; commit later with: $NAME commit"; fi
+  fi
+
+  reg_add "$name" "$path"
+  set_active "$name"
+  info "Repo '$name' created at $(tilde "$path") and made the active repo."
+
+  if [ -z "$mode" ]; then
+    choose_mode
+    mode=${MODE:-none}
+  fi
+  setup_remote "$mode" "$url" "$name" "$vis" || true
+  return 0
+}
+
+cmd_add() {
+  local p="" name="" real top exist
+  while (($#)); do
+    case $1 in
+      -*) die "unknown option for add: $1" ;;
+      *)  if [ -z "$p" ]; then p=$1; elif [ -z "$name" ]; then name=$1; else die "too many arguments for add"; fi ;;
+    esac
+    shift
+  done
+  need_git
+  reg_init
+  abs_path "${p:-$PWD}"; p=$REPLY
+  [ -d "$p" ] || die "not a folder: $p"
+  real=$(cd "$p" && pwd -P) || die "cannot enter $p"
+  bad_path "$real" && die "tabs and newlines in paths are not supported"
+  if top=$(git -C "$real" rev-parse --show-toplevel 2>/dev/null); then
+    [ "$top" = "$real" ] || die "$(tilde "$real") is inside the repo $(tilde "$top"). Add that folder instead: $NAME add $top"
+  else
+    confirm "$(tilde "$real") is not a git repo yet. Run git init there?" || { info "Nothing changed."; return 1; }
+    git -C "$real" init -q -b main 2>/dev/null || git -C "$real" init -q || die "git init failed"
+    info "Empty repo created (save work in it with: $NAME commit)."
+  fi
+  if exist=$(reg_by_path "$real"); then info "Already in the list as '$exist'."; return 0; fi
+  name=${name:-$(basename "$real")}
+  if ! valid_name "$name"; then
+    is_tty && { ask "'$name' is not a usable name. Name for this repo:" || return 1; name=$REPLY; }
+    valid_name "$name" || die "invalid name '$name' (letters, digits, . _ -)"
+  fi
+  if reg_has "$name"; then die "the name '$name' is taken (by $(tilde "$(reg_path "$name")")). Pick another: $NAME add $real OTHERNAME"; fi
+  reg_add "$name" "$real"
+  info "Added '$name' ($(tilde "$real"))."
+  if [ -z "$(active_name)" ]; then set_active "$name"; info "It is now the active repo."
+  elif [ "$(active_name)" != "$name" ] && is_tty && confirm "Make it the active repo?"; then
+    set_active "$name"; info "Active repo: $name"
+  fi
+}
+
+cmd_clone() {
+  local url="" p="" base name real
+  while (($#)); do
+    case $1 in
+      -*) die "unknown option for clone: $1" ;;
+      *)  if [ -z "$url" ]; then url=$1; elif [ -z "$p" ]; then p=$1; else die "too many arguments for clone"; fi ;;
+    esac
+    shift
+  done
+  need_git
+  reg_init
+  if [ -z "$url" ]; then
+    is_tty || die "usage: $NAME clone URL [PATH]"
+    ask "Repo URL:" || return 1; url=$REPLY
+  fi
+  base=${url%/}; base=${base%.git}; base=${base##*/}; base=${base##*:}
+  name=$base
+  valid_name "$name" || die "cannot derive a repo name from that URL. Clone by hand, then: $NAME add PATH NAME"
+  if reg_has "$name"; then die "the name '$name' is already in the list. Clone by hand into another folder, then: $NAME add PATH OTHERNAME"; fi
+  if [ -z "$p" ]; then
+    p=$PWD/$name
+    if is_tty; then ask "Clone into:" "$(tilde "$p")" || return 1; p=$REPLY; fi
+  fi
+  abs_path "$p"; p=$REPLY
+  bad_path "$p" && die "tabs and newlines in paths are not supported"
+  [ ! -e "$p" ] || die "$p already exists"
+  git clone "$url" "$p" || die "clone failed"
+  real=$(cd "$p" && pwd -P) || die "cannot enter $p"
+  reg_add "$name" "$real"
+  info "Cloned and added '$name' ($(tilde "$real"))."
+  if [ -z "$(active_name)" ]; then set_active "$name"; info "It is now the active repo."
+  elif is_tty && confirm "Make it the active repo?"; then set_active "$name"; info "Active repo: $name"; fi
+}
+
+# forget: drop a repo from the list, keep every file
+cmd_forget() {
+  reg_init
+  local n=${1:-} p
+  if [ -z "$n" ]; then pick_repo "Forget which repo (its files stay)" || return 1; n=$PICKED; fi
+  reg_has "$n" || die "unknown repo '$n' (see: $NAME list)"
+  p=$(reg_path "$n")
+  confirm "Forget '$n' ($(tilde "$p"))? Its files and its GitHub repo are not touched." || { info "Cancelled."; return 0; }
+  reg_del "$n" || die "could not update the list"
+  info "Forgot '$n'. Add it back any time: $NAME add $(tilde "$p")"
+  fix_active_after_delete "$n"
+}
+
+# remove: unlink from GitHub, DELETE the folder, drop it from the list
+cmd_remove() {
+  reg_init
+  local n=${1:-} p real top size files dirty stash unpushed remotes r first_url=""
+  is_tty || die "remove asks for confirmation, so it needs a terminal"
+  if [ -z "$n" ]; then pick_repo "Remove which repo (this DELETES its folder)" || return 1; n=$PICKED; fi
+  reg_has "$n" || die "unknown repo '$n' (see: $NAME list)"
+  p=$(reg_path "$n")
+
+  if [ ! -d "$p" ]; then
+    warn "the folder $(tilde "$p") does not exist any more."
+    confirm "Just drop '$n' from the list?" || return 0
+    reg_del "$n" || die "could not update the list"
+    info "Removed '$n' from the list."; fix_active_after_delete "$n"; return 0
+  fi
+  [ ! -L "$p" ] || die "$(tilde "$p") is a symbolic link; refusing to delete through it. Use: $NAME forget $n"
+  real=$(cd "$p" && pwd -P) || die "cannot enter $p"
+  top=$(git -C "$real" rev-parse --show-toplevel 2>/dev/null) \
+    || die "$(tilde "$real") is not a git repo, so refusing to delete it. Use: $NAME forget $n"
+  [ "$top" = "$real" ] || die "$(tilde "$real") is only a folder inside the repo $(tilde "$top"); refusing. Use: $NAME forget $n"
+  [ "$real" != / ] && [ "$real" != "$HOME" ] || die "refusing to delete $real"
+  case $HOME/ in "$real"/*) die "refusing: $real contains your home folder" ;; esac
+  [[ ${real#/} == */* ]] || die "refusing to delete a top-level folder like $real"
+
+  size=$(du -sh -- "$real" 2>/dev/null | cut -f1)
+  files=$(git -C "$real" ls-files | wc -l)
+  dirty=$(git -C "$real" status --porcelain 2>/dev/null | wc -l)
+  stash=$(git -C "$real" stash list 2>/dev/null | wc -l)
+  remotes=$(git -C "$real" remote)
+  if git -C "$real" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    unpushed=$(git -C "$real" rev-list --count '@{u}..HEAD')
+  elif git -C "$real" rev-parse HEAD >/dev/null 2>&1; then
+    unpushed=$(git -C "$real" rev-list --count HEAD)
+  else
+    unpushed=0
+  fi
+
+  echo
+  echo "${B}Remove repo '$n'${N}"
+  echo "  folder    $(tilde "$real")  [${size:-?}, $files tracked file(s)]"
+  if [ -n "$remotes" ]; then
+    for r in $remotes; do
+      echo "  GitHub    $r -> $(git -C "$real" remote get-url "$r" 2>/dev/null)"
+      [ -n "$first_url" ] || first_url=$(git -C "$real" remote get-url "$r" 2>/dev/null)
+    done
+  else
+    echo "  GitHub    not linked"
+  fi
+  if (( dirty ));    then echo "  ${R}$dirty uncommitted change(s) will be lost${N}"; fi
+  if (( stash ));    then echo "  ${R}$stash stash entr(y/ies) will be lost${N}"; fi
+  if (( unpushed )); then echo "  ${R}$unpushed commit(s) are not on GitHub and will be lost${N}"; fi
+  case $SELF in "$real"/*) echo "  ${R}This folder contains the $NAME script itself and everything else installed in it.${N}" ;; esac
+  echo
+  echo "This will:"
+  if [ -n "$remotes" ]; then echo "  1. unlink it from GitHub (the GitHub repo itself is NOT deleted)"
+  else echo "  1. (nothing to unlink: no GitHub link)"; fi
+  echo "  2. delete the folder and EVERYTHING in it: .git, untracked and ignored files. No Trash, no undo."
+  echo "  3. drop '$n' from the $NAME list"
+  echo
+  ask "Type the repo name ($n) to confirm; anything else cancels:" || return 1
+  [ "$REPLY" = "$n" ] || { info "Cancelled, nothing was changed."; return 0; }
+
+  for r in $remotes; do git -C "$real" remote remove "$r" 2>/dev/null; done
+  cd "$HOME" 2>/dev/null || cd /
+  rm -rf -- "$real" || die "could not delete everything in $real (the list entry was kept)"
+  reg_del "$n" || warn "deleted, but could not update the list: $NAME forget $n"
+  info "Removed '$n' ($(tilde "$real") is gone)."
+  if [ -n "$first_url" ]; then
+    info "The GitHub repo is untouched: $first_url (delete it on github.com, or with: gh repo delete OWNER/REPO)"
+  fi
+  fix_active_after_delete "$n"
+}
+
+# ---------- help ----------
+usage() {
+  cat <<EOF
+${B}$NAME v$VERSION${N} - friendly git helper for your repos (formerly binvc)
+
+Run with no arguments for an interactive menu.
+
+Everyday commands (act on the ACTIVE repo; see which with: $NAME current)
+  status [-n]          checks GitHub (needs network), shows what changed and
+                       suggests the best next command. -n = skip the network
+  incoming             show what is on GitHub that you don't have yet (needs network)
+  diff [file]          show new files and edits since last commit (local only)
+  commit ["message"]   stage everything and commit (asks if no message)
+  push                 upload commits (and tags) to GitHub
+  pull                 download changes from GitHub
+  sync ["message"]     commit + pull + push in one go
+  log [n]              last n commits (default 15)
+  show <commit>        files changed in one commit
+  restore [file]       discard uncommitted edits in a file
+  fetchfile [file] [commit]
+                       bring back an older version of a file
+  undo                 undo the last commit (unpushed only), keep edits
+  tag [ver] [msg]      create a version tag, e.g. $NAME tag 1.2.0
+  tags                 list tags
+  scan                 look for passwords/tokens in tracked files
+  ignore               create a starter .gitignore
+  where                show the folder and the GitHub link
+
+GitHub link of the active repo
+  link [URL]           link an existing GitHub repo (and upload)
+  link --github [--public|--private]
+                       create a new GitHub repo with gh and upload (default: private)
+  unlink               remove the GitHub link (files and history stay)
+
+Your repos
+  list                 all repos with branch and state (* = active)
+  use [NAME]           switch the active repo (asks if no name)
+  current              name and folder of the active repo
+  new [NAME] [PATH] [--github|--remote URL|--local] [--public|--private]
+                       set up a new repo: git init, .gitignore, first commit,
+                       optional GitHub repo. It becomes the active repo
+  add [PATH] [NAME]    put an existing folder in the list (offers git init)
+  clone [URL] [PATH]   git clone and put it in the list
+  forget [NAME]        drop a repo from the list, keep all its files
+  remove [NAME]        unlink from GitHub and DELETE the folder (type the name to
+                       confirm; the GitHub repo is not deleted)
+
+  help                 this text
+  -V, --version        print the version
+
+The list lives in $CONF_DIR.
+Override for one run: REPOS_REPO=/path $NAME status   (BINVC_REPO still works)
+EOF
+}
+
+# ---------- menu ----------
+
+# Run one menu action in its own subshell: an error (die) inside it ends only
+# that action, not the whole menu. Everyday actions first enter the active repo.
+run_item() { ( "$@" ) || true; }
+run_git()  { ( need_repo && "$@" ) || true; }
+
+repo_menu() {
+  local c
+  while true; do
+    echo
+    echo "${B}$NAME v$VERSION${N}  repos   (active: $(active_name))"
+    cat <<'EOF'
+  1) List repos              6) Link active repo to GitHub
+  2) Switch repo             7) Unlink active repo from GitHub
+  3) New repo                8) Forget a repo (keeps files)
+  4) Add existing folder     9) Remove a repo (DELETES folder)
+  5) Clone from GitHub       b) Back
+EOF
+    read -r -p "Choose: " c || break
+    echo
+    case "$c" in
+      1) run_item cmd_list ;;
+      2) run_item cmd_use ;;
+      3) run_item cmd_new ;;
+      4) run_item cmd_add ;;
+      5) run_item cmd_clone ;;
+      6) run_git cmd_link ;;
+      7) run_git cmd_unlink ;;
+      8) run_item cmd_forget ;;
+      9) run_item cmd_remove ;;
+      b|B|q|Q|"") break ;;
+      *) warn "unknown choice" ;;
+    esac
+  done
+}
+
+menu() {
+  local c p act
+  reg_init
+  while true; do
+    act=$(active_name); p=""
+    if [ -n "$act" ]; then p=$(reg_path "$act" || true); fi
+    echo
+    echo "${B}$NAME v$VERSION${N}  active repo: ${act:-none}${p:+  ($(tilde "$p"))}"
+    cat <<'EOF'
+  1) Status           7) Restore a file
+  2) Show changes     8) Get older version of a file
+  3) Commit           9) Undo last commit
+  4) Push            10) Tag a version
+  5) Sync (all-in-1) 11) Scan for secrets
+  6) Log             12) Create .gitignore
+ 13) What's new on GitHub
+ 14) Switch repo    15) Manage repos (new, add, clone, remove...)
+  q) Quit
+EOF
+    read -r -p "Choose: " c || break
+    echo
+    case "$c" in
+      1) run_git cmd_status ;;
+      2) run_git cmd_diff ;;
+      3) run_git cmd_commit ;;
+      4) run_git cmd_push ;;
+      5) run_git cmd_sync ;;
+      6) run_git cmd_log ;;
+      7) run_git cmd_restore ;;
+      8) run_git cmd_fetchfile ;;
+      9) run_git cmd_undo ;;
+      10) run_git cmd_tag ;;
+      11) run_git cmd_scan ;;
+      12) run_git cmd_ignore ;;
+      13) run_git cmd_incoming ;;
+      14) run_item cmd_use ;;
+      15) repo_menu ;;
+      q|Q) break ;;
+      *) warn "unknown choice" ;;
+    esac
+  done
+}
+
+# ---------- main ----------
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  # these need neither git nor a repo
+  case "$cmd" in
+    version|-v|-V|--version) echo "$NAME v$VERSION"; return 0 ;;
+    help|-h|--help)          usage; return 0 ;;
+    "")                      if [ -t 0 ] && [ -t 1 ]; then need_git; menu; else usage; fi; return 0 ;;
+    list|ls)                 need_git; cmd_list "$@"; return ;;
+    use|switch)              cmd_use "$@"; return ;;
+    current)                 cmd_current "$@"; return ;;
+    new|init)                cmd_new "$@"; return ;;
+    add)                     cmd_add "$@"; return ;;
+    clone)                   cmd_clone "$@"; return ;;
+    forget)                  cmd_forget "$@"; return ;;
+    remove)                  need_git; cmd_remove "$@"; return ;;
+    status|st|s|incoming|in|diff|d|commit|c|push|p|pull|sync|log|l|show|restore|fetchfile|old|undo|tag|tags|scan|ignore|where|link|unlink) ;;
+    *) warn "unknown command: $cmd"; usage; exit 1 ;;
+  esac
+  need_repo
+  case "$cmd" in
+    status|st|s)       cmd_status "$@" ;;
+    incoming|in)       cmd_incoming ;;
+    diff|d)            cmd_diff "$@" ;;
+    commit|c)          cmd_commit "$@" ;;
+    push|p)            cmd_push ;;
+    pull)              cmd_pull ;;
+    sync)              cmd_sync "$@" ;;
+    log|l)             cmd_log "$@" ;;
+    show)              cmd_show "$@" ;;
+    restore)           cmd_restore "$@" ;;
+    fetchfile|old)     cmd_fetchfile "$@" ;;
+    undo)              cmd_undo ;;
+    tag)               cmd_tag "$@" ;;
+    tags)              cmd_tags ;;
+    scan)              cmd_scan ;;
+    ignore)            cmd_ignore ;;
+    where)             cmd_where ;;
+    link)              cmd_link "$@" ;;
+    unlink)            cmd_unlink ;;
+  esac
+}
+
+main "$@"
