@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (3.2.0):
-#   - Faster 'appimgr update': the update checks run in parallel (4 at a time; -j N or
-#     APPIMGR_JOBS) and are printed in app order. Ctrl+C stops the jobs and cleans up.
-#   - Downloads use aria2c when it is installed: several connections per file, and for
-#     'update' all files at once with one progress line. Otherwise curl, as before.
-#     --no-aria2 or APPIMGR_DOWNLOADER=curl forces curl. A file that fails in the batch is
-#     downloaded again on its own (aria2c, then curl). Installing still happens one app
-#     at a time. Free disk space is checked before a batch download.
-#   - GITHUB_TOKEN (environment only) raises GitHub's limit from 60 to 5000 requests per
-#     hour. It is sent only to api.github.com, never printed, and not passed on to AppImages.
-#   - A GitHub rate limit (with reset time), a rejected token or a missing repo is now
-#     reported as such. When the API failed while searching older releases, the message
-#     wrongly said that no release had a matching asset.
-#   - Fix: check_one built the .desktop path from the caller's $slug (a "local a=$1 b=$a"
-#     line expands both before assigning); it only worked because callers happened to
-#     pass the same value.
-VERSION="3.2.0"
+# NEW IN THIS VERSION (3.3.0):
+#   - New: 'appimgr remove <slug> --purge-data' also looks for the app's leftover data
+#     (config, cache, data, state). An AppImage does not say where it keeps its files, so
+#     the search is by name: entries in ~/.config, ~/.cache, ~/.local/share, ~/.local/state
+#     (and hidden folders in ~) whose name equals the app's slug, display name or window
+#     class, ignoring case and punctuation. You get a list with sizes and pick what to
+#     delete; with -y nothing found this way is deleted. On a terminal, plain 'remove'
+#     (and the menu) asks "Also look for leftover data?". Caches are deleted for good,
+#     everything else goes to the Trash (--purge = permanently).
+#   - New: portable mode, for apps you only want for a while. 'appimgr add ... --portable'
+#     (or 'appimgr portable <slug> on|off|status') keeps all of an app's data in
+#     <slug>.AppImage.home next to the AppImage, so 'remove --purge-data' deletes it exactly,
+#     with no guessing. Existing settings are not moved, and the app no longer sees your real
+#     home. Kept across updates. The menu has a matching entry and an "add" question.
+#   - 'list -l' shows where each app's data lives. 'remove' warns when a portable data folder
+#     is kept, and refuses --purge-data while the app is running.
+#   - The Trash helper now also names folders correctly when a name is already taken.
+#   - The 3.2.0 entry is replaced by this one.
+VERSION="3.3.0"
 #
 set -euo pipefail
 
@@ -35,7 +37,7 @@ warn() { echo "warning: $*" >&2; }
 info() { echo ":: $*"; }
 
 TMP_DIR=""; STAGE_FILE=""; DL_DIR=""; SCRATCH=""; BATCH_DIR=""
-SAVED=(); PF=()
+SAVED=(); PF=(); LEFT=()
 L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""; L_MATCHES=0
 STATUS=""; DL_ETAG=""
 JOBS="${APPIMGR_JOBS:-4}"
@@ -79,10 +81,13 @@ Usage:
   appimgr rollback <slug>                  Swap back to the previous version
   appimgr icon <slug> [<file>|--reset]     Show / change the icon (PNG or SVG)
   appimgr source [<slug> [set ...|clear]]  Show/set/clear the update source (no args = how-to)
+  appimgr portable <slug> [on|off|status]  Keep the app's data in its own folder (see "Leftover data")
   appimgr run <slug> [-d] [args...]        Launch from the terminal (-d = detached)
   appimgr list [-l]                        List integrated AppImages (-l = details)
-  appimgr remove <slug> [-y] [--purge]     Remove the app; the AppImage goes to the Trash
-                                           (-y = no prompt, --purge = delete permanently)
+  appimgr remove <slug> [-y] [--purge] [--purge-data]
+                                           Remove the app; the AppImage goes to the Trash
+                                           (-y = no prompt, --purge = delete permanently,
+                                           --purge-data = also remove its leftover data)
   appimgr version | --version
 
 Options for add / update <slug> <file>:
@@ -93,6 +98,8 @@ Options for add / update <slug> <file>:
       --no-fuse         Force extract-and-run mode (APPIMAGE_EXTRACT_AND_RUN=1).
                         Without it, FUSE is checked and this is enabled automatically if needed.
       --no-move         Keep the original file (default: it is deleted after success)
+      --portable        Keep all of the app's data in <slug>.AppImage.home next to the
+                        AppImage (remembered across updates; see "Leftover data")
 
 Options for add <link> / --repo (downloads):
       --repo OWNER/REPO Take the AppImage from this GitHub project's release
@@ -117,8 +124,27 @@ Downloads:
   'update' fetches all files at once with a single progress line. A file that fails is
   downloaded again on its own (aria2c, then curl). Installing always happens one app at a time.
 
+Leftover data:
+  An AppImage does not say where it keeps its settings, so appimgr cannot know for sure.
+  Two ways to deal with that:
+  * Long-term apps: 'remove --purge-data' (or the "Also look for leftover data?" question
+    that 'remove' asks on a terminal) searches ~/.config, ~/.cache, ~/.local/share,
+    ~/.local/state and hidden folders in ~ for entries named like the app: its slug,
+    display name or window class, ignoring case and punctuation (3+ characters, system
+    folders skipped). You get a list with sizes and choose what to delete. With -y nothing
+    found this way is deleted. Apps that use an unrelated folder name are not found.
+  * Temporary apps: portable mode ('add --portable', or 'portable <slug> on') keeps all the
+    app's data in <slug>.AppImage.home next to the AppImage, so the data is known exactly
+    and 'remove --purge-data' deletes it without guessing, even with -y. Existing settings
+    are not moved, the app starts empty, and it no longer sees your real home (its file
+    dialog opens in the portable home, your desktop theme settings are not read, ...).
+    Run the app from a terminal (appimgr run <slug>) to see the runtime confirm it.
+  Caches (~/.cache) are deleted permanently; everything else goes to the Trash, or is deleted
+  permanently with --purge.
+
 Layout:
   $APPS_DIR/<slug>.AppImage
+  $APPS_DIR/<slug>.AppImage.home   (portable mode only)
   $APPS_DIR/.icons/  .meta/  .backup/
   $DESKTOP_DIR/appimage-<slug>.desktop
 
@@ -188,6 +214,12 @@ set_jobs() { # <N>
 
 use_aria() { (( USE_ARIA )) && command -v aria2c >/dev/null 2>&1; }
 
+# ~ instead of the home folder, for messages
+tilde() { local t='~'; printf '%s' "${1/#$HOME/$t}"; }
+
+# Folder next to the AppImage that the AppImage runtime uses as $HOME when it exists.
+portable_dir() { printf '%s' "$APPS_DIR/$1.AppImage.home"; }
+
 # ---------- small metadata store: $APPS_DIR/.meta/<slug>.conf (key=value) ----------
 meta_get() { # <slug> <key>
   local f="$META_DIR/$1.conf"
@@ -210,6 +242,7 @@ saved_opts() { # <slug> -> fills SAVED with the options used at install time
   v=$(meta_get "$1" args);   if [[ -n $v ]]; then SAVED+=(--args "$v"); fi
   v=$(meta_get "$1" nofuse); if [[ $v == 1 ]]; then SAVED+=(--no-fuse); fi
   v=$(meta_get "$1" icon);   if [[ -n $v && -f $v ]]; then SAVED+=(--icon "$v"); fi
+  if [[ -d $(portable_dir "$1") ]]; then SAVED+=(--portable); fi
 }
 
 desktop_path() { grep -m1 '^X-AppImage-Path=' "$1" | cut -d= -f2- || true; }
@@ -887,7 +920,7 @@ choose_source() { # <slug> <appimage> <link candidate or ''> <nosource 0|1> <ins
 # ---------- add ----------
 cmd_add() {
   local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force="" icon_arg="" asked=0
-  local repo_arg="" asset_arg="" tag_arg="" nosource=0 remote=0
+  local repo_arg="" asset_arg="" tag_arg="" nosource=0 remote=0 portable=0
   while (($#)); do
     case $1 in
       -n|--name)  name=${2:?missing value for $1}; shift 2 ;;
@@ -898,6 +931,7 @@ cmd_add() {
       --no-move)  move=0; shift ;;
       --no-fuse)  nofuse=1; forced=1; shift ;;
       --no-aria2) USE_ARIA=0; shift ;;
+      --portable) portable=1; shift ;;
       --repo)     repo_arg=${2:?missing value for $1}; shift 2 ;;
       --asset)    asset_arg=${2:?missing value for $1}; shift 2 ;;
       --tag)      tag_arg=${2:?missing value for $1}; shift 2 ;;
@@ -1020,6 +1054,12 @@ cmd_add() {
   fi
   mv -f "$stage" "$dest"
 
+  # --- portable mode: the AppImage runtime uses <file>.AppImage.home as $HOME when it exists ---
+  if (( portable )); then
+    mkdir -p -- "$dest.home"
+    info "portable mode: the app's data goes to $(tilde "$dest.home")"
+  fi
+
   # --- icon (stored next to the AppImages, referenced by absolute path) ---
   local icon_id="application-x-executable"
   find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
@@ -1103,6 +1143,7 @@ EOF
   echo "   slug:    $slug"
   echo "   binary:  $dest"
   if (( nofuse )); then echo "   mode:    extract-and-run (no FUSE)"; else echo "   mode:    normal (FUSE)"; fi
+  if [[ -d $dest.home ]]; then echo "   data:    portable ($(tilde "$dest.home"))"; fi
   echo "   entry:   $out"
 
   choose_source "$slug" "$dest" "$R_SOURCE" "$nosource" "$R_ASSET"
@@ -1330,7 +1371,7 @@ cmd_update() {
       -j|--jobs)  set_jobs "${2:?missing value for $1}"; shift 2 ;;
       --no-aria2) USE_ARIA=0; shift ;;
       -n|--name|-a|--args|-i|--icon) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
-      --no-fuse|--no-move|--move) pass+=("$1"); shift ;;
+      --no-fuse|--no-move|--move|--portable) pass+=("$1"); shift ;;
       -*)         die "unknown option: $1" ;;
       *)
         if (( all )); then die "unexpected argument: $1"
@@ -1447,14 +1488,16 @@ urlencode_path() { # percent-encode a path for .trashinfo
   printf '%s' "$out"
 }
 
-# Moves a file into the freedesktop.org home Trash (restorable from file managers
-# or with trash-cli). Prints the name it has in the Trash.
-trash_file() { # <file>
+# Moves a file or folder into the freedesktop.org home Trash (restorable from file
+# managers or with trash-cli). Prints the name it has in the Trash.
+trash_file() { # <file or folder>
   local f=$1 tdir="$DATA_HOME/Trash" base target n=1
   mkdir -p "$tdir/files" "$tdir/info"
   base=$(basename -- "$f"); target=$base
   while [[ -e $tdir/files/$target || -e $tdir/info/$target.trashinfo ]]; do
-    n=$((n+1)); target="${base%.*}.$n.${base##*.}"
+    n=$((n+1))
+    if [[ $base == ?*.* ]]; then target="${base%.*}.$n.${base##*.}"   # foo.AppImage -> foo.2.AppImage
+    else target="$base.$n"; fi                                       # Foo / .foo   -> Foo.2 / .foo.2
   done
   printf '[Trash Info]\nPath=%s\nDeletionDate=%s\n' \
     "$(urlencode_path "$(readlink -f -- "$f")")" "$(date +%Y-%m-%dT%H:%M:%S)" > "$tdir/info/$target.trashinfo"
@@ -1464,22 +1507,122 @@ trash_file() { # <file>
   printf '%s' "$target"
 }
 
+# ---------- leftover data ----------
+# Delete one data file/folder: caches for good (they can be rebuilt), the rest to the Trash
+# unless permanent=1. Refuses anything that is not clearly inside your home or the AppImage folder.
+discard() { # <path> <permanent 0|1>
+  local p=$1 perm=${2:-0}
+  [[ -n $p && ( $p == "$HOME"/?* || $p == "$APPS_DIR"/?* ) ]] || return 1
+  [[ -e $p || -L $p ]] || return 0
+  case $p in "${XDG_CACHE_HOME:-$HOME/.cache}"/*) perm=1 ;; esac
+  if (( perm )); then
+    rm -rf -- "$p"
+  else
+    trash_file "$p" >/dev/null || return 1
+  fi
+}
+
+# Lowercase letters and digits only, result in REPLY: "Foo-Bar 2" -> "foobar2"
+norm_name() { local s=${1,,}; REPLY=${s//[^[:alnum:]]/}; }
+
+# Fills LEFT[] with folders/files that look like they belong to the app. The match is by name only
+# (exact, ignoring case and punctuation), so it is a list to review, never an automatic deletion.
+find_leftovers() { # <slug> <desktop file>
+  local slug=$1 df=$2 c root e b key n want=" " seen=$'\n' entries=() cand=()
+  LEFT=()
+  cand+=("$slug")
+  if [[ -f $df ]]; then
+    cand+=("$(grep -m1 '^Name=' "$df" | cut -d= -f2- || true)")
+    cand+=("$(grep -m1 '^StartupWMClass=' "$df" | cut -d= -f2- || true)")
+  fi
+  for c in "${cand[@]}"; do
+    norm_name "$c"; n=$REPLY
+    if (( ${#n} >= 3 )) && [[ $want != *" $n "* ]]; then want+="$n "; fi
+  done
+  [[ $want != " " ]] || return 0
+  for root in "${XDG_CONFIG_HOME:-$HOME/.config}" "${XDG_CACHE_HOME:-$HOME/.cache}" \
+              "$DATA_HOME" "${XDG_STATE_HOME:-$HOME/.local/state}" "$HOME"; do
+    [[ -d $root ]] || continue
+    if [[ $root == "$HOME" ]]; then entries=("$root"/.[!.]*); else entries=("$root"/*); fi
+    for e in "${entries[@]}"; do
+      [[ -e $e || -L $e ]] || continue
+      [[ $e == "$APPS_DIR" || $e == "$APPS_DIR".* ]] && continue
+      b=${e##*/}; key=${b#.}
+      case ${key,,} in *.conf|*.ini|*.json|*.toml|*.cfg|*.yaml|*.yml) key=${key%.*} ;; esac
+      norm_name "$key"; n=$REPLY
+      [[ -n $n && $want == *" $n "* ]] || continue
+      case $n in   # folders that belong to the system or to other tools, even if an app shares the name
+        appimages|applications|autostart|systemd|dconf|fish|nvim|vim|gtk|gtk20|gtk30|gtk40|pulse|pipewire|wireplumber|\
+        mime|icons|fonts|fontconfig|themes|trash|flatpak|keyrings|kde|kdeglobals|plasma|dolphin|niri|dms|quickshell|\
+        snapper|git|ssh|gnupg|mozilla|chromium|config|cache|local|share|state|bin|var|steam|wine|python|pip|npm|\
+        cargo|rustup|mesa|nvidia|thumbnails|userdirs|xdg|nautilus|environmentd) continue ;;
+      esac
+      if [[ $seen == *$'\n'"$e"$'\n'* ]]; then continue; fi
+      seen+="$e"$'\n'
+      LEFT+=("$e")
+    done
+  done
+}
+
+# After the app is gone: delete its portable data folder (certain), then offer the by-name list.
+handle_data() { # <portable folder or ''> <permanent 0|1> <yes 0|1>
+  local pdir=$1 purge=$2 yes=$3 i size p tok nums=() pick=()
+  if [[ -n $pdir && -d $pdir ]]; then
+    size=$(du -sh -- "$pdir" 2>/dev/null | cut -f1 || true)
+    if discard "$pdir" "$purge"; then info "portable data removed (${size:-?}): $(tilde "$pdir")"
+    else warn "could not remove the portable data folder: $pdir"; fi
+  fi
+  if (( ${#LEFT[@]} == 0 )); then
+    info "no other leftover data found by name (an app can use any folder name: check ~/.config, ~/.cache and ~/.local/share yourself)"
+    return 0
+  fi
+  info "possible leftover data, matched by name only:"
+  for i in "${!LEFT[@]}"; do
+    size=$(du -sh -- "${LEFT[i]}" 2>/dev/null | cut -f1 || true)
+    printf '   %2d) %7s  %s\n' $((i+1)) "${size:-?}" "$(tilde "${LEFT[i]}")"
+  done
+  if (( yes )) || [[ ! -t 0 ]]; then
+    info "none of these was deleted (a name match needs your choice); remove them by hand if they are the app's"
+    return 0
+  fi
+  ask "   Delete which? numbers separated by spaces, a = all, Enter = none: " || return 0
+  if [[ -z $REPLY ]]; then info "nothing deleted"; return 0; fi
+  if [[ $REPLY == [Aa] ]]; then
+    pick=("${LEFT[@]}")
+  else
+    read -ra nums <<<"$REPLY" || true
+    for tok in ${nums[@]+"${nums[@]}"}; do
+      if [[ $tok =~ ^[0-9]{1,4}$ ]] && (( 10#$tok >= 1 && 10#$tok <= ${#LEFT[@]} )); then
+        pick+=("${LEFT[10#$tok-1]}")
+      else
+        warn "ignored: $tok"
+      fi
+    done
+  fi
+  for p in ${pick[@]+"${pick[@]}"}; do
+    if discard "$p" "$purge"; then info "removed: $(tilde "$p")"; else warn "could not remove: $p"; fi
+  done
+}
+
 cmd_remove() {
-  local slug="" yes=0 purge=0
+  local slug="" yes=0 purge=0 pdata=0
   while (($#)); do
     case $1 in
-      -y|--yes) yes=1; shift ;;
-      --purge)  purge=1; shift ;;
-      -*)       die "unknown option: $1" ;;
-      *)        if [[ -z $slug ]]; then slug=$1; else die "unexpected argument: $1"; fi; shift ;;
+      -y|--yes)    yes=1; shift ;;
+      --purge)     purge=1; shift ;;
+      --purge-data) pdata=1; shift ;;
+      -*)          die "unknown option: $1" ;;
+      *)           if [[ -z $slug ]]; then slug=$1; else die "unexpected argument: $1"; fi; shift ;;
     esac
   done
   [[ -n $slug ]] || { usage; exit 1; }
-  local df="$DESKTOP_DIR/appimage-$slug.desktop" path="" name has_file=0 trashed=""
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" path="" name has_file=0 trashed="" pdir has_pdir=0
   [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
   path=$(desktop_path "$df")
   name=$(grep -m1 '^Name=' "$df" | cut -d= -f2- || true)
   if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then has_file=1; fi
+  pdir=$(portable_dir "$slug")
+  if [[ -d $pdir ]]; then has_pdir=1; fi
 
   if (( ! yes )); then
     info "remove '${name:-$slug}' ($slug)?"
@@ -1487,7 +1630,20 @@ cmd_remove() {
     if (( has_file && purge )); then echo "   - the AppImage is deleted PERMANENTLY"
     elif (( has_file )); then echo "   - the AppImage is moved to the Trash (restorable)"; fi
     if [[ -f $BACKUP_DIR/$slug.AppImage ]]; then echo "   - the previous version (rollback copy) is deleted"; fi
+    if (( has_pdir && pdata )); then echo "   - its portable data folder is deleted ($(tilde "$pdir"))"
+    elif (( has_pdir )); then echo "   - its portable data folder is KEPT ($(tilde "$pdir")); add --purge-data to delete it"; fi
+    if (( pdata )); then echo "   - you choose which leftover data found by name is deleted"; fi
     if ! confirm "Continue?" n; then info "cancelled (non-interactive? use -y)"; return 0; fi
+    if (( ! pdata )) && [[ -t 0 ]]; then
+      if confirm "Also look for leftover data (config, cache, ...)?" n; then pdata=1; fi
+    fi
+  fi
+
+  if (( pdata )); then
+    if command -v pgrep >/dev/null 2>&1 && [[ -n $path ]] && pgrep -f -- "$path" >/dev/null 2>&1; then
+      die "$slug seems to be running: close it first (nothing was removed)"
+    fi
+    find_leftovers "$slug" "$df"   # reads the names from the launcher entry, so it must run before that is deleted
   fi
 
   if (( has_file )); then
@@ -1503,10 +1659,57 @@ cmd_remove() {
   refresh
   info "removed: $slug"
   if [[ -n $trashed ]]; then info "AppImage moved to Trash as '$trashed' (restore it from your file manager)"; fi
+
+  if (( pdata )); then
+    handle_data "$( if (( has_pdir )); then echo "$pdir"; fi )" "$purge" "$yes"
+  elif (( has_pdir )); then
+    info "its portable data folder was kept: $(tilde "$pdir") (delete it yourself, or next time use --purge-data)"
+  fi
+}
+
+# ---------- portable mode ----------
+cmd_portable() {
+  local slug=${1:-} action=${2:-status} yes=0 df pdir size
+  [[ -n $slug ]] || { usage; exit 1; }
+  shift || true; shift || true
+  while (($#)); do
+    case $1 in
+      -y|--yes) yes=1; shift ;;
+      *)        die "unexpected argument: $1" ;;
+    esac
+  done
+  df="$DESKTOP_DIR/appimage-$slug.desktop"
+  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+  pdir=$(portable_dir "$slug")
+  case $action in
+    status)
+      if [[ -d $pdir ]]; then
+        size=$(du -sh -- "$pdir" 2>/dev/null | cut -f1 || true)
+        echo "$slug: portable ($(tilde "$pdir"), ${size:-?})"
+      else
+        echo "$slug: not portable (the app uses your real home)"
+      fi ;;
+    on)
+      if [[ -d $pdir ]]; then info "$slug: already portable ($(tilde "$pdir"))"; return 0; fi
+      mkdir -p -- "$pdir"
+      info "$slug: portable mode on. Data now goes to $(tilde "$pdir")"
+      info "existing settings are not moved: the app starts empty, and it no longer sees your real home" ;;
+    off)
+      if [[ ! -d $pdir ]]; then info "$slug: already not portable"; return 0; fi
+      size=$(du -sh -- "$pdir" 2>/dev/null | cut -f1 || true)
+      if (( ! yes )); then
+        if ! confirm "Move the portable data (${size:-?}) to the Trash and use your real home again?" n; then
+          info "cancelled (non-interactive? use -y)"; return 0
+        fi
+      fi
+      discard "$pdir" 0 || die "could not move $pdir to the Trash"
+      info "$slug: portable mode off. The data folder is in the Trash" ;;
+    *) die "unknown action '$action' (use: on | off | status)" ;;
+  esac
 }
 
 print_long() { # <slug> <name> <path> <desktop file>
-  local slug=$1 name=$2 path=$3 f=$4 size mode ver inst src args bak=no
+  local slug=$1 name=$2 path=$3 f=$4 size mode ver inst src args bak=no data pdir psize
   size=$(du -h -- "$path" 2>/dev/null | cut -f1 || true)
   if grep -q '^Exec=env APPIMAGE_EXTRACT_AND_RUN=1' "$f"; then mode="extract-and-run (no FUSE)"; else mode="normal (FUSE)"; fi
   ver=$(meta_get "$slug" version)
@@ -1518,6 +1721,13 @@ print_long() { # <slug> <name> <path> <desktop file>
   if [[ -f $BACKUP_DIR/$slug.AppImage ]]; then
     bak="yes ($(du -h -- "$BACKUP_DIR/$slug.AppImage" | cut -f1))"
   fi
+  pdir=$(portable_dir "$slug")
+  if [[ -d $pdir ]]; then
+    psize=$(du -sh -- "$pdir" 2>/dev/null | cut -f1 || true)
+    data="portable: $(tilde "$pdir")  [${psize:-?}]"
+  else
+    data="your home (see: appimgr remove --purge-data)"
+  fi
   printf '%s  (%s)\n' "$slug" "$name"
   printf '   %-10s %s\n' "binary"    "$path${size:+  [$size]}"
   printf '   %-10s %s\n' "installed" "${inst:--}"
@@ -1525,6 +1735,7 @@ print_long() { # <slug> <name> <path> <desktop file>
   printf '   %-10s %s\n' "mode"      "$mode"
   printf '   %-10s %s\n' "args"      "${args:--}"
   printf '   %-10s %s\n' "source"    "$src"
+  printf '   %-10s %s\n' "data"      "$data"
   printf '   %-10s %s\n' "rollback"  "$bak"
   printf '   %-10s %s\n' "entry"     "$f"
 }
@@ -1662,13 +1873,13 @@ pick_app() { # <prompt> [all] -> PICKED (slug, or --all)
 }
 
 menu_add() {
-  local i f size file="" tilde='~' args=() remote=0
+  local i f size file="" tilde_c='~' args=() remote=0
   find_candidates
   if ((${#CANDS[@]})); then
     info "AppImage files found:"
     for i in "${!CANDS[@]}"; do
       f=${CANDS[i]}; size=$(du -h -- "$f" | cut -f1)
-      printf '   %2d) %s  [%s]\n' $((i+1)) "${f/#$HOME/$tilde}" "$size"
+      printf '   %2d) %s  [%s]\n' $((i+1)) "${f/#$HOME/$tilde_c}" "$size"
     done
     ask "   Number, path to an .AppImage, download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
   else
@@ -1691,6 +1902,8 @@ menu_add() {
   fi
   ask "   Display name (Enter = auto-detect): " || return 0
   if [[ -n $REPLY ]]; then args+=(--name "$REPLY"); fi
+  ask "   Keep this app's data in its own folder (portable), so removing it leaves nothing behind? [y/N] " || return 0
+  if [[ $REPLY == [Yy]* ]]; then args+=(--portable); fi
   if (( ! remote )) && ! confirm "Delete the original file after integrating?" y; then args+=(--no-move); fi
   if [[ -n $file ]]; then args+=("$file"); fi
   run_self add "${args[@]}"
@@ -1744,6 +1957,20 @@ menu_icon() {
   esac
 }
 
+menu_portable() {
+  local slug
+  pick_app "Portable mode for which app" || return 0
+  slug=$PICKED
+  run_self portable "$slug" status
+  ask "   [e]nable, [d]isable, Enter = keep as is: " || return 0
+  case $REPLY in
+    e|E|on)   run_self portable "$slug" on ;;
+    d|D|off)  run_self portable "$slug" off ;;
+    "") ;;
+    *) warn "unknown choice: $REPLY" ;;
+  esac
+}
+
 cmd_menu() {
   local first=1
   while true; do
@@ -1766,8 +1993,9 @@ cmd_menu() {
   5) Update apps
   6) Roll back to previous version
   7) Set update source
-  8) Remove an app
+  8) Remove an app (and optionally its leftover data)
   9) Change an app's icon
+ 10) Portable mode (an app's data in its own folder)
   h) Full help        q) Quit (or Enter)
 EOF
     ask "Choose: " || break
@@ -1781,6 +2009,7 @@ EOF
       7|s|source)    menu_source ;;
       8|rm|remove)   if pick_app "Remove which app"; then run_self remove "$PICKED"; fi ;;
       9|i|icon)      menu_icon ;;
+      10|p|portable) menu_portable ;;
       h|help|'?')    usage ;;
       q|Q|quit|exit|"") break ;;
       *)             warn "unknown choice: $REPLY" ;;
@@ -1797,6 +2026,7 @@ case "${1:-}" in
   rollback)          shift; cmd_rollback "$@" ;;
   icon)              shift; cmd_icon "$@" ;;
   source)            shift; cmd_source "$@" ;;
+  portable)          shift; cmd_portable "$@" ;;
   run)               shift; cmd_run "$@" ;;
   remove|rm)         shift; cmd_remove "$@" ;;
   list|ls)           shift; cmd_list "$@" ;;
