@@ -45,9 +45,10 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 | Script | What it does | Portability | Changes your system? |
 |---|---|---|---|
 | [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; update from GitHub, roll back, remove | Most Linux desktops | Yes (`~/.local/share`) |
-| [`binvc`](#binvc) | Friendly git helper for the scripts repo itself | Anywhere with git | Yes (git commits/pushes) |
+| [`binvc`](#binvc) | Friendly git helper for the scripts repo itself (the older, single-repo version of `repos`) | Anywhere with git | Yes (git commits/pushes) |
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
 | [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
+| [`repos`](#repos) | Git helper for several repos: set up, switch, link to GitHub, remove, plus everyday git | Anywhere with git (`gh` optional) | Yes (git commits/pushes, **can delete repo folders**) |
 | [`shelf`](#shelf) | Menu launcher for every script in `~/.local/bin` | Anywhere (nicer with `fzf`) | No |
 | [`stage`](#stage) | Save Niri window layouts as one-key profiles and restore them | **Niri only** | Yes (edits Niri config) |
 | [`syscheck`](#syscheck) | Read-only health report for Arch + Niri + DMS | **Arch, tuned to my laptop** | No (read-only) |
@@ -80,6 +81,8 @@ Makes AppImages behave like installed apps.
 ### binvc
 
 A small, friendly wrapper around git for the `~/.local/bin` scripts repo.
+
+> `repos` (below) is the newer version: it does everything `binvc` does and can also manage several repos. I'm keeping `binvc` around for now in case I don't get on with `repos`. It only knows one repo.
 
 - `status` suggests the next best command (commit, push, pull, sync) based on local and remote state.
 - `sync "message"` commits, pulls with rebase and pushes in one go.
@@ -116,6 +119,23 @@ Run `fbackup --check` to see what's missing.
 - `--dry-run` shows what would happen without changing anything.
 
 **Needs:** `bash` and coreutils.
+
+### repos
+
+The successor to `binvc`: a git helper that keeps a list of my repos, with one "active" repo that the everyday commands act on.
+
+- **Everyday git, same as `binvc`:** `status` (suggests the next command), `commit`, `push`, `pull`, `sync "message"`, `log`, `undo`, `tag`, secret scan, and so on. These act on the active repo, and commands that change something print which repo they are working on first.
+- **Set up a repo:** `repos new NAME` runs `git init`, creates a starter `.gitignore`, makes the first commit (with the secret check) and registers the repo. It can then create the GitHub repo with `gh` (private by default), or link an existing URL, or stay local. `repos add` registers a folder I already have, `repos clone URL` clones one.
+- **Switch repos:** `repos use NAME` (no name = pick from a list). `repos list` shows every repo with its branch and whether it has changes to commit, push or pull.
+- **GitHub link:** `repos link` / `repos link --github` / `repos unlink` for the active repo.
+- **Remove a repo:** `repos forget NAME` only drops it from the list and keeps all files. `repos remove NAME` unlinks it from GitHub and then **deletes the whole folder** (including `.git` and untracked files, no Trash). It shows what will be lost, needs the repo name typed to confirm, and refuses to run without a terminal. The GitHub repo itself is never deleted.
+- On first run my existing `~/.local/bin` repo is registered as `scripts`. The list lives in `~/.config/repos/`.
+- Interactive menu when run with no arguments.
+
+**Needs:** `git`. **Optional:** `gh` (GitHub CLI, `sudo pacman -S github-cli` then `gh auth login`) to create GitHub repos.
+`BINVC_REPO` and `REPOS_REPO` override the active repo for a single run.
+
+> ⚠️ `repos remove` deletes things for good. Read the summary it prints before typing the name, and use `forget` if you only want the repo out of the list.
 
 ### shelf
 
@@ -171,10 +191,10 @@ A tiny watcher that sends a desktop notification when the CPU package stays abov
 ```
  AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin ──► shelf (menu)
                                           │
-                                          └──► binvc ──► this repo
+                                          └──► repos (or binvc) ──► this repo
 ```
 
-My workflow: ask the AI for a change, download the updated script, run `ims` to install it, try it, and when I'm happy run `binvc sync` to commit and push.
+My workflow: ask the AI for a change, download the updated script, run `ims` to install it, try it, and when I'm happy run `repos sync` (or the older `binvc sync`) to commit and push.
 
 ---
 
