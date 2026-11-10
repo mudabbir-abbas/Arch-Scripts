@@ -45,7 +45,7 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 
 | Script | What it does | Portability | Changes your system? |
 |---|---|---|---|
-| [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; update from GitHub, roll back, remove (optionally with leftover data) | Most Linux desktops | Yes (`~/.local/share`) |
+| [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; add, update from GitHub and remove one or several at once, roll back, optionally clean up leftover data | Most Linux desktops | Yes (`~/.local/share`) |
 | [`binvc`](#binvc) | Friendly git helper for the scripts repo itself (the older, single-repo version of `repos`) | Anywhere with git | Yes (git commits/pushes) |
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
 | [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` (or any path) to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
@@ -68,18 +68,20 @@ All scripts follow the same conventions:
 
 Makes AppImages behave like installed apps.
 
-- Adds an AppImage (local file, direct link, GitHub release link, or `--repo OWNER/REPO`), extracts the icon and `.desktop` entry, and creates a launcher entry.
-- Checks for updates from GitHub releases or a direct URL, in parallel, then asks once before installing.
+- Adds AppImages (local files, direct links, GitHub release links, or `--repo OWNER/REPO`), extracts the icon and `.desktop` entry, and creates a launcher entry. Several files or links can be given at once (`appimgr add a.AppImage b.AppImage`).
+- **Several apps at once:** `appimgr update app1 app2 app3` updates only those, `appimgr remove app1 app2 app3` removes them with one question. Without names, `update` covers every app that has an update source.
+- Checks for updates from GitHub releases or a direct URL, in parallel, lists them in a table (old → new version, size, total), then asks once before installing.
+- **Package-manager style output:** a progress bar while checking, one live progress line per download (name, bar, percentage, size, speed), and one line per app while installing.
 - Verifies SHA-256 digests when GitHub provides them.
 - Keeps the previous version for `rollback`.
 - `remove` moves the AppImage to the Trash instead of deleting it.
 - **Leftover data:** `remove --purge-data` searches `~/.config`, `~/.cache`, `~/.local/share`, `~/.local/state` and hidden folders in `~` for entries named like the app, shows them with sizes, and lets me pick what to delete. It's a name match, so it's a list to review, never an automatic deletion.
 - **Portable mode** (`add --portable`, or `portable <slug> on|off|status`) keeps all of an app's data in `<slug>.AppImage.home` next to the AppImage, so removing a temporary app leaves nothing behind and `--purge-data` deletes it exactly, with no guessing.
-- Also: custom icons (`icon`), manual update sources (`source`), launching from a terminal (`run`), and an interactive menu when run with no arguments.
-- Uses `aria2c` for downloads if installed, otherwise `curl`.
+- Also: custom icons (`icon`), manual update sources (`source`), launching from a terminal (`run`), and an interactive menu when run with no arguments (it accepts several numbers, like `1 3 4`).
+- Downloads with `curl`, several at a time (`-j N`).
 - Honors `GITHUB_TOKEN` (raises the API limit); the token is only sent to `api.github.com` and removed from the environment for child processes.
 
-**Needs:** `bash`, `curl`. **Optional:** `aria2c`, `fuse2` (without it, extract-and-run mode is used).
+**Needs:** `bash`, `curl`. **Optional:** `fuse2` (without it, extract-and-run mode is used).
 **Writes to:** `~/.local/share/AppImages` (including `.AppImage.home` folders in portable mode), `~/.local/share/applications`.
 
 ### binvc

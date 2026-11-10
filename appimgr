@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (3.4.0):
+# NEW IN THIS VERSION (4.0.0):
 #   - New: several apps at once. 'appimgr update app1 app2 app3' updates only those,
 #     'appimgr remove app1 app2 app3' removes them (one question for all), and
 #     'appimgr add a.AppImage b.AppImage <link>' adds several (per-app options such as
@@ -10,13 +10,14 @@
 #     are listed in a table (old -> new version, size, total), every download has its own
 #     "name [#####-----] 42% size speed" line, and installs print one line per app. The raw
 #     per-app chatter (extraction, icons, update source) is hidden while updating.
-#   - Changed: downloads use curl only, several at a time (-j N). aria2c is no longer used;
-#     --no-aria2 and APPIMGR_DOWNLOADER are still accepted and ignored.
+#   - Changed: downloads use curl only, several at a time (-j N). aria2c support is gone:
+#     the --no-aria2 option and the APPIMGR_DOWNLOADER variable are removed (breaking: the
+#     option is now an "unknown option" error).
 #   - Named apps whose newer version cannot be told (no digest/version) are offered for
 #     update instead of being skipped. A name that is an integrated app is always an app;
 #     anything else given to 'update' must be a local file (appimgr update <slug> <file>).
 #   - The 3.3.0 entry is replaced by this one.
-VERSION="3.4.0"
+VERSION="4.0.0"
 #
 set -euo pipefail
 
@@ -1082,7 +1083,6 @@ add_one() {
       --move)     move=1; shift ;;
       --no-move)  move=0; shift ;;
       --no-fuse)  nofuse=1; forced=1; shift ;;
-      --no-aria2) shift ;;
       --portable) portable=1; shift ;;
       --repo)     repo_arg=${2:?missing value for $1}; shift 2 ;;
       --asset)    asset_arg=${2:?missing value for $1}; shift 2 ;;
@@ -1526,7 +1526,6 @@ cmd_update() {
       --check)    check=1; shift ;;
       -y|--yes)   yes=1; shift ;;
       -j|--jobs)  set_jobs "${2:?missing value for $1}"; shift 2 ;;
-      --no-aria2) shift ;;
       -n|--name|-a|--args|-i|--icon) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
       --no-fuse|--no-move|--move|--portable) pass+=("$1"); shift ;;
       -*)         die "unknown option: $1" ;;
