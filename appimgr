@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
 # DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (3.3.0):
-#   - New: 'appimgr remove <slug> --purge-data' also looks for the app's leftover data
-#     (config, cache, data, state). An AppImage does not say where it keeps its files, so
-#     the search is by name: entries in ~/.config, ~/.cache, ~/.local/share, ~/.local/state
-#     (and hidden folders in ~) whose name equals the app's slug, display name or window
-#     class, ignoring case and punctuation. You get a list with sizes and pick what to
-#     delete; with -y nothing found this way is deleted. On a terminal, plain 'remove'
-#     (and the menu) asks "Also look for leftover data?". Caches are deleted for good,
-#     everything else goes to the Trash (--purge = permanently).
-#   - New: portable mode, for apps you only want for a while. 'appimgr add ... --portable'
-#     (or 'appimgr portable <slug> on|off|status') keeps all of an app's data in
-#     <slug>.AppImage.home next to the AppImage, so 'remove --purge-data' deletes it exactly,
-#     with no guessing. Existing settings are not moved, and the app no longer sees your real
-#     home. Kept across updates. The menu has a matching entry and an "add" question.
-#   - 'list -l' shows where each app's data lives. 'remove' warns when a portable data folder
-#     is kept, and refuses --purge-data while the app is running.
-#   - The Trash helper now also names folders correctly when a name is already taken.
-#   - The 3.2.0 entry is replaced by this one.
-VERSION="3.3.0"
+# NEW IN THIS VERSION (3.4.0):
+#   - New: several apps at once. 'appimgr update app1 app2 app3' updates only those,
+#     'appimgr remove app1 app2 app3' removes them (one question for all), and
+#     'appimgr add a.AppImage b.AppImage <link>' adds several (per-app options such as
+#     --name need a single app). The menu accepts several numbers too ("1 3 4").
+#   - Changed: output looks like a package manager. Update checks show a progress bar, updates
+#     are listed in a table (old -> new version, size, total), every download has its own
+#     "name [#####-----] 42% size speed" line, and installs print one line per app. The raw
+#     per-app chatter (extraction, icons, update source) is hidden while updating.
+#   - Changed: downloads use curl only, several at a time (-j N). aria2c is no longer used;
+#     --no-aria2 and APPIMGR_DOWNLOADER are still accepted and ignored.
+#   - Named apps whose newer version cannot be told (no digest/version) are offered for
+#     update instead of being skipped. A name that is an integrated app is always an app;
+#     anything else given to 'update' must be a local file (appimgr update <slug> <file>).
+#   - The 3.3.0 entry is replaced by this one.
+VERSION="3.4.0"
 #
 set -euo pipefail
 
@@ -32,18 +29,25 @@ DESKTOP_DIR="$DATA_HOME/applications"
 
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null) || SELF=$0
 
+if [[ -t 1 ]]; then
+  C_BL=$'\e[1;34m'; C_G=$'\e[32m'; C_R=$'\e[31m'; C_D=$'\e[2m'; C_N=$'\e[0m'
+else
+  C_BL=""; C_G=""; C_R=""; C_D=""; C_N=""
+fi
+
+QUIET=0        # 1 while updating: hides the per-app chatter of 'add'
 die()  { echo "error: $*" >&2; exit 1; }
 warn() { echo "warning: $*" >&2; }
-info() { echo ":: $*"; }
+info() { if (( QUIET )); then return 0; fi; printf '%s::%s %s\n' "$C_BL" "$C_N" "$*"; }
 
 TMP_DIR=""; STAGE_FILE=""; DL_DIR=""; SCRATCH=""; BATCH_DIR=""
-SAVED=(); PF=(); LEFT=()
+SAVED=(); LEFT=()
 L_VERSION=""; L_URL=""; L_NAME=""; L_SIZE=""; L_DIGEST=""; L_ETAG=""; L_MATCHES=0
 STATUS=""; DL_ETAG=""
 JOBS="${APPIMGR_JOBS:-4}"
-USE_ARIA=1
 GH_TOKEN=""; GH_BODY=""; GH_PARSED=""; GH_ERR=""; GH_RESET=""
 RL_QUIET=0     # 1 inside parallel check jobs: rate-limit / bad-token messages are printed once by the parent
+D_URL=(); D_OUT=(); D_LABEL=(); D_SIZE=(); D_RC=(); D_ETAG=()   # download list, see dl_many
 
 cleanup() {
   local p
@@ -68,27 +72,33 @@ appimgr v$VERSION - integrate AppImages into your app launcher
 
 Usage:
   appimgr                                  Interactive menu (when run without arguments)
-  appimgr add <file.AppImage> [options]    Integrate an AppImage into the launcher
-  appimgr add <link> [options]             Download (GitHub release link or direct URL) and integrate
+  appimgr add <file.AppImage|link>... [options]
+                                           Integrate one or more AppImages (files or links)
   appimgr add --repo OWNER/REPO [--asset 'PATTERN'] [--tag TAG] [options]
                                            Download from a GitHub release and integrate
-  appimgr update <slug> [--check] [-y]     Update from the saved update source
-  appimgr update [--all] [--check] [-y] [-j N]
-                                           Check every app with a source (in parallel), list updates,
-                                           ask once, download them together, install all
-                                           (no <slug> = all)
-  appimgr update <slug> <file> [options]   Replace with a local file instead
+  appimgr update [<slug>...] [--check] [-y] [-j N]
+                                           Update the named apps, or (no names) every app that has
+                                           an update source: check in parallel, list the updates,
+                                           ask once, download together, install one by one
+  appimgr update <slug> <file> [options]   Replace one app with a local file instead
   appimgr rollback <slug>                  Swap back to the previous version
   appimgr icon <slug> [<file>|--reset]     Show / change the icon (PNG or SVG)
   appimgr source [<slug> [set ...|clear]]  Show/set/clear the update source (no args = how-to)
   appimgr portable <slug> [on|off|status]  Keep the app's data in its own folder (see "Leftover data")
   appimgr run <slug> [-d] [args...]        Launch from the terminal (-d = detached)
   appimgr list [-l]                        List integrated AppImages (-l = details)
-  appimgr remove <slug> [-y] [--purge] [--purge-data]
-                                           Remove the app; the AppImage goes to the Trash
+  appimgr remove <slug>... [-y] [--purge] [--purge-data]
+                                           Remove one or more apps; the AppImages go to the Trash
                                            (-y = no prompt, --purge = delete permanently,
-                                           --purge-data = also remove its leftover data)
+                                           --purge-data = also remove their leftover data)
   appimgr version | --version
+
+Several apps at once:
+  appimgr update obsidian zen brave        only these three
+  appimgr remove obsidian zen              one question for both
+  appimgr add ~/Downloads/a.AppImage ~/Downloads/b.AppImage
+  With 'update', a name that is an integrated app is always an app; anything else must be a
+  file: 'appimgr update obsidian ./Obsidian-1.6.AppImage' replaces obsidian with that file.
 
 Options for add / update <slug> <file>:
   -n, --name "Name"     Override the display name
@@ -100,6 +110,8 @@ Options for add / update <slug> <file>:
       --no-move         Keep the original file (default: it is deleted after success)
       --portable        Keep all of the app's data in <slug>.AppImage.home next to the
                         AppImage (remembered across updates; see "Leftover data")
+  When adding several apps at once only --no-fuse, --no-move, --portable and --no-source
+  are allowed (they apply to every app); the rest belongs to one app.
 
 Options for add <link> / --repo (downloads):
       --repo OWNER/REPO Take the AppImage from this GitHub project's release
@@ -111,18 +123,15 @@ Options for add <link> / --repo (downloads):
                         (GitHub, one matching asset) and you are asked only when it is not
                         (--no-move has no effect for downloads: the temp file is always removed)
 
-Options for update <slug|--all>:
+Options for update:
       --check           Only check for updates, install nothing
   -y, --yes             Don't ask before installing
-  -j, --jobs N          Run N update checks at the same time (default 4, max 16)
-
-Options for add (downloads) and update:
-      --no-aria2        Download with curl even if aria2c is installed
+  -j, --jobs N          Run N update checks / downloads at the same time (default 4, max 16)
 
 Downloads:
-  If aria2c is installed it is used automatically: several connections per file, and
-  'update' fetches all files at once with a single progress line. A file that fails is
-  downloaded again on its own (aria2c, then curl). Installing always happens one app at a time.
+  Downloads use curl, up to N at a time, each with its own progress line
+  (name, bar, percentage, size, speed). A file that fails is reported and skipped;
+  the other apps are still installed.
 
 Leftover data:
   An AppImage does not say where it keeps its settings, so appimgr cannot know for sure.
@@ -153,7 +162,6 @@ Environment:
                       60 to 5000 requests per hour; useful with many apps. Sent only to
                       api.github.com, never printed, not passed on to AppImages.
   APPIMGR_JOBS        Default for --jobs
-  APPIMGR_DOWNLOADER  Set to curl to never use aria2c
   APPIMGR_DIR         Overrides the AppImage dir
 EOF
 }
@@ -194,7 +202,7 @@ confirm() { # <prompt> <default when not interactive: y|n>; Enter = yes
 }
 
 # The token is read once from the environment and then removed from it, so that
-# programs we start (AppImages, aria2c, ...) never inherit it.
+# programs we start (AppImages, curl, ...) never inherit it.
 init_token() {
   local t=${GITHUB_TOKEN:-}
   unset GITHUB_TOKEN
@@ -212,13 +220,133 @@ set_jobs() { # <N>
   if (( JOBS > 16 )); then JOBS=16; fi
 }
 
-use_aria() { (( USE_ARIA )) && command -v aria2c >/dev/null 2>&1; }
-
 # ~ instead of the home folder, for messages
 tilde() { local t='~'; printf '%s' "${1/#$HOME/$t}"; }
 
 # Folder next to the AppImage that the AppImage runtime uses as $HOME when it exists.
 portable_dir() { printf '%s' "$APPS_DIR/$1.AppImage.home"; }
+
+# ---------- progress display (package-manager style) ----------
+
+# 1536 -> "1.5 KiB" (result in REPLY)
+hsize() {
+  local b=${1:-0} d
+  if (( b >= 1073741824 )); then d=$(( b * 10 / 1073741824 )); REPLY="$((d / 10)).$((d % 10)) GiB"
+  elif (( b >= 1048576 )); then d=$(( b * 10 / 1048576 )); REPLY="$((d / 10)).$((d % 10)) MiB"
+  elif (( b >= 1024 )); then d=$(( b * 10 / 1024 )); REPLY="$((d / 10)).$((d % 10)) KiB"
+  else REPLY="$b B"; fi
+}
+
+# [#######-------]  35%   (result in REPLY; total 0 = unknown size)
+bar() { # <done> <total> <width>
+  local d=$1 t=$2 w=$3 f=0 p=0 i s=""
+  if (( t > 0 )); then
+    if (( d > t )); then d=$t; fi
+    p=$(( d * 100 / t )); f=$(( d * w / t ))
+  fi
+  for (( i = 0; i < w; i++ )); do
+    if (( i < f )); then s+='#'; else s+='-'; fi
+  done
+  if (( t > 0 )); then printf -v REPLY '[%s] %3d%%' "$s" "$p"; else REPLY="[$s]   ?%"; fi
+}
+
+# current time in microseconds (REPLY)
+now_us() {
+  if [[ -n ${EPOCHREALTIME:-} ]]; then REPLY=${EPOCHREALTIME/[.,]/}; else REPLY=$(( SECONDS * 1000000 )); fi
+}
+
+# redraw the "checking" bar of 'update'
+ck_draw() { # <done> <total>
+  bar "$1" "$2" 20
+  printf '\r\033[K%s::%s Checking %d app(s) for updates  %s' "$C_BL" "$C_N" "$2" "$REPLY"
+}
+
+# Draws one progress line per file (reads the variables of dl_many through bash's dynamic scope).
+dl_draw() {
+  local i d t el sp lab line b
+  printf '\033[%dA' "$n"
+  for (( i = 0; i < n; i++ )); do
+    lab=${D_LABEL[i]:0:20}
+    case ${st[i]} in
+      wait) printf -v line ' %-20s waiting' "$lab" ;;
+      fail) printf -v line ' %-20s %sFAILED%s' "$lab" "$C_R" "$C_N" ;;
+      *)
+        d=0
+        if [[ -f ${D_OUT[i]} ]]; then d=$(stat -c %s -- "${D_OUT[i]}" 2>/dev/null || echo 0); fi
+        if (( tot[i] == 0 )) && [[ -s ${D_OUT[i]}.hdr ]]; then
+          # size from the Content-Length of the final (200) response
+          tot[i]=$(awk '/^HTTP\//{ok=($2==200); next} ok && tolower($1)=="content-length:" {v=$2} END{gsub(/[^0-9]/,"",v); print v+0}' "${D_OUT[i]}.hdr" 2>/dev/null || echo 0)
+        fi
+        t=${tot[i]}
+        if [[ ${st[i]} == ok ]]; then t=$d; now_us; el=$(( ${t1[i]} - ${t0[i]} )); else now_us; el=$(( REPLY - ${t0[i]} )); fi
+        bar "$d" "$t" 20; b=$REPLY
+        hsize "$d"; sp=$REPLY
+        printf -v line ' %-20s %s  %9s' "$lab" "$b" "$sp"
+        if (( el >= 300000 )); then hsize $(( d * 1000000 / el )); printf -v line '%s  %9s/s' "$line" "$REPLY"; fi ;;
+    esac
+    printf '\r\033[K%s\n' "$line"
+  done
+}
+
+# Downloads the files in D_URL[] / D_OUT[] / D_LABEL[] / D_SIZE[] (size 0 = unknown), JOBS at a
+# time, with one progress line per file on a terminal. Fills D_RC[] (0 = ok) and D_ETAG[].
+# A failed file is reported with a warning and removed; the others carry on.
+dl_many() {
+  local n=${#D_URL[@]} i started=0 finished=0 running=0 tty=0 rows="" rc
+  local pid=() st=() tot=() t0=() t1=()
+  D_RC=(); D_ETAG=()
+  if (( n == 0 )); then return 0; fi
+  if [[ -t 1 ]]; then
+    rows=$(stty size 2>/dev/null </dev/tty | cut -d' ' -f1 || true)
+    [[ $rows =~ ^[0-9]+$ ]] && (( rows > 0 )) || rows=24
+    if (( n + 3 <= rows )); then tty=1; fi
+  fi
+  for (( i = 0; i < n; i++ )); do
+    st[i]=wait; D_RC[i]=1; D_ETAG[i]=""; t0[i]=0; t1[i]=0; tot[i]=0
+    if [[ ${D_SIZE[i]:-} =~ ^[0-9]+$ ]]; then tot[i]=${D_SIZE[i]}; fi
+  done
+  if (( tty )); then for (( i = 0; i < n; i++ )); do echo; done; fi
+
+  while (( finished < n )); do
+    while (( started < n && running < JOBS )); do
+      i=$started
+      mkdir -p -- "$(dirname -- "${D_OUT[i]}")"
+      rm -f -- "${D_OUT[i]}"
+      curl -fsSL --retry 2 --connect-timeout 20 -D "${D_OUT[i]}.hdr" -o "${D_OUT[i]}" -- "${D_URL[i]}" \
+        2>"${D_OUT[i]}.err" &
+      pid[i]=$!; st[i]=run; now_us; t0[i]=$REPLY
+      started=$((started + 1)); running=$((running + 1))
+    done
+    for (( i = 0; i < started; i++ )); do
+      [[ ${st[i]} == run ]] || continue
+      if kill -0 "${pid[i]}" 2>/dev/null; then continue; fi
+      rc=0; wait "${pid[i]}" || rc=$?
+      now_us; t1[i]=$REPLY
+      running=$((running - 1)); finished=$((finished + 1))
+      if (( rc == 0 )) && [[ -f ${D_OUT[i]} ]]; then st[i]=ok; D_RC[i]=0; else st[i]=fail; D_RC[i]=$(( rc == 0 ? 1 : rc )); fi
+      if (( ! tty )); then
+        if [[ ${st[i]} == ok ]]; then
+          hsize "$(stat -c %s -- "${D_OUT[i]}" 2>/dev/null || echo 0)"
+          printf ' %-20s done  %s\n' "${D_LABEL[i]:0:20}" "$REPLY"
+        fi
+      fi
+    done
+    if (( tty )); then dl_draw; fi
+    if (( finished < n )); then sleep 0.2; fi
+  done
+
+  for (( i = 0; i < n; i++ )); do
+    if [[ ${st[i]} == ok && -f ${D_OUT[i]}.hdr ]]; then
+      D_ETAG[i]=$(tr -d '\r' <"${D_OUT[i]}.hdr" | awk 'index(tolower($0), "etag:")==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}')
+    fi
+    if [[ ${st[i]} == fail ]]; then
+      warn "${D_LABEL[i]}: download failed: $(head -c 300 -- "${D_OUT[i]}.err" 2>/dev/null | tr '\n' ' ')"
+      rm -f -- "${D_OUT[i]}"
+    fi
+    rm -f -- "${D_OUT[i]}.hdr" "${D_OUT[i]}.err"
+  done
+  return 0
+}
 
 # ---------- small metadata store: $APPS_DIR/.meta/<slug>.conf (key=value) ----------
 meta_get() { # <slug> <key>
@@ -589,25 +717,12 @@ check_status() { # <slug> <path> <canonical source>
   esac
 }
 
-# Downloads one file (sets DL_ETAG when curl is used). aria2c if installed, else curl.
-download() { # <url> <outfile>
-  local hdr
-  DL_ETAG=""
-  if use_aria; then
-    if aria2c -x4 -s4 -k1M -c --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
-         --console-log-level=warn --summary-interval=0 --download-result=hide \
-         -d "$(dirname -- "$2")" -o "$(basename -- "$2")" -- "$1"; then
-      return 0
-    fi
-    warn "aria2c failed, trying curl"
-    rm -f -- "$2" "$2.aria2"
-  fi
-  hdr=$(mktemp)
-  if ! curl -fL --retry 2 --progress-bar -D "$hdr" -o "$2" "$1"; then
-    rm -f -- "$hdr" "$2"; warn "download failed: $1"; return 1
-  fi
-  DL_ETAG=$(tr -d '\r' <"$hdr" | awk 'index(tolower($0), "etag:")==1 {v=$0} END {sub(/^[^:]*:[ ]*/, "", v); print v}')
-  rm -f -- "$hdr"
+# Downloads one file with the same progress line as 'update' (sets DL_ETAG).
+download() { # <url> <outfile> [label] [size]
+  D_URL=("$1"); D_OUT=("$2"); D_LABEL=("${3:-${2##*/}}"); D_SIZE=("${4:-0}")
+  dl_many
+  DL_ETAG=${D_ETAG[0]:-}
+  return "${D_RC[0]:-1}"
 }
 
 # Checks the downloaded file against the release's sha256 digest (L_DIGEST), when there is one.
@@ -736,8 +851,8 @@ fr_test() {
 # Downloads into $DL_DIR and fills R_FILE / R_SOURCE (candidate) / R_VERSION / R_GENERIC / R_ASSET. Returns 1 after a message on failure.
 fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosource 0|1>
   local link=$1 repo=$2 asset_arg=$3 tag_arg=$4 nosource=$5
-  local url="" name="" digest="" ver="" pre=0 rtag="" parsed kind a b c d sum i lower m
-  local names=() urls=() digs=() idx=() keep=()
+  local url="" name="" digest="" dsize=0 ver="" pre=0 rtag="" parsed kind a b c d i lower m
+  local names=() urls=() digs=() szs=() idx=() keep=()
   R_FILE=""; R_SOURCE=""; R_VERSION=""; R_GENERIC=""; R_ASSET=""
   need_cmd curl
 
@@ -768,14 +883,14 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
       case $kind in
         TAG)   ver=$a ;;
         PRE)   if [[ $a == true ]]; then pre=1; fi ;;
-        ASSET) names+=("$a"); urls+=("$d"); digs+=("$c") ;;
+        ASSET) names+=("$a"); urls+=("$d"); digs+=("$c"); szs+=("$b") ;;
       esac
     done <<<"$parsed"
 
     if [[ -z $url ]]; then   # repo mode: choose the asset
       pick_assets
       if ((${#idx[@]} == 0)) && [[ -z $rtag || $rtag == latest ]] && gh_scan "$repo" fr_test; then
-        names=("${SC_NAMES[@]}"); urls=("${SC_URLS[@]}"); digs=("${SC_DIGS[@]}"); ver=$SC_TAG
+        names=("${SC_NAMES[@]}"); urls=("${SC_URLS[@]}"); digs=("${SC_DIGS[@]}"); szs=(); ver=$SC_TAG
         info "newest release has no matching asset - using $ver instead"
       fi
       if ((${#idx[@]} == 0)); then
@@ -796,8 +911,11 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
       fi
       i=${idx[0]}; name=${names[i]}; url=${urls[i]}
     fi
-    for i in "${!names[@]}"; do   # digest of the file we are about to download
-      if [[ ${names[i]} == "$name" && ${digs[i]} == sha256:* ]]; then digest=${digs[i]#sha256:}; fi
+    for i in "${!names[@]}"; do   # digest and size of the file we are about to download
+      if [[ ${names[i]} == "$name" ]]; then
+        if [[ ${digs[i]} == sha256:* ]]; then digest=${digs[i]#sha256:}; fi
+        if [[ ${szs[i]:-} =~ ^[0-9]+$ ]]; then dsize=${szs[i]}; fi
+      fi
     done
     if [[ -z $ver ]]; then ver=$rtag; fi
   fi
@@ -806,8 +924,9 @@ fetch_remote() { # <link or ''> <OWNER/REPO or ''> <asset pattern> <tag> <nosour
   mkdir -p "$APPS_DIR"
   DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
   info "downloading $name"
-  download "$url" "$DL_DIR/$name" || return 1
+  download "$url" "$DL_DIR/$name" "$name" "$dsize" || return 1
   if [[ -n $digest ]]; then
+    local sum
     sum=$(sha256sum -- "$DL_DIR/$name" | cut -d' ' -f1)
     if [[ $sum != "$digest" ]]; then warn "checksum mismatch - aborting, nothing changed"; return 1; fi
     info "sha256 verified"
@@ -918,7 +1037,40 @@ choose_source() { # <slug> <appimage> <link candidate or ''> <nosource 0|1> <ins
 }
 
 # ---------- add ----------
+# Adds several apps when given several files/links; one app keeps all options.
 cmd_add() {
+  local args=("$@") i=0 a perapp="" srcs=() common=()
+  while (( i < ${#args[@]} )); do
+    a=${args[i]}
+    case $a in
+      -n|--name|-a|--args|-i|--icon|--slug|--repo|--asset|--tag) perapp=$a; i=$((i + 2)); continue ;;
+      -*) common+=("$a") ;;
+      *)  srcs+=("$a") ;;
+    esac
+    i=$((i + 1))
+  done
+  if (( ${#srcs[@]} < 2 )); then add_one "$@"; return; fi
+  [[ -z $perapp ]] || die "$perapp belongs to one app: add the apps one at a time to use it"
+
+  local n=${#srcs[@]} s k=0 ok=0 rc failed=()
+  for s in "${srcs[@]}"; do
+    k=$((k + 1))
+    echo
+    info "[$k/$n] adding $s"
+    # own subshell so one failing app (even a die) does not stop the others
+    set +e
+    ( set -e; trap cleanup EXIT; add_one ${common[@]+"${common[@]}"} "$s" )
+    rc=$?
+    set -e
+    if (( rc == 0 )); then ok=$((ok + 1)); else failed+=("$s"); fi
+  done
+  echo
+  info "added $ok of $n"
+  if (( ${#failed[@]} )); then warn "failed: ${failed[*]}"; return 1; fi
+  return 0
+}
+
+add_one() {
   local src="" name="" extra="" move=1 nofuse=0 forced=0 slug_force="" icon_arg="" asked=0
   local repo_arg="" asset_arg="" tag_arg="" nosource=0 remote=0 portable=0
   while (($#)); do
@@ -930,7 +1082,7 @@ cmd_add() {
       --move)     move=1; shift ;;
       --no-move)  move=0; shift ;;
       --no-fuse)  nofuse=1; forced=1; shift ;;
-      --no-aria2) USE_ARIA=0; shift ;;
+      --no-aria2) shift ;;
       --portable) portable=1; shift ;;
       --repo)     repo_arg=${2:?missing value for $1}; shift 2 ;;
       --asset)    asset_arg=${2:?missing value for $1}; shift 2 ;;
@@ -1139,12 +1291,14 @@ EOF
   meta_set "$slug" version "$R_VERSION"
   meta_set "$slug" etag ""
 
-  info "integrated: $display"
-  echo "   slug:    $slug"
-  echo "   binary:  $dest"
-  if (( nofuse )); then echo "   mode:    extract-and-run (no FUSE)"; else echo "   mode:    normal (FUSE)"; fi
-  if [[ -d $dest.home ]]; then echo "   data:    portable ($(tilde "$dest.home"))"; fi
-  echo "   entry:   $out"
+  if (( ! QUIET )); then
+    info "integrated: $display"
+    printf '   %-8s %s\n' "slug" "$slug"
+    printf '   %-8s %s\n' "binary" "$dest"
+    if (( nofuse )); then printf '   %-8s %s\n' "mode" "extract-and-run (no FUSE)"; else printf '   %-8s %s\n' "mode" "normal (FUSE)"; fi
+    if [[ -d $dest.home ]]; then printf '   %-8s %s\n' "data" "portable ($(tilde "$dest.home"))"; fi
+    printf '   %-8s %s\n' "entry" "$out"
+  fi
 
   choose_source "$slug" "$dest" "$R_SOURCE" "$nosource" "$R_ASSET"
   if [[ -n $R_GENERIC && -z $(meta_get "$slug" source) ]]; then
@@ -1183,108 +1337,54 @@ dump_result() {
   done
 }
 
-# Installs what the L_* variables describe for <slug>. With a third argument that file is used
-# (already downloaded by prefetch_batch); otherwise it is downloaded here.
-install_one() { # <slug> <canonical source> [<downloaded file>]
-  local slug=$1 src=$2 file=${3:-} own=0 type
-  if [[ -z $file ]]; then
-    own=1
-    mkdir -p "$APPS_DIR"
-    DL_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
-    info "downloading $L_NAME"
-    download "$L_URL" "$DL_DIR/$L_NAME" || return 1
-    file=$DL_DIR/$L_NAME
-  else
-    DL_ETAG=""
-  fi
+# Installs a downloaded file for <slug> (L_* describe the release it came from).
+install_one() { # <slug> <canonical source> <downloaded file>
+  local slug=$1 src=$2 file=$3 type
   verify_download "$slug" "$file" || return 1
-
   saved_opts "$slug"
-  cmd_add --slug "$slug" "${SAVED[@]}" "$file"
+  add_one --slug "$slug" ${SAVED[@]+"${SAVED[@]}"} "$file"
   meta_set "$slug" version "$L_VERSION"
   type=${src%%|*}
   if [[ $type == url ]]; then meta_set "$slug" etag "${DL_ETAG:-$L_ETAG}"; fi
-  if (( own )); then rm -rf -- "$DL_DIR"; DL_DIR=""; fi
 }
 
-# Single app: check, show the result, ask, install.
-update_one() { # <slug> <check_only 0|1> <yes 0|1> <quiet_if_no_source 0|1>
-  local slug=$1 check=$2 yes=$3 quiet=$4
-  check_one "$slug"
-  case $CK in
-    error)    return 1 ;;
-    nosource) if (( ! quiet )); then info "$slug: no update source saved (see: appimgr source)"; fi; return 0 ;;
-    uptodate) info "$slug: up to date${L_VERSION:+ ($L_VERSION)}"; return 0 ;;
-    update)   info "$slug: update available: ${CK_SAVED:-installed} -> ${L_VERSION:-latest}  [$L_NAME]" ;;
-    *)        info "$slug: cannot tell if this is newer (latest: ${L_VERSION:-?}  [$L_NAME])" ;;
-  esac
-  if (( check )); then return 0; fi
-  if (( ! yes )); then
-    if ! confirm "Download and install it?" n; then info "$slug: skipped"; return 0; fi
+# Update the given apps (no names = every integrated app): check everything first (in parallel),
+# list what is ready, ask ONCE, download everything together, then install one by one.
+update_batch() { # <check_only 0|1> <yes 0|1> [slug ...]
+  local check=$1 yes=$2 f slug i n k ok=0 rc running=0 done_n=0 reset_hm="" explicit=0 drawbar=0 pre e
+  shift 2
+  local slugs=("$@")
+  local B_SLUG=() B_SRC=() B_URL=() B_NAME=() B_DIGEST=() B_VER=() B_ETAG=() B_SIZE=() B_OLD=() B_UNK=()
+  local unk=() err=() failed=() rl=() utd=() nosrc=() badtoken=0 pf=()
+  if (( ${#slugs[@]} )); then
+    explicit=1
+  else
+    for f in "$DESKTOP_DIR"/appimage-*.desktop; do
+      [[ -f $f ]] || continue
+      grep -q '^X-AppImage-Managed=appimgr' "$f" || continue
+      slug=${f##*/appimage-}; slugs+=("${slug%.desktop}")
+    done
   fi
-  install_one "$slug" "$(meta_get "$slug" source)"
-}
-
-# Downloads every pending update at once with a single aria2c run into BATCH_DIR/<index>/.
-# Fills PF[i] with the finished file of app i; an app whose download failed gets no entry and is
-# downloaded again with curl by install_one. Reads B_SLUG, B_URL, B_NAME, B_SIZE from update_batch.
-prefetch_batch() {
-  local i name list cnt=0 total=0 avail rc=0
-  PF=()
-  mkdir -p "$APPS_DIR"
-  BATCH_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
-  list="$BATCH_DIR/aria2.in"
-  : > "$list"
-  for i in "${!B_SLUG[@]}"; do
-    name=${B_NAME[i]}
-    if [[ -z $name || $name == */* ]]; then continue; fi
-    mkdir -p "$BATCH_DIR/$i"
-    printf '%s\n  dir=%s\n  out=%s\n' "${B_URL[i]}" "$BATCH_DIR/$i" "$name" >> "$list"
-    cnt=$((cnt+1))
-    if [[ ${B_SIZE[i]} =~ ^[0-9]+$ ]]; then total=$((total + B_SIZE[i])); fi
-  done
-  if (( cnt == 0 )); then return 0; fi
-
-  if (( total >= 1048576 )); then info "downloading $cnt file(s) with aria2c, about $((total / 1048576)) MiB"
-  else info "downloading $cnt file(s) with aria2c"; fi
-  if (( total > 0 )); then
-    avail=$(df -B1 --output=avail -- "$APPS_DIR" 2>/dev/null | tail -n1 | tr -dc '0-9' || true)
-    if [[ -n $avail ]] && (( avail < total + total / 2 )); then
-      warn "low disk space: $((avail / 1048576)) MiB free in $APPS_DIR, the updates need about $((total / 1048576)) MiB plus room to install"
-    fi
-  fi
-  aria2c -i "$list" -j 3 -x4 -s4 -k1M -c --file-allocation=none --allow-overwrite=true --auto-file-renaming=false \
-    --console-log-level=warn --summary-interval=0 --download-result=hide || rc=$?
-  for i in "${!B_SLUG[@]}"; do
-    name=${B_NAME[i]}
-    if [[ -f $BATCH_DIR/$i/$name && ! -e $BATCH_DIR/$i/$name.aria2 ]]; then PF[i]=$BATCH_DIR/$i/$name; fi
-  done
-  if (( rc )); then warn "aria2c reported problems; a missing file is downloaded again on its own"; fi
-}
-
-# All apps: check everything first (in parallel), list what is ready, ask ONCE, download
-# everything together, then install them one by one.
-update_batch() { # <check_only 0|1> <yes 0|1>
-  local check=$1 yes=$2 f slug i n k ok=0 rc running=0 reset_hm=""
-  local B_SLUG=() B_SRC=() B_URL=() B_NAME=() B_DIGEST=() B_VER=() B_ETAG=() B_SIZE=()
-  local unk=() err=() failed=() rl=() slugs=() badtoken=0
-  for f in "$DESKTOP_DIR"/appimage-*.desktop; do
-    [[ -f $f ]] || continue
-    grep -q '^X-AppImage-Managed=appimgr' "$f" || continue
-    slug=${f##*/appimage-}; slugs+=("${slug%.desktop}")
-  done
   k=${#slugs[@]}
   if (( k == 0 )); then info "nothing to update"; return 0; fi
 
   # --- phase 1: checks, JOBS at a time. Each job writes its messages and its result to files. ---
   SCRATCH=$(mktemp -d)
-  if (( k > 1 )); then info "checking $k app(s), up to $JOBS at a time ..."; fi
+  if (( k > 1 )) && [[ -t 1 ]]; then drawbar=1; fi
+  if (( drawbar )); then ck_draw 0 "$k"; else info "Checking $k app(s) for updates..."; fi
   for i in "${!slugs[@]}"; do
-    while (( running >= JOBS )); do wait -n || true; running=$((running - 1)); done
+    while (( running >= JOBS )); do
+      wait -n || true; running=$((running - 1)); done_n=$((done_n + 1))
+      if (( drawbar )); then ck_draw "$done_n" "$k"; fi
+    done
     ( RL_QUIET=1; check_one "${slugs[i]}"; dump_result >"$SCRATCH/$i.res" ) >"$SCRATCH/$i.msg" 2>&1 &
     running=$((running + 1))
   done
-  wait || true
+  while (( running > 0 )); do
+    wait -n || true; running=$((running - 1)); done_n=$((done_n + 1))
+    if (( drawbar )); then ck_draw "$done_n" "$k"; fi
+  done
+  if (( drawbar )); then echo; fi
 
   # --- results, in app order ---
   for i in "${!slugs[@]}"; do
@@ -1304,18 +1404,30 @@ update_batch() { # <check_only 0|1> <yes 0|1>
       continue
     fi
     case $CK in
-      nosource) ;;
+      nosource) nosrc+=("$slug") ;;
       error)    err+=("$slug") ;;
-      uptodate) info "$slug: up to date${L_VERSION:+ ($L_VERSION)}" ;;
-      update)
-        info "$slug: update available: ${CK_SAVED:-installed} -> ${L_VERSION:-latest}"
+      uptodate) utd+=("$slug|${L_VERSION}") ;;
+      update|unknown)
+        if [[ $CK == unknown ]] && (( ! explicit )); then unk+=("$slug"); continue; fi
         B_SLUG+=("$slug"); B_SRC+=("$(meta_get "$slug" source)"); B_URL+=("$L_URL"); B_NAME+=("$L_NAME")
-        B_DIGEST+=("$L_DIGEST"); B_VER+=("$L_VERSION"); B_ETAG+=("$L_ETAG"); B_SIZE+=("$L_SIZE") ;;
-      *)        unk+=("$slug") ;;
+        B_DIGEST+=("$L_DIGEST"); B_VER+=("$L_VERSION"); B_ETAG+=("$L_ETAG"); B_SIZE+=("$L_SIZE")
+        B_OLD+=("${CK_SAVED:-installed}")
+        if [[ $CK == unknown ]]; then B_UNK+=(1); else B_UNK+=(0); fi ;;
     esac
   done
   rm -rf -- "$SCRATCH"; SCRATCH=""
 
+  if (( explicit )); then
+    for e in ${utd[@]+"${utd[@]}"}; do
+      if [[ -n ${e#*|} ]]; then printf ' %-22s up to date (%s)\n' "${e%%|*}" "${e#*|}"
+      else printf ' %-22s up to date\n' "${e%%|*}"; fi
+    done
+    for e in ${nosrc[@]+"${nosrc[@]}"}; do
+      printf ' %-22s no update source saved (see: appimgr source)\n' "$e"
+    done
+  elif (( ${#utd[@]} )); then
+    info "${#utd[@]} app(s) up to date"
+  fi
   if (( ${#rl[@]} )); then
     if (( badtoken )); then
       warn "GitHub rejected the token (HTTP 401), check GITHUB_TOKEN: could not check ${rl[*]}"
@@ -1325,81 +1437,124 @@ update_batch() { # <check_only 0|1> <yes 0|1>
     fi
   fi
   if (( ${#err[@]} )); then warn "could not check: ${err[*]}"; fi
-  if (( ${#unk[@]} )); then info "cannot tell if newer (skipped; force with 'appimgr update <slug>'): ${unk[*]}"; fi
+  if (( ${#unk[@]} )); then info "cannot tell if newer (skipped; name them to force: appimgr update <slug>): ${unk[*]}"; fi
   n=${#B_SLUG[@]}
   if (( n == 0 )); then
     if (( ${#rl[@]} + ${#err[@]} )); then info "no updates among the apps that could be checked"
     else info "nothing to update"; fi
     return 0
   fi
-  if (( check )); then info "$n update(s) available: ${B_SLUG[*]}"; return 0; fi
 
-  info "$n update(s) ready: ${B_SLUG[*]}"
+  # --- the update table ---
+  local w=0 ow=0 nw=0 total=0 unkn=0 sz note
+  for (( i = 0; i < n; i++ )); do
+    if (( ${#B_SLUG[i]} > w )); then w=${#B_SLUG[i]}; fi
+    if (( ${#B_OLD[i]} > ow )); then ow=${#B_OLD[i]}; fi
+    if (( ${#B_VER[i]} > nw )); then nw=${#B_VER[i]}; fi
+  done
+  info "$n update(s) available"
+  for (( i = 0; i < n; i++ )); do
+    if [[ ${B_SIZE[i]} =~ ^[0-9]+$ ]]; then hsize "${B_SIZE[i]}"; sz=$REPLY; total=$((total + B_SIZE[i])); else sz="?"; unkn=1; fi
+    note=""
+    if (( B_UNK[i] )); then note="  (cannot tell if newer)"; fi
+    printf '   %-*s  %-*s -> %-*s  %9s%s\n' "$w" "${B_SLUG[i]}" "$ow" "${B_OLD[i]}" "$nw" "${B_VER[i]:-latest}" "$sz" "$note"
+  done
+  if (( total > 0 )); then
+    hsize "$total"
+    printf '\n   Total download size: %s%s\n\n' "$REPLY" "$( if (( unkn )); then echo ' (+ some unknown)'; fi )"
+  else
+    echo
+  fi
+  if (( check )); then
+    if (( explicit )); then echo "   install with: appimgr update ${slugs[*]}"; else echo "   install with: appimgr update"; fi
+    return 0
+  fi
   if (( ! yes )); then
-    if ! confirm "Install all $n?" n; then info "skipped"; return 0; fi
+    if ! confirm "Proceed with the update?" n; then info "skipped"; return 0; fi
   fi
 
-  # --- phase 2: download everything together (aria2c), phase 3: install one by one ---
-  PF=()
-  if use_aria; then prefetch_batch; fi
+  # --- phase 2: download everything together ---
+  mkdir -p "$APPS_DIR"
+  BATCH_DIR=$(mktemp -d "$APPS_DIR/.appimgr-dl.XXXXXX")
+  D_URL=(); D_OUT=(); D_LABEL=(); D_SIZE=()
+  for (( i = 0; i < n; i++ )); do
+    f=${B_NAME[i]##*/}; if [[ -z $f ]]; then f="download.AppImage"; fi
+    D_URL+=("${B_URL[i]}"); D_OUT+=("$BATCH_DIR/$i/$f"); D_LABEL+=("${B_SLUG[i]}"); D_SIZE+=("${B_SIZE[i]}")
+  done
+  info "Downloading $n file(s)..."
+  dl_many
+  for (( i = 0; i < n; i++ )); do
+    if (( D_RC[i] == 0 )) && [[ -f ${D_OUT[i]} ]]; then pf[i]=${D_OUT[i]}; else pf[i]=""; fi
+  done
+
+  # --- phase 3: install one by one, one line each ---
+  info "Installing $n app(s)..."
+  SCRATCH=$(mktemp -d)
   for (( i = 0; i < n; i++ )); do
     slug=${B_SLUG[i]}
+    pre=""
+    if (( n > 1 )); then printf -v pre '(%d/%d) ' "$((i + 1))" "$n"; fi
+    printf ' %s%-*s  %s -> %s  ' "$pre" "$w" "$slug" "${B_OLD[i]}" "${B_VER[i]:-latest}"
+    if [[ -z ${pf[i]} ]]; then
+      echo "${C_R}FAILED${C_N} (download)"; failed+=("$slug"); continue
+    fi
     L_URL=${B_URL[i]}; L_NAME=${B_NAME[i]}; L_DIGEST=${B_DIGEST[i]}; L_VERSION=${B_VER[i]}; L_ETAG=${B_ETAG[i]}
-    info "[$((i+1))/$n] $slug"
-    # own subshell so one failing app (even a die) does not stop the others; it must not
-    # clean up the shared download folder, so BATCH_DIR is blanked there
+    DL_ETAG=${D_ETAG[i]:-}
+    # own subshell so one failing app (even a die) does not stop the others; it must not clean up
+    # the shared folders, so those are blanked there. stdin is closed so nothing can ask a question.
     set +e
-    ( set -e; BATCH_DIR=""; SCRATCH=""; trap cleanup EXIT; install_one "$slug" "${B_SRC[i]}" "${PF[i]:-}" )
+    ( set -e; BATCH_DIR=""; SCRATCH=""; trap cleanup EXIT; QUIET=1; install_one "$slug" "${B_SRC[i]}" "${pf[i]}" ) \
+      >/dev/null 2>"$SCRATCH/err" </dev/null
     rc=$?
     set -e
-    if (( rc )); then failed+=("$slug"); else ok=$((ok+1)); fi
-    if [[ -n $BATCH_DIR ]]; then rm -rf -- "$BATCH_DIR/$i"; fi
+    if (( rc == 0 )); then echo "${C_G}done${C_N}"; ok=$((ok + 1)); else echo "${C_R}FAILED${C_N}"; failed+=("$slug"); fi
+    if [[ -s $SCRATCH/err ]]; then sed 's/^/      /' "$SCRATCH/err" >&2; fi
+    rm -rf -- "$BATCH_DIR/$i"
   done
-  if [[ -n $BATCH_DIR ]]; then rm -rf -- "$BATCH_DIR"; BATCH_DIR=""; fi
+  rm -rf -- "$SCRATCH"; SCRATCH=""
+  rm -rf -- "$BATCH_DIR"; BATCH_DIR=""
   info "updated $ok of $n"
   if (( ${#failed[@]} )); then warn "failed: ${failed[*]}"; return 1; fi
   return 0
 }
 
 cmd_update() {
-  local slug="" file="" all=0 check=0 yes=0 pass=()
+  local all=0 check=0 yes=0 pass=() pos=() slugs=() file="" p seen=" "
   while (($#)); do
     case $1 in
       --all)      all=1; shift ;;
       --check)    check=1; shift ;;
       -y|--yes)   yes=1; shift ;;
       -j|--jobs)  set_jobs "${2:?missing value for $1}"; shift 2 ;;
-      --no-aria2) USE_ARIA=0; shift ;;
+      --no-aria2) shift ;;
       -n|--name|-a|--args|-i|--icon) pass+=("$1" "${2:?missing value for $1}"); shift 2 ;;
       --no-fuse|--no-move|--move|--portable) pass+=("$1"); shift ;;
       -*)         die "unknown option: $1" ;;
-      *)
-        if (( all )); then die "unexpected argument: $1"
-        elif [[ -z $slug ]]; then slug=$1
-        elif [[ -z $file ]]; then file=$1
-        else die "unexpected argument: $1"; fi
-        shift ;;
+      *)          pos+=("$1"); shift ;;
     esac
   done
   set_jobs "$JOBS"   # also checks APPIMGR_JOBS
 
-  if [[ -z $slug ]]; then
-    if (( ${#pass[@]} )); then die "options ${pass[0]} ... only work with: appimgr update <slug> <file>"; fi
-    all=1   # no slug: same as --all
-  fi
+  # a name that is an integrated app is an app; the one other thing allowed is a local file
+  for p in ${pos[@]+"${pos[@]}"}; do
+    if [[ -f $DESKTOP_DIR/appimage-$p.desktop ]]; then
+      if [[ $seen != *" $p "* ]]; then slugs+=("$p"); seen+="$p "; fi
+    elif [[ -z $file && -f $p ]]; then
+      file=$p
+    else
+      die "not integrated: $p (see: appimgr list)"
+    fi
+  done
+  if (( all && ${#pos[@]} )); then die "--all cannot be combined with app names"; fi
 
-  if (( all )); then
-    update_batch "$check" "$yes"
+  if [[ -n $file ]]; then
+    (( ${#slugs[@]} == 1 )) || die "a local file can replace only one app: appimgr update <slug> <file>"
+    saved_opts "${slugs[0]}"
+    add_one --slug "${slugs[0]}" ${SAVED[@]+"${SAVED[@]}"} ${pass[@]+"${pass[@]}"} "$file"
     return
   fi
-
-  [[ -f $DESKTOP_DIR/appimage-$slug.desktop ]] || die "not integrated: $slug (see: appimgr list)"
-  if [[ -n $file ]]; then
-    saved_opts "$slug"
-    cmd_add --slug "$slug" "${SAVED[@]}" "${pass[@]}" "$file"
-  else
-    update_one "$slug" "$check" "$yes" 0
-  fi
+  if (( ${#pass[@]} )); then die "options ${pass[0]} ... only work with: appimgr update <slug> <file>"; fi
+  update_batch "$check" "$yes" ${slugs[@]+"${slugs[@]}"}
 }
 
 cmd_rollback() {
@@ -1604,34 +1759,86 @@ handle_data() { # <portable folder or ''> <permanent 0|1> <yes 0|1>
   done
 }
 
-cmd_remove() {
-  local slug="" yes=0 purge=0 pdata=0
-  while (($#)); do
-    case $1 in
-      -y|--yes)    yes=1; shift ;;
-      --purge)     purge=1; shift ;;
-      --purge-data) pdata=1; shift ;;
-      -*)          die "unknown option: $1" ;;
-      *)           if [[ -z $slug ]]; then slug=$1; else die "unexpected argument: $1"; fi; shift ;;
-    esac
-  done
-  [[ -n $slug ]] || { usage; exit 1; }
-  local df="$DESKTOP_DIR/appimage-$slug.desktop" path="" name has_file=0 trashed="" pdir has_pdir=0
-  [[ -f $df ]] || die "not integrated: $slug (see: appimgr list)"
+# Removes one app (the questions were asked already). Returns 1 with a warning if it could not.
+remove_one() { # <slug> <purge 0|1> <leftover search 0|1> <yes 0|1> <line prefix>
+  local slug=$1 purge=$2 pdata=$3 yes=$4 pre=${5:-}
+  local df="$DESKTOP_DIR/appimage-$slug.desktop" path="" has_file=0 trashed="" pdir has_pdir=0 note=""
   path=$(desktop_path "$df")
-  name=$(grep -m1 '^Name=' "$df" | cut -d= -f2- || true)
   if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then has_file=1; fi
   pdir=$(portable_dir "$slug")
   if [[ -d $pdir ]]; then has_pdir=1; fi
 
+  if (( pdata )); then
+    if command -v pgrep >/dev/null 2>&1 && [[ -n $path ]] && pgrep -f -- "$path" >/dev/null 2>&1; then
+      warn "$slug seems to be running: close it first (nothing was removed)"
+      printf ' %s%s  %sFAILED%s (running)\n' "$pre" "$slug" "$C_R" "$C_N"
+      return 1
+    fi
+    find_leftovers "$slug" "$df"   # reads the names from the launcher entry, so it must run before that is deleted
+  fi
+
+  if (( has_file )); then
+    if (( purge )); then
+      rm -f -- "$path"; note="AppImage deleted"
+    else
+      trashed=$(trash_file "$path") || {
+        warn "$slug: could not move $path to the Trash (use --purge to delete it)"
+        printf ' %s%s  %sFAILED%s\n' "$pre" "$slug" "$C_R" "$C_N"
+        return 1
+      }
+      note="AppImage in the Trash as '$trashed'"
+    fi
+  fi
+  rm -f -- "$df" "$BACKUP_DIR/$slug.AppImage" "$META_DIR/$slug.conf"
+  find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
+  rm -f -- "$ICONS_DIR/custom/$slug".*
+  printf ' %s%s  %sremoved%s%s\n' "$pre" "$slug" "$C_G" "$C_N" "${note:+  ($note)}"
+
+  if (( pdata )); then
+    handle_data "$( if (( has_pdir )); then echo "$pdir"; fi )" "$purge" "$yes"
+  elif (( has_pdir )); then
+    echo "      its portable data folder was kept: $(tilde "$pdir") (delete it yourself, or next time use --purge-data)"
+  fi
+}
+
+cmd_remove() {
+  local yes=0 purge=0 pdata=0 slugs=() s seen=" " n k=0 ok=0 rc pre="" name path
+  local files=() baks=() pds=() failed=()
+  while (($#)); do
+    case $1 in
+      -y|--yes)     yes=1 ;;
+      --purge)      purge=1 ;;
+      --purge-data) pdata=1 ;;
+      -*)           die "unknown option: $1" ;;
+      *)            if [[ $seen != *" $1 "* ]]; then slugs+=("$1"); seen+="$1 "; fi ;;
+    esac
+    shift
+  done
+  (( ${#slugs[@]} )) || { usage; exit 1; }
+  for s in "${slugs[@]}"; do
+    [[ -f $DESKTOP_DIR/appimage-$s.desktop ]] || die "not integrated: $s (see: appimgr list)"
+  done
+  n=${#slugs[@]}
+
   if (( ! yes )); then
-    info "remove '${name:-$slug}' ($slug)?"
-    echo "   - launcher entry, icon and update settings are deleted"
-    if (( has_file && purge )); then echo "   - the AppImage is deleted PERMANENTLY"
-    elif (( has_file )); then echo "   - the AppImage is moved to the Trash (restorable)"; fi
-    if [[ -f $BACKUP_DIR/$slug.AppImage ]]; then echo "   - the previous version (rollback copy) is deleted"; fi
-    if (( has_pdir && pdata )); then echo "   - its portable data folder is deleted ($(tilde "$pdir"))"
-    elif (( has_pdir )); then echo "   - its portable data folder is KEPT ($(tilde "$pdir")); add --purge-data to delete it"; fi
+    for s in "${slugs[@]}"; do
+      path=$(desktop_path "$DESKTOP_DIR/appimage-$s.desktop")
+      if [[ -n $path && $path == "$APPS_DIR"/* && -f $path ]]; then files+=("$s"); fi
+      if [[ -f $BACKUP_DIR/$s.AppImage ]]; then baks+=("$s"); fi
+      if [[ -d $(portable_dir "$s") ]]; then pds+=("$s"); fi
+    done
+    if (( n == 1 )); then
+      name=$(grep -m1 '^Name=' "$DESKTOP_DIR/appimage-${slugs[0]}.desktop" | cut -d= -f2- || true)
+      info "remove '${name:-${slugs[0]}}' (${slugs[0]})?"
+    else
+      info "remove $n apps: ${slugs[*]}?"
+    fi
+    echo "   - launcher entries, icons and update settings are deleted"
+    if (( ${#files[@]} && purge )); then echo "   - the AppImage(s) are deleted PERMANENTLY"
+    elif (( ${#files[@]} )); then echo "   - the AppImage(s) are moved to the Trash (restorable)"; fi
+    if (( ${#baks[@]} )); then echo "   - the previous versions (rollback copies) are deleted: ${baks[*]}"; fi
+    if (( ${#pds[@]} && pdata )); then echo "   - portable data folders are deleted: ${pds[*]}"
+    elif (( ${#pds[@]} )); then echo "   - portable data folders are KEPT: ${pds[*]} (add --purge-data to delete them)"; fi
     if (( pdata )); then echo "   - you choose which leftover data found by name is deleted"; fi
     if ! confirm "Continue?" n; then info "cancelled (non-interactive? use -y)"; return 0; fi
     if (( ! pdata )) && [[ -t 0 ]]; then
@@ -1639,32 +1846,21 @@ cmd_remove() {
     fi
   fi
 
-  if (( pdata )); then
-    if command -v pgrep >/dev/null 2>&1 && [[ -n $path ]] && pgrep -f -- "$path" >/dev/null 2>&1; then
-      die "$slug seems to be running: close it first (nothing was removed)"
-    fi
-    find_leftovers "$slug" "$df"   # reads the names from the launcher entry, so it must run before that is deleted
-  fi
-
-  if (( has_file )); then
-    if (( purge )); then
-      rm -f -- "$path"
-    else
-      trashed=$(trash_file "$path") || die "could not move $path to the Trash (use --purge to delete it)"
-    fi
-  fi
-  rm -f -- "$df" "$BACKUP_DIR/$slug.AppImage" "$META_DIR/$slug.conf"
-  find "$ICONS_DIR" -maxdepth 1 -name "$slug.*" -delete 2>/dev/null || true
-  rm -f -- "$ICONS_DIR/custom/$slug".*
+  if (( n > 1 )); then info "Removing $n apps..."; fi
+  for s in "${slugs[@]}"; do
+    k=$((k + 1)); pre=""
+    if (( n > 1 )); then printf -v pre '(%d/%d) ' "$k" "$n"; fi
+    # own subshell so one failing app does not stop the others
+    set +e
+    ( set -e; remove_one "$s" "$purge" "$pdata" "$yes" "$pre" )
+    rc=$?
+    set -e
+    if (( rc == 0 )); then ok=$((ok + 1)); else failed+=("$s"); fi
+  done
   refresh
-  info "removed: $slug"
-  if [[ -n $trashed ]]; then info "AppImage moved to Trash as '$trashed' (restore it from your file manager)"; fi
-
-  if (( pdata )); then
-    handle_data "$( if (( has_pdir )); then echo "$pdir"; fi )" "$purge" "$yes"
-  elif (( has_pdir )); then
-    info "its portable data folder was kept: $(tilde "$pdir") (delete it yourself, or next time use --purge-data)"
-  fi
+  if (( n > 1 )); then info "removed $ok of $n"; fi
+  if (( ${#failed[@]} )); then warn "not removed: ${failed[*]}"; return 1; fi
+  return 0
 }
 
 # ---------- portable mode ----------
@@ -1806,7 +2002,7 @@ cmd_icon() {
 }
 
 # ---------- interactive menu (no arguments, on a terminal) ----------
-SLUGS=(); CANDS=(); PICKED=""
+SLUGS=(); CANDS=(); PICKED=""; PICKED_LIST=()
 
 # fresh process: errors don't kill the menu. The token was removed from the environment at
 # startup, so it is handed to this one child explicitly.
@@ -1850,15 +2046,20 @@ find_candidates() { # AppImage files lying around that are not already in APPS_D
   done
 }
 
-pick_app() { # <prompt> [all] -> PICKED (slug, or --all)
+print_slug_list() { # numbered list of the integrated apps (SLUGS must be loaded)
   local i s name
-  PICKED=""; load_slugs
-  if ((${#SLUGS[@]} == 0)); then info "no integrated AppImages yet - use 'Add' first"; return 1; fi
   for i in "${!SLUGS[@]}"; do
     s=${SLUGS[i]}
     name=$(grep -m1 '^Name=' "$DESKTOP_DIR/appimage-$s.desktop" | cut -d= -f2- || true)
     printf '   %2d) %-22s %s\n' $((i+1)) "$s" "$name"
   done
+}
+
+pick_app() { # <prompt> [all] -> PICKED (slug, or --all)
+  local s
+  PICKED=""; load_slugs
+  if ((${#SLUGS[@]} == 0)); then info "no integrated AppImages yet - use 'Add' first"; return 1; fi
+  print_slug_list
   if [[ ${2:-} == all ]]; then echo "    a) all"; fi
   ask "   $1 (Enter = cancel): " || return 1
   [[ -n $REPLY ]] || return 1
@@ -1872,8 +2073,32 @@ pick_app() { # <prompt> [all] -> PICKED (slug, or --all)
   warn "invalid choice: $REPLY"; return 1
 }
 
+# Like pick_app, but several numbers or names at once ("1 3 4"). Result in PICKED_LIST
+# (or just --all when 'all' is allowed and chosen).
+pick_apps() { # <prompt> [all]
+  local s tok toks=()
+  PICKED_LIST=(); load_slugs
+  if ((${#SLUGS[@]} == 0)); then info "no integrated AppImages yet - use 'Add' first"; return 1; fi
+  print_slug_list
+  if [[ ${2:-} == all ]]; then echo "    a) all"; fi
+  ask "   $1 (numbers or names separated by spaces, Enter = cancel): " || return 1
+  [[ -n $REPLY ]] || return 1
+  if [[ ${2:-} == all && $REPLY == [Aa] ]]; then PICKED_LIST=(--all); return 0; fi
+  read -ra toks <<<"$REPLY" || true
+  for tok in ${toks[@]+"${toks[@]}"}; do
+    if [[ $tok =~ ^[0-9]{1,4}$ ]] && ((10#$tok >= 1 && 10#$tok <= ${#SLUGS[@]})); then
+      PICKED_LIST+=("${SLUGS[10#$tok-1]}"); continue
+    fi
+    for s in "${SLUGS[@]}"; do
+      if [[ $tok == "$s" ]]; then PICKED_LIST+=("$s"); continue 2; fi
+    done
+    warn "ignored: $tok"
+  done
+  ((${#PICKED_LIST[@]} > 0))
+}
+
 menu_add() {
-  local i f size file="" tilde_c='~' args=() remote=0
+  local i f size file="" tilde_c='~' args=() remote=0 files=() tok toks=()
   find_candidates
   if ((${#CANDS[@]})); then
     info "AppImage files found:"
@@ -1881,44 +2106,53 @@ menu_add() {
       f=${CANDS[i]}; size=$(du -h -- "$f" | cut -f1)
       printf '   %2d) %s  [%s]\n' $((i+1)) "${f/#$HOME/$tilde_c}" "$size"
     done
-    ask "   Number, path to an .AppImage, download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
+    ask "   Number(s) (several: 1 3), path to an .AppImage, download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
   else
     ask "   Path to an .AppImage (drag & drop), download link or GitHub OWNER/REPO (Enter = cancel): " || return 0
   fi
   [[ -n $REPLY ]] || return 0
-  if [[ $REPLY =~ ^[0-9]{1,4}$ ]] && ((10#$REPLY >= 1 && 10#$REPLY <= ${#CANDS[@]})); then
-    file=${CANDS[10#$REPLY-1]}
+  if [[ $REPLY =~ ^[0-9]{1,4}( +[0-9]{1,4})*$ ]]; then
+    # one or more numbers from the list above
+    read -ra toks <<<"$REPLY"
+    for tok in "${toks[@]}"; do
+      if ((10#$tok >= 1 && 10#$tok <= ${#CANDS[@]})); then files+=("${CANDS[10#$tok-1]}"); else warn "ignored: $tok"; fi
+    done
+    ((${#files[@]})) || return 0
   elif [[ $REPLY =~ ^https?://[^[:space:]]+$ ]]; then
-    remote=1; file=$REPLY
+    remote=1; files=("$REPLY")
   else
     file=$(clean_path "$REPLY")
     if [[ ! -e $file && $file =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
-      remote=1; args+=(--repo "$file"); file=""
+      remote=1; args+=(--repo "$file")
       ask "   Asset pattern, e.g. 'Foo-*-x86_64.AppImage' (Enter = auto-detect): " || return 0
       if [[ -n $REPLY ]]; then args+=(--asset "$(unquote "$REPLY")"); fi
     elif [[ ! -f $file ]]; then
       warn "file not found: $file"; return 0
+    else
+      files=("$file")
     fi
   fi
-  ask "   Display name (Enter = auto-detect): " || return 0
-  if [[ -n $REPLY ]]; then args+=(--name "$REPLY"); fi
+  if ((${#files[@]} <= 1)); then
+    ask "   Display name (Enter = auto-detect): " || return 0
+    if [[ -n $REPLY ]]; then args+=(--name "$REPLY"); fi
+  fi
   ask "   Keep this app's data in its own folder (portable), so removing it leaves nothing behind? [y/N] " || return 0
   if [[ $REPLY == [Yy]* ]]; then args+=(--portable); fi
-  if (( ! remote )) && ! confirm "Delete the original file after integrating?" y; then args+=(--no-move); fi
-  if [[ -n $file ]]; then args+=("$file"); fi
-  run_self add "${args[@]}"
+  if (( ! remote )) && ! confirm "Delete the original file(s) after integrating?" y; then args+=(--no-move); fi
+  run_self add "${args[@]}" ${files[@]+"${files[@]}"}
 }
 
 menu_update() { # <check 0|1>
-  local check=$1 a=()
-  if ((check)); then pick_app "Check which app" all || return 0
-  else pick_app "Update which app" all || return 0; fi
-  if [[ $PICKED == --all ]]; then
-    local s have=0
+  local check=$1 a=() s have=0 q="Update which app(s)"
+  if ((check)); then q="Check which app(s)"; fi
+  pick_apps "$q" all || return 0
+  if [[ ${PICKED_LIST[0]} == --all ]]; then
     for s in "${SLUGS[@]}"; do if [[ -n $(meta_get "$s" source) ]]; then have=1; fi; done
     if ((! have)); then info "none of your apps has an update source yet - use option 7 to set one"; return 0; fi
     a=(--all)
-  else a=("$PICKED"); fi
+  else
+    a=("${PICKED_LIST[@]}")
+  fi
   if ((check)); then a+=(--check); fi
   run_self update "${a[@]}"
 }
@@ -1986,14 +2220,14 @@ cmd_menu() {
     fi
     cat <<'EOF'
 
-  1) Add / integrate an AppImage (file, link or GitHub repo)
+  1) Add / integrate AppImages (files, links or a GitHub repo)
   2) List apps (details)
   3) Run an app
-  4) Check for updates
-  5) Update apps
+  4) Check for updates (one, several or all)
+  5) Update apps (one, several or all)
   6) Roll back to previous version
   7) Set update source
-  8) Remove an app (and optionally its leftover data)
+  8) Remove apps (and optionally their leftover data)
   9) Change an app's icon
  10) Portable mode (an app's data in its own folder)
   h) Full help        q) Quit (or Enter)
@@ -2007,7 +2241,7 @@ EOF
       5|u|update)    menu_update 0 ;;
       6|rollback)    if pick_app "Roll back which app"; then run_self rollback "$PICKED"; fi ;;
       7|s|source)    menu_source ;;
-      8|rm|remove)   if pick_app "Remove which app"; then run_self remove "$PICKED"; fi ;;
+      8|rm|remove)   if pick_apps "Remove which app(s)"; then run_self remove "${PICKED_LIST[@]}"; fi ;;
       9|i|icon)      menu_icon ;;
       10|p|portable) menu_portable ;;
       h|help|'?')    usage ;;
@@ -2018,7 +2252,6 @@ EOF
 }
 
 init_token
-if [[ ${APPIMGR_DOWNLOADER:-} == curl ]]; then USE_ARIA=0; fi
 
 case "${1:-}" in
   add)               shift; cmd_add "$@" ;;
