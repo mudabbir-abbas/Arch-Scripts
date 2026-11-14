@@ -50,7 +50,6 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
 | [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` (or any path) to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
 | [`repos`](#repos) | Git helper for several repos: set up, switch, link to GitHub, remove, plus everyday git | Anywhere with git (`gh` optional) | Yes (git commits/pushes, **can delete repo folders**) |
-| [`shelf`](#shelf) | Menu launcher for every script in `~/.local/bin` | Anywhere (nicer with `fzf`) | No |
 | [`stage`](#stage) | Save Niri window layouts as one-key profiles and restore them | **Niri only** | Yes (edits Niri config) |
 | [`syscheck`](#syscheck) | Read-only health report for Arch + Niri + DMS | **Arch, tuned to my laptop** | No (read-only) |
 | [`thermal-toast`](#thermal-toast) | Desktop notification when the CPU stays hot too long; can install itself as a user service | Intel `coretemp` machines | Only if you run `install` (user service + settings file) |
@@ -60,7 +59,7 @@ All scripts follow the same conventions:
 - `VERSION="MAJOR.MINOR.PATCH"` near the top, shown by `--version` and at the top of `--help`.
 - A **NEW IN THIS VERSION** comment block at the top: a short changelog for the latest bump.
 - Run with no arguments, they still do something useful (a menu, or the help text).
-- A `# DESC:` line near the top that `shelf` uses as the description.
+- A `# DESC:` line near the top with a one-line description of the script.
 
 ---
 
@@ -148,18 +147,6 @@ The successor to `binvc`: a git helper that keeps a list of my repos, with one "
 
 > ⚠️ `repos remove` deletes things for good. Read the summary it prints before typing the name, and use `forget` if you only want the repo out of the list.
 
-### shelf
-
-A launcher menu for everything in `~/.local/bin`.
-
-- Lists scripts with their version and a description (read from the first lines of each script, never executed).
-- With `fzf`: Enter to run, `Ctrl-A` to run with arguments, `Ctrl-H` for `--help`, `Ctrl-E` to edit, `Tab` for an info panel.
-- Without `fzf`: falls back to a plain numbered menu.
-- Ctrl+C inside a launched script brings you back to the menu instead of closing it.
-- `-l`/`--list` prints the table, `--info NAME` prints one script's info card, `-d DIR` (or `SHELF_DIR`) scans another folder. The table is also printed when there's no terminal (e.g. `shelf | cat`).
-
-**Needs:** `bash`. **Optional:** `fzf`.
-
 ### stage
 
 Saves your Niri window layout as a named profile ("stage") and restores it later with one shortcut.
@@ -204,7 +191,7 @@ A tiny watcher that sends a desktop notification when the CPU package stays abov
 ## How the pieces fit together
 
 ```
- AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin ──► shelf (menu)
+ AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin
                                           │
                                           └──► repos (or binvc) ──► this repo
 ```
