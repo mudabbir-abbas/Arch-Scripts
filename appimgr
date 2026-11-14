@@ -1,23 +1,12 @@
 #!/usr/bin/env bash
 # DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
-# NEW IN THIS VERSION (4.0.0):
-#   - New: several apps at once. 'appimgr update app1 app2 app3' updates only those,
-#     'appimgr remove app1 app2 app3' removes them (one question for all), and
-#     'appimgr add a.AppImage b.AppImage <link>' adds several (per-app options such as
-#     --name need a single app). The menu accepts several numbers too ("1 3 4").
-#   - Changed: output looks like a package manager. Update checks show a progress bar, updates
-#     are listed in a table (old -> new version, size, total), every download has its own
-#     "name [#####-----] 42% size speed" line, and installs print one line per app. The raw
-#     per-app chatter (extraction, icons, update source) is hidden while updating.
-#   - Changed: downloads use curl only, several at a time (-j N). aria2c support is gone:
-#     the --no-aria2 option and the APPIMGR_DOWNLOADER variable are removed (breaking: the
-#     option is now an "unknown option" error).
-#   - Named apps whose newer version cannot be told (no digest/version) are offered for
-#     update instead of being skipped. A name that is an integrated app is always an app;
-#     anything else given to 'update' must be a local file (appimgr update <slug> <file>).
-#   - The 3.3.0 entry is replaced by this one.
-VERSION="4.0.0"
+# NEW IN THIS VERSION (4.0.1):
+#   - Fix: the text cursor jumped up and down on every redraw of the download progress lines.
+#     It is now hidden while downloads are shown and brought back when they finish. It is
+#     also restored on Ctrl+C or any error, so the terminal is never left without a cursor.
+#   - The 4.0.0 entry is replaced by this one.
+VERSION="4.0.1"
 #
 set -euo pipefail
 
@@ -52,6 +41,7 @@ D_URL=(); D_OUT=(); D_LABEL=(); D_SIZE=(); D_RC=(); D_ETAG=()   # download list,
 
 cleanup() {
   local p
+  if [[ -t 1 ]]; then printf '\033[?25h'; fi   # always give the cursor back (it is hidden during downloads)
   for p in $(jobs -p 2>/dev/null); do kill "$p" 2>/dev/null || true; done
   if [[ -n $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
   if [[ -n $STAGE_FILE ]]; then rm -f -- "$STAGE_FILE"; fi
@@ -307,6 +297,7 @@ dl_many() {
     if [[ ${D_SIZE[i]:-} =~ ^[0-9]+$ ]]; then tot[i]=${D_SIZE[i]}; fi
   done
   if (( tty )); then for (( i = 0; i < n; i++ )); do echo; done; fi
+  if (( tty )); then printf '\033[?25l'; fi   # hide the cursor while the lines are redrawn (cleanup() restores it on Ctrl+C or errors)
 
   while (( finished < n )); do
     while (( started < n && running < JOBS )); do
@@ -335,6 +326,7 @@ dl_many() {
     if (( tty )); then dl_draw; fi
     if (( finished < n )); then sleep 0.2; fi
   done
+  if (( tty )); then printf '\033[?25h'; fi   # downloads finished: show the cursor again
 
   for (( i = 0; i < n; i++ )); do
     if [[ ${st[i]} == ok && -f ${D_OUT[i]}.hdr ]]; then
