@@ -2,7 +2,14 @@
 # DESC: Notify when the CPU package stays hot for too long (installs and manages itself as a user service)
 # thermal-toast: notify when the CPU package stays hot for too long.
 #
-# NEW IN THIS VERSION (2.0.0):
+# NEW IN THIS VERSION (2.0.1):
+#   - Fixed low thresholds so the hot-period timer resets after the CPU cools.
+#   - Installation now stops on daemon-reload or enable failures instead of
+#     reporting success when the service is not enabled correctly.
+#   - The watcher exits with an error if its sensor stops being readable, allowing
+#     systemd to restart it.
+#
+# PREVIOUS VERSION (2.0.0):
 #   - New: the script manages itself as a systemd user service: install, uninstall,
 #     start, stop, restart, enable, disable, reload, status and log. No unit file to
 #     write by hand.
@@ -15,7 +22,7 @@
 #     so an existing autostart line keeps working.
 #   - The start line is also printed when not on a terminal, so the journal shows the
 #     settings in use.
-VERSION="2.0.0"
+VERSION="2.0.1"
 NAME="thermal-toast"
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -235,7 +242,7 @@ cmd_run() {
             load_config
             echo "$NAME: settings reloaded (alert above ${THRESHOLD}°C for ${SUSTAIN}s, check every ${INTERVAL}s)."
         fi
-        raw="$(cat "$sensor" 2>/dev/null)" || { nap; continue; }
+        raw="$(cat "$sensor" 2>/dev/null)" || die "Cannot read CPU temperature sensor: $sensor"
         temp=$(( raw / 1000 ))
         now=$SECONDS
 
@@ -247,7 +254,7 @@ cmd_run() {
 $(top_procs)"
                 last_alert=$now
             fi
-        elif (( temp < THRESHOLD - HYSTERESIS )); then
+        elif (( temp < THRESHOLD - HYSTERESIS || (THRESHOLD <= HYSTERESIS && temp < THRESHOLD) )); then
             hot_since=-1
         fi
 
@@ -306,8 +313,8 @@ Nice=10
 [Install]
 WantedBy=default.target
 EOF
-    sctl daemon-reload
-    sctl enable "$UNIT" 2>&1 | tail -n1
+    sctl daemon-reload || die "systemd daemon-reload failed"
+    sctl enable "$UNIT" || die "could not enable the service"
     sctl restart "$UNIT" || die "the service did not start (see: $NAME log)"
     echo "Installed, enabled and started. Check it with: $NAME status"
     if (( ${#CLI_VARS[@]} )); then echo "Your options were saved in $CONF_FILE"; fi
@@ -316,9 +323,9 @@ EOF
 cmd_uninstall() {
     if ! is_installed; then echo "The service is not installed."; else
         need_systemd
-        sctl disable --now "$UNIT" 2>&1 | tail -n1
+        sctl disable --now "$UNIT" || die "could not disable and stop the service"
         rm -f -- "$UNIT_FILE"
-        sctl daemon-reload
+        sctl daemon-reload || die "systemd daemon-reload failed after removing the service"
         sctl reset-failed "$UNIT" 2>/dev/null || true
         echo "Service removed."
     fi
