@@ -48,7 +48,6 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 | [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; add, update from GitHub and remove one or several at once, roll back, optionally clean up leftover data | Most Linux desktops | Yes (`~/.local/share`) |
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
 | [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` (or any path) to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
-| [`repos`](#repos) | Git helper for several repos: set up, switch, link to GitHub, remove, plus everyday git | Anywhere with git (`gh` optional) | Yes (git commits/pushes, **can delete repo folders**) |
 | [`stage`](#stage) | Save Niri window layouts as one-key profiles and restore them | **Niri only** | Yes (edits Niri config) |
 | [`syscheck`](#syscheck) | Read-only health report for Arch + Niri + DMS | **Arch, tuned to my laptop** | No (read-only) |
 | [`thermal-toast`](#thermal-toast) | Desktop notification when the CPU stays hot too long; can install itself as a user service | Intel `coretemp` machines | Only if you run `install` (user service + settings file) |
@@ -113,23 +112,6 @@ Picks files/folders, packs them into one archive, and puts them back in their or
 
 **Needs:** `bash` and coreutils. **Optional:** `fish` for the completions.
 
-### repos
-
-A git helper that keeps a list of my repos, with one "active" repo that the everyday commands act on.
-
-- **Everyday git:** `status` (suggests the next command), `commit`, `push`, `pull`, `sync "message"`, `log`, `undo`, `tag`, secret scan, and so on. These act on the active repo, and commands that change something print which repo they are working on.
-- **Set up a repo:** `repos new NAME` runs `git init`, creates a starter `.gitignore`, makes the first commit (with the secret check) and registers the repo. It can then create the GitHub repo with `gh` (private by default), or link an existing URL, or stay local. `repos add` registers a folder I already have, `repos clone URL` clones one.
-- **Switch repos:** `repos use NAME` (no name = pick from a list). `repos list` shows every repo with its branch and whether it has changes to commit, push or pull.
-- **GitHub link:** `repos link` / `repos link --github` / `repos unlink` for the active repo.
-- **Remove a repo:** `repos forget NAME` only drops it from the list and keeps all files. `repos remove NAME` unlinks it from GitHub and then **deletes the whole folder** (including `.git` and untracked files, no Trash). It shows what will be lost, needs the repo name typed to confirm, and refuses to run without a terminal. The GitHub repo itself is never deleted.
-- On first run my existing `~/.local/bin` repo is registered as `scripts`. The list lives in `~/.config/repos/`.
-- Interactive menu when run with no arguments.
-
-**Needs:** `git`. **Optional:** `gh` (GitHub CLI, `sudo pacman -S github-cli` then `gh auth login`) to create GitHub repos.
-`REPOS_REPO` overrides the active repo for a single run. `BINVC_REPO` is also accepted as a legacy alias.
-
-> ⚠️ `repos remove` deletes things for good. Read the summary it prints before typing the name, and use `forget` if you only want the repo out of the list.
-
 ### stage
 
 Saves your Niri window layout as a named profile ("stage") and restores it later with one shortcut.
@@ -160,7 +142,7 @@ A reusable, **read-only** health report for my exact setup: Arch + Niri + Dank M
 
 A tiny watcher that sends a desktop notification when the CPU package stays above a temperature for too long. It can also manage itself as a systemd user service, so there's no unit file to write by hand.
 
-- Defaults: alert above 85 °C for 60 s, 10-minute cooldown, checks every 5 s.
+- Defaults: alert above 90 °C for 60 s, 10-minute cooldown, checks every 5 s.
 - Settings come from, in priority order: option, `THERMAL_TOAST_*` variable, settings file (`~/.config/thermal-toast/config`), default.
 - The notification lists the top CPU-using processes.
 - **Service commands:** `install`, `uninstall [--purge]`, `start`, `stop`, `restart`, `enable`, `disable`, `reload`, `status`, `log [-f]`, `config set NAME VALUE` (reloads a running service), `test`, and `run` to watch in the terminal.
@@ -175,11 +157,9 @@ A tiny watcher that sends a desktop notification when the CPU package stays abov
 
 ```
  AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin
-                                          │
-                                          └──► repos ──► this repo
 ```
 
-My workflow: ask the AI for a change, download the updated script, run `ims` to install it (or `ims path/to/file` if it landed somewhere else), try it, and when I'm happy run `repos sync` to commit and push.
+My workflow: ask the AI for a change, download the updated script, run `ims` to install it (or `ims path/to/file` if it landed somewhere else), try it, and commit and push changes when I'm happy.
 
 ---
 

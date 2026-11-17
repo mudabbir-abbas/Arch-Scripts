@@ -33,7 +33,7 @@ UNIT_DIR="$CFG_HOME/systemd/user"
 UNIT_FILE="$UNIT_DIR/$UNIT"
 
 VARS=(THRESHOLD SUSTAIN COOLDOWN INTERVAL)
-THRESHOLD=85     # deg C
+THRESHOLD=90     # deg C
 SUSTAIN=60       # seconds above threshold before alerting
 COOLDOWN=600     # seconds between alerts
 INTERVAL=5       # polling interval in seconds
@@ -76,7 +76,7 @@ Commands:
   test                 Send a test notification and exit (same as --test)
 
 Options:
-  -t, --threshold C   Temperature threshold in deg C   (default: 85)
+  -t, --threshold C   Temperature threshold in deg C   (default: 90)
   -s, --sustain S     Seconds above threshold to alert (default: 60)
   -c, --cooldown S    Seconds between alerts           (default: 600)
   -i, --interval S    Polling interval in seconds      (default: 5)
