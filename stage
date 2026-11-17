@@ -18,8 +18,7 @@
 #   - Fix: writing a file (config.kdl, profiles) no longer resets its permissions.
 #   - Renamed a local variable that hid the act() function; removed an empty
 #     section header.
-#   - Header: the older version history is replaced by this entry; added a
-#     # DESC: line for shelf.
+#   - Header: the older version history is replaced by this entry.
 VERSION="3.0.2"
 NAME="stage"
 LEGACY="niri-ws"

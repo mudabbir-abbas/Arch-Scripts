@@ -29,8 +29,8 @@
 #   - Fix: --full now marks a check that hit its deadline as [CHECK], like the other modes
 #   - Fix: boot phases over a minute ("1min 3.2s (firmware)") were read as 3.2s, which
 #     hid a slow firmware or loader phase; minutes are now counted
-#   - --version and --help print "syscheck v<version>"; VERSION moved up (shelf reads only
-#     the first 40 lines); the changelog at the end of the file is removed
+#   - --version and --help print "syscheck v<version>"; VERSION moved up and the changelog
+#     at the end of the file is removed
 NAME="syscheck"
 VERSION="4.3.1"
 #

@@ -46,7 +46,6 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 | Script | What it does | Portability | Changes your system? |
 |---|---|---|---|
 | [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; add, update from GitHub and remove one or several at once, roll back, optionally clean up leftover data | Most Linux desktops | Yes (`~/.local/share`) |
-| [`binvc`](#binvc) | Friendly git helper for the scripts repo itself (the older, single-repo version of `repos`) | Anywhere with git | Yes (git commits/pushes) |
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
 | [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` (or any path) to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
 | [`repos`](#repos) | Git helper for several repos: set up, switch, link to GitHub, remove, plus everyday git | Anywhere with git (`gh` optional) | Yes (git commits/pushes, **can delete repo folders**) |
@@ -83,21 +82,6 @@ Makes AppImages behave like installed apps.
 **Needs:** `bash`, `curl`. **Optional:** `fuse2` (without it, extract-and-run mode is used).
 **Writes to:** `~/.local/share/AppImages` (including `.AppImage.home` folders in portable mode), `~/.local/share/applications`.
 
-### binvc
-
-A small, friendly wrapper around git for the `~/.local/bin` scripts repo.
-
-> `repos` (below) is the newer version: it does everything `binvc` does and can also manage several repos. I'm keeping `binvc` around for now in case I don't get on with `repos`. It only knows one repo.
-
-- `status` suggests the next best command (commit, push, pull, sync) based on local and remote state.
-- `sync "message"` commits, pulls with rebase and pushes in one go.
-- Warns about possible secrets before committing and can scan the whole tracked tree.
-- Warns about scripts that have a shebang but aren't executable.
-- Has restore / old-version / undo helpers with confirmation prompts.
-- Interactive menu when run with no arguments (an error in one action returns to the menu instead of closing it).
-
-**Needs:** `git`. The repo path defaults to `~/.local/bin` (override with `BINVC_REPO`).
-
 ### fbackup
 
 Picks files/folders, packs them into one archive, and puts them back in their original locations later.
@@ -132,9 +116,9 @@ Picks files/folders, packs them into one archive, and puts them back in their or
 
 ### repos
 
-The successor to `binvc`: a git helper that keeps a list of my repos, with one "active" repo that the everyday commands act on.
+A git helper that keeps a list of my repos, with one "active" repo that the everyday commands act on.
 
-- **Everyday git, same as `binvc`:** `status` (suggests the next command), `commit`, `push`, `pull`, `sync "message"`, `log`, `undo`, `tag`, secret scan, and so on. These act on the active repo, and commands that change something print which repo they are working on.
+- **Everyday git:** `status` (suggests the next command), `commit`, `push`, `pull`, `sync "message"`, `log`, `undo`, `tag`, secret scan, and so on. These act on the active repo, and commands that change something print which repo they are working on.
 - **Set up a repo:** `repos new NAME` runs `git init`, creates a starter `.gitignore`, makes the first commit (with the secret check) and registers the repo. It can then create the GitHub repo with `gh` (private by default), or link an existing URL, or stay local. `repos add` registers a folder I already have, `repos clone URL` clones one.
 - **Switch repos:** `repos use NAME` (no name = pick from a list). `repos list` shows every repo with its branch and whether it has changes to commit, push or pull.
 - **GitHub link:** `repos link` / `repos link --github` / `repos unlink` for the active repo.
@@ -143,7 +127,7 @@ The successor to `binvc`: a git helper that keeps a list of my repos, with one "
 - Interactive menu when run with no arguments.
 
 **Needs:** `git`. **Optional:** `gh` (GitHub CLI, `sudo pacman -S github-cli` then `gh auth login`) to create GitHub repos.
-`BINVC_REPO` and `REPOS_REPO` override the active repo for a single run.
+`REPOS_REPO` overrides the active repo for a single run. `BINVC_REPO` is also accepted as a legacy alias.
 
 > ⚠️ `repos remove` deletes things for good. Read the summary it prints before typing the name, and use `forget` if you only want the repo out of the list.
 
@@ -193,10 +177,10 @@ A tiny watcher that sends a desktop notification when the CPU package stays abov
 ```
  AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin
                                           │
-                                          └──► repos (or binvc) ──► this repo
+                                          └──► repos ──► this repo
 ```
 
-My workflow: ask the AI for a change, download the updated script, run `ims` to install it (or `ims path/to/file` if it landed somewhere else), try it, and when I'm happy run `repos sync` (or the older `binvc sync`) to commit and push.
+My workflow: ask the AI for a change, download the updated script, run `ims` to install it (or `ims path/to/file` if it landed somewhere else), try it, and when I'm happy run `repos sync` to commit and push.
 
 ---
 

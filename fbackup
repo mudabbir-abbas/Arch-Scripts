@@ -12,8 +12,7 @@
 #   - 'config' now warns when sudo changed $HOME (same check as backup/restore).
 #   - tar's closing "Exiting with failure status" line is no longer shown as an
 #     extra warning; Ctrl+C prints "Interrupted." and exits with 130.
-#   - VERSION moved to the top (shelf reads only the first 40 lines); the
-#     history block is replaced by this entry.
+#   - VERSION moved to the top; the history block is replaced by this entry.
 VERSION="2.0.1"
 #
 # fbackup - pack chosen files/folders into ONE archive, and put them back
