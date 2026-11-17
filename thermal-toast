@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Notify when the CPU package stays hot for too long (installs and manages itself as a user service)
 # thermal-toast: notify when the CPU package stays hot for too long.
 #
 # NEW IN THIS VERSION (2.0.1):

@@ -58,7 +58,6 @@ All scripts follow the same conventions:
 - `VERSION="MAJOR.MINOR.PATCH"` near the top, shown by `--version` and at the top of `--help`.
 - A **NEW IN THIS VERSION** comment block at the top: a short changelog for the latest bump.
 - Run with no arguments, they still do something useful (a menu, or the help text).
-- A `# DESC:` line near the top with a one-line description of the script.
 
 ---
 

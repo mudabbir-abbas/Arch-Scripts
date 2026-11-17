@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Reusable health report for Arch Linux + Niri (Dank Material Shell)
 # (made for a Dell Latitude 5400: systemd-boot + UKI + Plymouth, Btrfs + Snapper, zram,
 #  power-profiles-daemon, greetd + dms-greeter)
 #

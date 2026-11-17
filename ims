@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Install My Scripts: move updated scripts (and marked plain files like PLANS.md) from ~/Downloads to ~/.local/bin
 # ims - Install My Scripts: move updated scripts from ~/Downloads to ~/.local/bin
 #
 # NEW IN THIS VERSION (2.4.0):

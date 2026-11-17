@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# DESC: Save Niri window layouts as one-key profiles ("stages") and restore them later
 #
 # stage: save your Niri window layouts as one-key profiles ("stages") and bring
 # them back later. Interactive interface built on gum; stdlib-only Python.

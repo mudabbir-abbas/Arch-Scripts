@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Friendly git helper for several repos: set up, switch, remove, plus everyday git (was binvc)
 # repos - friendly git helper (formerly "binvc"): keeps a list of your repos and does the everyday git work
 #
 # NEW IN THIS VERSION (3.0.0):

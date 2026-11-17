@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Pack chosen files/folders into one archive and restore them to their original locations
 #
 # NEW IN THIS VERSION (2.0.1):
 #   - Fix: every successful backup left a temp file in /tmp (the cleanup list was

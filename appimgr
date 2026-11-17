@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# DESC: Integrate AppImages into the app launcher: add, update from GitHub, roll back, remove
 #
 # NEW IN THIS VERSION (4.0.2):
 #   - Fix: the cursor is now hidden from the start of the update check too, not only during
