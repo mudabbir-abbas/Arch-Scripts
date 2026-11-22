@@ -1,18 +1,9 @@
 #!/usr/bin/env bash
 #
-# NEW IN THIS VERSION (2.0.1):
-#   - Fix: every successful backup left a temp file in /tmp (the cleanup list was
-#     emptied too early). It is now removed when fbackup exits.
-#   - Fix: 'restore' / 'list' no longer fall back to the newest archive when you
-#     typed something it could not understand; it stops with an error instead.
-#   - The command word (restore, list, config) may now come after options, e.g.
-#     'fbackup -v restore'. A file or folder really named like a command still
-#     works as a path.
-#   - 'config' now warns when sudo changed $HOME (same check as backup/restore).
-#   - tar's closing "Exiting with failure status" line is no longer shown as an
-#     extra warning; Ctrl+C prints "Interrupted." and exits with 130.
-#   - VERSION moved to the top; the history block is replaced by this entry.
-VERSION="2.0.1"
+# NEW IN THIS VERSION (2.0.2):
+#   - Restore warns when paths pass through existing symlinked folders; '..' paths
+#     in an archive are refused.
+VERSION="2.0.2"
 #
 # fbackup - pack chosen files/folders into ONE archive, and put them back
 #           in their original locations later (creating folders as needed).
@@ -122,8 +113,9 @@ Notes:
   * Under sudo, "home" is whatever $HOME is. Use: sudo env HOME="$HOME" fbackup ...
     (fbackup's own sudo offer already does this).
   * Symlinks are saved as links (not followed) and fbackup warns about each one;
-    absolute link targets are kept as-is. On restore, an existing symlinked
-    folder is kept and files go through it. Hard links are saved as copies.
+    absolute link targets are kept as-is. On restore, existing symlinked folders
+    are kept and files go through them. Only restore archives you trust, especially
+    when restoring system files as root. Hard links are saved as copies.
   * Unreadable files are reported and skipped; the rest is still backed up.
 EOF
 }
@@ -949,6 +941,30 @@ do_restore() {
     if [[ $l == HOME || $l == HOME/* ]]; then n_in=$((n_in+1)); else n_out=$((n_out+1)); fi
   done <<<"$listing"
 
+  # Find existing symlinked destination directories so the restore can warn
+  # before GNU tar follows them. This is supported behavior for setups that
+  # deliberately place folders such as ~/.config on another filesystem.
+  local target parent symlinked=0
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    if $HOME_ONLY && [[ $l != HOME && $l != HOME/* ]]; then continue; fi
+    [[ /$l/ != */../* ]] || die "Refusing to restore an archive path containing '..': $l"
+    case $l in
+      HOME)   target=$HOME_DIR ;;
+      HOME/*) target=$HOME_DIR/${l#HOME/} ;;
+      /*)     target=$l ;;
+      *)      target=/$l ;;
+    esac
+    parent=${target%/*}
+    [[ -n $parent ]] || parent=/
+    while [[ $parent != / ]]; do
+      if [[ -L $parent && -d $parent ]]; then symlinked=$((symlinked+1)); fi
+      parent=${parent%/*}
+      [[ -n $parent ]] || parent=/
+    done
+    if [[ -L $target && -d $target ]]; then symlinked=$((symlinked+1)); fi
+  done <<<"$listing"
+
   if (( n_out == 0 )); then
     info "Archive check: $n_in file(s), all for your home - root not needed."
   else
@@ -971,6 +987,14 @@ do_restore() {
     rr0+=(-- "$REPLY")
     offer_sudo "${rr0[@]}"
     die "Not running as root - nothing was restored."
+  fi
+
+  if (( symlinked )); then
+    if (( EUID == 0 )); then
+      warn "Some restore paths pass through existing symlinked folders. They will be followed; restore only archives you trust, especially as root."
+    else
+      warn "Some restore paths pass through existing symlinked folders. They will be followed; restore only archives you trust."
+    fi
   fi
 
   local mode=--skip-old-files

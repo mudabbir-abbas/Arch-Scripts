@@ -82,6 +82,7 @@ Picks files/folders, packs them into one archive, and puts them back in their or
 - Existing files are **not** overwritten unless you pass `--overwrite`.
 - Saved path list in `~/.config/fbackup/paths.conf` for things you always back up (`fbackup config add|remove|list|edit`).
 - `--home` mode never needs root; the default mode allows any path and needs root. On restore it checks the archive first: home-only archives need no root, archives with items outside the home do (and it offers to re-run itself with `sudo`).
+- Restore preserves existing symlinked folders and writes through them. It warns when archive paths will follow those links; only restore archives you trust, especially when restoring system files as root.
 - `fbackup list ARCHIVE` shows what's inside an archive; `fbackup --check` reports which tools are installed.
 - Verifies the archive after creating it, and reports unreadable files and symlinks.
 - Run with no arguments, it opens a small menu.
