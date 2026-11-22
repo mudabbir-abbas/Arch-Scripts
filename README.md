@@ -17,7 +17,6 @@ What that means for you:
 
 - **Treat the code as unreviewed by a professional.** It works for me, but "works on my laptop" is the only guarantee there is.
 - **Read a script before you run it**, especially the ones that change things on your system (see the table below).
-- **Don't assume edge cases are handled.** Many were found and fixed by running into them, which is what the "NEW IN THIS VERSION" headers record.
 - If you spot a bug, a risky pattern or something silly, I genuinely want to hear about it.
 
 ### They're built for one machine
@@ -28,9 +27,9 @@ Everything here is tuned to my setup:
 |---|---|
 | Laptop | Dell Latitude 5400 (i5-8350U, 8 GB RAM, 256 GB NVMe) |
 | OS | Arch Linux |
-| Desktop | Niri + Dank Material Shell, `greetd` + `dms-greeter` |
-| Boot | systemd-boot, UKI, Plymouth |
-| Disk | Btrfs + Snapper, zram, no disk encryption, no Secure Boot |
+| Desktop | Niri + Dux Shell |
+| Boot | systemd-boot, Plymouth |
+| Disk | Btrfs + Snapper, zram |
 | Power | power-profiles-daemon |
 
 Some scripts assume parts of this (for example `syscheck` and `stage` are very specific). Others are generic and should work on most Linux systems. The table below says which is which.
@@ -52,14 +51,8 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 | [`syscheck`](#syscheck) | Read-only health report for Arch + Niri + DMS | **Arch, tuned to my laptop** | No (read-only) |
 | [`thermal-toast`](#thermal-toast) | Desktop notification when the CPU stays hot too long; can install itself as a user service | Intel `coretemp` machines | Only if you run `install` (user service + settings file) |
 
-All scripts follow the same conventions:
-
-- `VERSION="MAJOR.MINOR.PATCH"` near the top, shown by `--version` and at the top of `--help`.
-- A **NEW IN THIS VERSION** comment block at the top: a short changelog for the latest bump.
-- Run with no arguments, they still do something useful (a menu, or the help text).
-
 ---
-
+ 
 ### appimgr
 
 Makes AppImages behave like installed apps.
@@ -150,16 +143,6 @@ A tiny watcher that sends a desktop notification when the CPU package stays abov
 
 **Needs:** `notify-send` (`libnotify`), an Intel `coretemp` (or `x86_pkg_temp`) sensor, and a systemd user session for the service commands.
 **Writes to (only after `install` / `config set`):** `~/.config/systemd/user/thermal-toast.service`, `~/.config/thermal-toast/`.
-
----
-
-## How the pieces fit together
-
-```
- AI chat ──► ~/Downloads ──► ims ──► ~/.local/bin
-```
-
-My workflow: ask the AI for a change, download the updated script, run `ims` to install it (or `ims path/to/file` if it landed somewhere else), try it, and commit and push changes when I'm happy.
 
 ---
 
