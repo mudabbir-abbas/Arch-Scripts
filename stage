@@ -3,22 +3,10 @@
 # stage: save your Niri window layouts as one-key profiles ("stages") and bring
 # them back later. Interactive interface built on gum; stdlib-only Python.
 #
-# NEW IN THIS VERSION (3.0.2):
-#   - Fix: a saved window without an app_id (or launch command) made `restore`
-#     launch a new copy every time, wait the full timeout and report "not found";
-#     with no command at all it crashed mid-restore. Such windows are now skipped
-#     and listed as problems at once.
-#   - Fix: the shortcut-conflict scan treated "//" inside a quoted string (for
-#     example a URL in a bind) as a comment, so later binds went unseen. Strings
-#     are now ignored when looking for comments and braces.
-#   - Fix: `capture NAME` dropped every window of a single-process terminal (all
-#     its windows share one pid). When several windows match, only the focused one
-#     (the one you typed the command in) is left out.
-#   - Fix: writing a file (config.kdl, profiles) no longer resets its permissions.
-#   - Renamed a local variable that hid the act() function; removed an empty
-#     section header.
-#   - Header: the older version history is replaced by this entry.
-VERSION="3.0.2"
+# NEW IN THIS VERSION (3.0.3):
+#   - Null optional layout values in profiles are accepted; restore skips the
+#     corresponding placement action when a value is unspecified.
+VERSION="3.0.3"
 NAME="stage"
 LEGACY="niri-ws"
 
@@ -559,7 +547,9 @@ def ancestors():
 
 
 def skey(it):
-    return (it["workspace"]["idx"], 1 if it["floating"] else 0, it.get("column") or 0, it.get("tile") or 0)
+    ws = it.get("workspace") or {}
+    return (ws.get("idx") if ws.get("idx") is not None else 0,
+            1 if it.get("floating") else 0, it.get("column") or 0, it.get("tile") or 0)
 
 
 def capture_windows():
@@ -600,11 +590,17 @@ def capture_windows():
 
 
 def pos_str(it):
-    return "float" if it["floating"] else f"col{it['column']}.{it['tile']}"
+    if it.get("floating") is True:
+        return "float"
+    if it.get("column") is None:
+        return "—"
+    tile = it.get("tile") if it.get("tile") is not None else "—"
+    return f"col{it['column']}.{tile}"
 
 
 def row(i, it, skipped=None):
-    ws = str(it["workspace"]["name"] or it["workspace"]["idx"])
+    workspace = it.get("workspace") or {}
+    ws = str(workspace.get("name") or workspace.get("idx") or "—")
     label = (it.get("label") or it.get("app_id") or "?")[:22]
     out = f"{i:>3}  "
     if skipped is not None:
@@ -744,25 +740,37 @@ def cmd_restore(name, dry=False):
     groups = {}
     for i in sorted(claimed):
         w = wins[i]
-        ws = w["workspace"]
-        groups.setdefault((w.get("output"), ws["idx"], ws["name"]), []).append((w, claimed[i]))
+        ws = w.get("workspace") or {}
+        # Null output/workspace fields mean that the profile does not constrain
+        # that part of placement. Give unconstrained windows their own group so
+        # they are not accidentally combined into a shared column.
+        out = w.get("output")
+        idx, wsname = ws.get("idx"), ws.get("name")
+        group = (out, idx, wsname) if idx is not None or wsname else (None, None, None, i)
+        groups.setdefault(group, []).append((w, claimed[i]))
     first = None
-    for (out, idx, wsname), members in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
-        ref = str(wsname or idx)
-        if out in outs:
+    for group_key, members in sorted(groups.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))):
+        out, idx, wsname = group_key[:3]
+        ref = str(wsname or idx) if wsname or idx is not None else None
+        if out and out in outs:
             act(fails, "focus-monitor", out)
         cur_w = ((outs.get(out) or {}).get("logical") or {}).get("width")
         for w, wid in members:
+            if ref is None:
+                continue
             if not act(fails, "move-window-to-workspace", "--window-id", str(wid), "--focus", "false", ref):
                 act(fails, "focus-window", "--id", str(wid))
                 act(fails, "move-window-to-workspace", ref)
-        tiled = [(w, wid) for w, wid in members if not w["floating"]]
+        tiled = [(w, wid) for w, wid in members if w.get("floating") is False]
         for k, (w, wid) in enumerate(tiled, 1):
+            if w.get("column") is None:
+                continue
             act(fails, "focus-window", "--id", str(wid))
             act(fails, "move-column-to-index", str(k))
         cols = {}
         for w, wid in tiled:
-            cols.setdefault(w["column"], []).append((w, wid))
+            if w.get("column") is not None:
+                cols.setdefault(w["column"], []).append((w, wid))
         for its in cols.values():
             if len(its) > 1:
                 act(fails, "focus-window", "--id", str(its[0][1]))
@@ -772,20 +780,20 @@ def cmd_restore(name, dry=False):
             w0, id0 = its[0]
             scale = (cur_w / w0["out_width"]) if cur_w and w0.get("out_width") else 1
             act(fails, "focus-window", "--id", str(id0))
-            if len(w0["size"]) == 2:
+            if len(w0.get("size") or []) == 2:
                 act(fails, "set-column-width", str(int(w0["size"][0] * scale)))
             if len(its) > 1:
                 for w, wid in its[:-1]:
-                    if len(w["size"]) == 2:
+                    if len(w.get("size") or []) == 2:
                         act(fails, "focus-window", "--id", str(wid))
                         act(fails, "set-window-height", str(int(w["size"][1])))
         for w, wid in members:
-            if not w["floating"]:
+            if w.get("floating") is not True:
                 continue
             scale = (cur_w / w["out_width"]) if cur_w and w.get("out_width") else 1
             act(fails, "focus-window", "--id", str(wid))
             act(fails, "move-window-to-floating")
-            if len(w["size"]) == 2:
+            if len(w.get("size") or []) == 2:
                 act(fails, "set-window-width", str(int(w["size"][0] * scale)))
                 act(fails, "set-window-height", str(int(w["size"][1])))
             if w.get("pos"):
@@ -1091,7 +1099,8 @@ def run_action(fn, *a, wait=True):
 
 # ---- window lists
 def window_item(i, it):
-    ws = str(it["workspace"]["name"] or it["workspace"]["idx"])
+    workspace = it.get("workspace") or {}
+    ws = str(workspace.get("name") or workspace.get("idx") or "—")
     label = (it.get("label") or it.get("app_id") or "?")[:20]
     return clean(f"{i:<3}{label:<20} ws{ws:<3} {pos_str(it):<8} {(it.get('title') or '')[:34]}")
 
