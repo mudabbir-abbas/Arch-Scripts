@@ -1,4 +1,3 @@
-<!-- ims-managed -->
 # Arch-Scripts
 
 My personal utility scripts from `~/.local/bin` on Arch Linux.
@@ -46,7 +45,6 @@ Provided as-is. I'm not promising support, fixes, or that anything will keep wor
 |---|---|---|---|
 | [`appimgr`](#appimgr) | Integrates AppImages into the app launcher; add, update from GitHub and remove one or several at once, roll back, optionally clean up leftover data | Most Linux desktops | Yes (`~/.local/share`) |
 | [`fbackup`](#fbackup) | Pack chosen files/folders into one archive and restore them to their original locations | Any Linux with GNU tar | Yes (writes/restores files) |
-| [`ims`](#ims) | "Install My Scripts": moves updated scripts from `~/Downloads` (or any path) to `~/.local/bin` | Anywhere | Yes (replaces scripts) |
 | [`stage`](#stage) | Save Niri window layouts as one-key profiles and restore them | **Niri only** | Yes (edits Niri config) |
 | [`syscheck`](#syscheck) | Read-only health report for Arch + Niri + DMS | **Arch, tuned to my laptop** | No (read-only) |
 | [`thermal-toast`](#thermal-toast) | Desktop notification when the CPU stays hot too long; can install itself as a user service | Intel `coretemp` machines | Only if you run `install` (user service + settings file) |
@@ -90,21 +88,6 @@ Picks files/folders, packs them into one archive, and puts them back in their or
 **Needs:** `bash` 4+, GNU `tar`. **Optional:** `zstd`, `gzip`.
 
 > ⚠️ This one writes files. Try `fbackup list ARCHIVE` and a restore into a test setup before trusting it with anything important. Snapshots and backups are not the same thing, and this is a personal tool, not a backup product.
-
-### ims
-
-"Install My Scripts". When I download a new version of a script from the AI chat, `ims` drops it into place.
-
-- Matches `~/Downloads` files to installed scripts by name (handles `foo.sh`, `foo (1).sh`, etc.).
-- **Install from anywhere:** an argument containing a slash is a path to the file itself, e.g. `ims ~/code/foo.py` installs it as `foo`. It's moved like Downloads files (`-c`/`--copy` keeps the original).
-- Backs up the old copy (keeps the last 3), runs `chmod +x`, and replaces the script atomically. It can update itself safely.
-- Plain files like `PLANS.md` are handled too (never made executable); plain `ims` only replaces them when the Downloads copy carries an `ims-managed` marker.
-- `ims list` shows installed scripts, versions, and updates waiting in Downloads.
-- `ims restore <name>` rolls back to the latest backup (run again to toggle).
-- `ims completions --install` sets up fish tab completion (Downloads files, subcommands, ordinary paths).
-- `--dry-run` shows what would happen without changing anything.
-
-**Needs:** `bash` and coreutils. **Optional:** `fish` for the completions.
 
 ### stage
 
