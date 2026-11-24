@@ -24,14 +24,22 @@
 #   Offline, internet checks are skipped. Slow link? DL_NET=400 syscheck (max 600 s per limit;
 #   variables: DL_LOCAL, DL_SLOW, DL_NET, NET_BUDGET)
 #
-# NEW IN THIS VERSION (4.3.1):
-#   - Fix: --full now marks a check that hit its deadline as [CHECK], like the other modes
-#   - Fix: boot phases over a minute ("1min 3.2s (firmware)") were read as 3.2s, which
-#     hid a slow firmware or loader phase; minutes are now counted
-#   - --version and --help print "syscheck v<version>"; VERSION moved up and the changelog
-#     at the end of the file is removed
+# NEW IN THIS VERSION (4.4.0):
+#   - New: pending repo updates become an attention item only when the last full upgrade
+#     (from pacman.log) is UPDATE_AGE_DAYS (7) or more days old. A fresh update is just
+#     information. Nothing is stored on disk, so the script stays strictly read-only.
+#   - AUR and Flatpak updates are informational (names shown) but a helper error is still flagged.
+#   - "Network listeners" is informational, and prints (none) when empty.
+#   - Bluetooth: an enabled service with no adapter is reported (BIOS/UEFI switch?).
+#   - One shared list of known-benign log messages (BENIGN_RE) now feeds "Errors this boot",
+#     "Kernel errors" and "Recurring errors"; new entries: duplicate Dolphin FileManager1 name,
+#     greetd keyring notices, archlinux-keyring refresh probe.
+#   - Unclean-shutdown detection (clean_end) is kept in "Per-boot problems".
+#   - A check can now set its own failure reason for the summary (WHYMSG).
+#   - Code: every check is a named function (c_* prints, t_* judges), and the report at the
+#     bottom of the file lists them in order. Developer notes are above the engine.
 NAME="syscheck"
-VERSION="4.3.1"
+VERSION="4.4.0"
 #
 # Read-only: it changes nothing and installs nothing.
 # Privacy: hostname, username, real name, LAN IPs, MAC addresses, Wi-Fi/VPN
@@ -45,6 +53,9 @@ usage() {
     awk 'NR>1 { if ($0 ~ /^(NAME|VERSION)=/) next; if ($0 !~ /^#/) exit; sub(/^# ?(DESC: *)?/,""); print }' "$0"
 }
 
+# =====================================================================================
+# 1. OPTIONS
+# =====================================================================================
 DIR=""
 DIR_GIVEN=0
 FULL=0
@@ -68,13 +79,14 @@ if [ "$FULL" -eq 1 ] && [ "$SUMONLY" -eq 1 ]; then
     echo "syscheck: --summary and --full contradict each other, pick one (try --help)" >&2; exit 2
 fi
 
-# ---------- deadlines ----------
-# Every check has a time limit so nothing can hang the report (see the header). Override from the
-# environment if needed. DL_MAX is the hard ceiling: no limit is ever above 10 minutes.
-DL_LOCAL="${DL_LOCAL:-60}"            # seconds: ordinary checks
-DL_SLOW="${DL_SLOW:-300}"             # seconds: heavy local checks (package verification, journal scans)
-DL_NET="${DL_NET:-240}"               # seconds: each check that needs the internet
-NET_BUDGET="${NET_BUDGET:-600}"       # seconds: all internet checks together
+# =====================================================================================
+# 2. SETTINGS
+# =====================================================================================
+# Deadlines (seconds). Override from the environment. DL_MAX is the hard ceiling.
+DL_LOCAL="${DL_LOCAL:-60}"            # ordinary checks
+DL_SLOW="${DL_SLOW:-300}"             # heavy local checks (package verification, journal scans)
+DL_NET="${DL_NET:-240}"               # each check that needs the internet
+NET_BUDGET="${NET_BUDGET:-600}"       # all internet checks together
 DL_MAX=600
 for _v in DL_LOCAL DL_SLOW DL_NET NET_BUDGET; do
     case "${!_v}" in
@@ -86,7 +98,23 @@ for _v in DL_LOCAL DL_SLOW DL_NET NET_BUDGET; do
 done
 NET_USED=0; NET_MIN=10
 
-# ---------- terminal helpers ----------
+# Pending repo updates are only an attention item when the last full upgrade is this old.
+UPDATE_AGE_DAYS=7
+
+# Log messages that are known to be harmless on this machine. One list, used by every
+# journal/dmesg check. Written as an ERE, so it must work after the "recurring errors"
+# check has replaced digits by "#". Add new entries here, nowhere else.
+BENIGN_RE='SGX disabled|TDX not supported|multicast RX registrations|Touch jump|touchpad-jumping-cursors'
+BENIGN_RE+='|libinput bug: invalid gesture event|log rate limit exceeded|text-to-speech plug-in'
+BENIGN_RE+='|pam_unix\(sudo:auth\): (conversation failed|auth could not identify password)'
+BENIGN_RE+='|Reading supported features failed \(-[0-9#]+\)|Error reading debug features|btd_adv_monitor_power_down'
+BENIGN_RE+='|Ignoring duplicate name .org.freedesktop.FileManager'
+BENIGN_RE+='|gkr-pam: (couldn.t unlock the login keyring|unable to locate daemon control file)'
+BENIGN_RE+='|Failed to start Refresh existing keys of archlinux-keyring'
+
+# =====================================================================================
+# 3. TERMINAL HELPERS AND CLEANUP
+# =====================================================================================
 if [ -t 1 ]; then
     IS_TTY=1
     C_OK=$'\033[32m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'; C_WARN=$'\033[33m'; C_OFF=$'\033[0m'
@@ -95,10 +123,9 @@ else
 fi
 clear_line() { [ "$IS_TTY" -eq 1 ] && printf '\r\033[K'; }
 
-# ---------- cleanup ----------
-RAW="$(mktemp /tmp/syscheck-raw.XXXXXX)"
-SUMF="$(mktemp /tmp/syscheck-sum.XXXXXX)"
-CHK="$(mktemp /tmp/syscheck-chk.XXXXXX)"
+RAW="$(mktemp /tmp/syscheck-raw.XXXXXX)"      # the unmasked report (private, deleted at exit)
+SUMF="$(mktemp /tmp/syscheck-sum.XXXXXX)"     # the summary block
+CHK="$(mktemp /tmp/syscheck-chk.XXXXXX)"      # output of the check that is running
 chmod 600 "$RAW" "$SUMF" "$CHK"
 KEEPALIVE=""; TPID=""
 cleanup() {
@@ -109,6 +136,12 @@ cleanup() {
 trap cleanup EXIT
 trap 'clear_line; echo "Interrupted. Nothing was saved."; exit 130' INT TERM
 
+have() { command -v "$1" >/dev/null 2>&1; }
+net_up() { ip route show default 2>/dev/null | grep -q .; }
+
+# =====================================================================================
+# 4. START-UP: banner, where to save, sudo
+# =====================================================================================
 echo "${C_BOLD}System check (Arch + Niri)${C_OFF} ${C_DIM}$NAME v$VERSION${C_OFF}  (read-only, nothing is changed)"
 echo
 if ! grep -qiE '^(ID|ID_LIKE)=.*arch' /etc/os-release 2>/dev/null; then
@@ -125,7 +158,6 @@ if [ "$UPTIME_S" -lt 300 ]; then
     echo
 fi
 
-# ---------- choose where to save ----------
 if [ "$DIR_GIVEN" -eq 1 ]; then
     if [ -z "$DIR" ]; then echo "syscheck: empty folder name for -d (try --help)" >&2; exit 2; fi
     # explicit -d: honour it exactly, never silently save somewhere else
@@ -153,7 +185,7 @@ echo "Report will be saved to: $OUT"
 echo "                         ($WHERE)"
 echo
 
-# ---------- sudo once, keep it alive ----------
+# sudo once, kept alive in the background
 HAVE_SUDO=0
 echo "Some checks (SMART, dmesg, firewall) need sudo. Asking once:"
 if sudo -v; then
@@ -169,22 +201,49 @@ else
 fi
 echo
 
-have() { command -v "$1" >/dev/null 2>&1; }
+# =====================================================================================
+# 5. DEVELOPER NOTES
+# =====================================================================================
+# HOW A CHECK IS BUILT
+#   c_NAME   prints the facts. It runs in its own bash (with a deadline), so it cannot
+#            change variables here. It may use h_* helpers and the exported variables
+#            KNOWN_TPM, TPMFILT, THR0, BENIGN_RE.
+#   t_NAME   decides "healthy?" from $out (the output) and $rc (the exit code):
+#            return 0 = healthy, 1 = needs attention. It runs in this shell. It may set
+#            MSG (the text of the OK line) or WHYMSG (the reason shown in the summary
+#            when the check fails).
+#   h_NAME   a helper that c_* functions can call. Defined here, copied into each check.
+#
+# HOW TO ADD A CHECK
+#   1. Write c_NAME (and t_NAME if it can judge itself) in the CHECK LIBRARY below.
+#   2. Add one line to the REPORT at the bottom, inside the right `section`:
+#        run   "title" c_NAME                           always show the output
+#        runq  "title" c_NAME t_NAME "OK message"       one OK line unless t_NAME fails
+#        srun / srunq                                    same, but as root (sudo)
+#        netrunq                                        same, needs the internet
+#      Put CHECK_DL=$DL_SLOW in front for a heavy check (e.g. CHECK_DL=$DL_SLOW runq ...).
+#   Ready-made verdicts: t_empty (no output), t_none (output is "none"), t_rc0, t_no_review.
+#
+# THE ENGINE
+#   _exec runs c_NAME in `bash -c` with the helpers and the function text prepended
+#   (with root: through `sudo -n`). runq/srunq/netrunq call t_NAME afterwards, keep the
+#   output only when it fails (or in --full), and list failures in the summary.
 
-# deadline for the next check: CHECK_DL if set (DL_SLOW, DL_NET, ...), else DL_LOCAL; never above DL_MAX
-_dl() {
+# =====================================================================================
+# 6. ENGINE
+# =====================================================================================
+_dl() { # deadline for the next check: CHECK_DL if set, else DL_LOCAL; never above DL_MAX
     local d="${CHECK_DL:-$DL_LOCAL}"
     [ "$d" -gt "$DL_MAX" ] && d="$DL_MAX"
     [ "$d" -lt 5 ] && d=5
     echo "$d"
 }
-net_up() { ip route show default 2>/dev/null | grep -q .; }
 
-# ---------- progress + section engine ----------
 TOTAL="$(grep -c '^section "' "$0" 2>/dev/null)"
 [ "${TOTAL:-0}" -gt 0 ] || TOTAL=14
 CUR_N=0; CUR_TITLE=""; CUR_START=0; NOISE=0
-BAD=(); WHY=(); OK_N=0; out=""; rc=0; MSG=""; TIMED_OUT=0; LAST_DL=0
+BAD=(); WHY=(); OK_N=0; out=""; rc=0; MSG=""; WHYMSG=""; TIMED_OUT=0; LAST_DL=0
+HELPER_DEFS=""      # text of all h_* functions, filled in right before the report starts
 
 section_end() {
     [ -n "$CUR_TITLE" ] || return
@@ -211,18 +270,25 @@ section() {
     fi
 }
 
-# _exec "what this check is" 'shell command'  -> sets $out and $rc
+# the command line that runs one check: helpers + the function + the call
+_fncmd() { printf '%s\n%s\n%s\n' "$HELPER_DEFS" "$(declare -f "$1")" "$1"; }
+
+# _exec "what this check is" FUNCTION  -> sets $out and $rc  (ROOT=1 in front = run through sudo)
 _exec() {
-    local desc="$1" cmd="$2" dl t0 note=""
+    local desc="$1" fn="$2" dl t0 note="" cmd grace=0
     dl="$(_dl)"; LAST_DL="$dl"; TIMED_OUT=0; t0=$SECONDS
+    cmd="$(_fncmd "$fn")"
+    if [ "${ROOT:-0}" = 1 ]; then
+        # the root-level timeout inside sudo gets a head start (grace) on the outer one
+        cmd="sudo -n $SUDO_ENV timeout -k 5 $dl bash -c $(printf '%q' "$cmd")"; grace=15
+    fi
     [ "$dl" -gt "$DL_LOCAL" ] && note=" (may take up to ${dl}s)"
     if [ "$IS_TTY" -eq 1 ]; then
         printf '\r\033[K%s[%2d/%d]%s %s %s> %s%s%s' "$C_DIM" "$CUR_N" "$TOTAL" "$C_OFF" "$CUR_TITLE" "$C_DIM" "$desc" "$note" "$C_OFF"
     fi
     # Deadline: timeout runs the check in its own process group and stops everything it started when the
     # limit is reached. It runs in the background and we wait for it, so Ctrl+C reaches our trap at once.
-    # EXEC_GRACE gives sudo checks (which carry their own root-level timeout inside) time to stop first.
-    timeout -k 10 "$((dl + ${EXEC_GRACE:-0}))" bash -c "$cmd" < /dev/null > "$CHK" 2>&1 &
+    timeout -k 10 "$((dl + grace))" bash -c "$cmd" < /dev/null > "$CHK" 2>&1 &
     TPID=$!
     wait "$TPID"; rc=$?
     TPID=""
@@ -239,7 +305,7 @@ _exec() {
     fi
 }
 
-# _emit "desc" "cmd" [tag] : write the full output of the last _exec
+# _emit "desc" FUNCTION [tag] : write the full output of the last _exec to the report
 _emit() {
     {
         echo
@@ -250,10 +316,24 @@ _emit() {
     } >> "$RAW"
 }
 
-# run: always show the output (information the script cannot judge by itself)
+# _note "desc" "text" : a report entry without running anything (used for skipped checks)
+_note() { { echo; echo "--- $1"; echo "$2"; } >> "$RAW"; }
+
+# short reason for a failed check: the check's own WHYMSG, else the first line that looks like a problem
+why() {
+    local l
+    if [ "$TIMED_OUT" -eq 1 ]; then printf 'timed out after %ss, result unknown' "$LAST_DL"; return; fi
+    if [ -n "$WHYMSG" ]; then printf '%s' "$WHYMSG" | cut -c1-110; return; fi
+    l="$(printf '%s\n' "$out" | grep -m1 -E "WARNING|CRITICAL|^LOW|^HIGH|MISSING|^LARGE|^OLD|^SLOW|^REVIEW|NOT |NO FIREWALL|FAILED|failed|missing|error|degraded|timed out" )"
+    [ -n "$l" ] || l="$(printf '%s\n' "$out" | grep -m1 .)"
+    printf '%s' "${l:-no output (exit code $rc)}" | cut -c1-110
+}
+
+# run "desc" c_fn : always show the output (information the script cannot judge by itself)
 run() {
     _exec "$1" "$2"
     local tag=""
+    WHYMSG=""
     if [ "$TIMED_OUT" -eq 1 ]; then
         tag="CHECK"
         if [ "$FULL" -eq 0 ]; then BAD+=("$1"); WHY+=("$(why)"); fi
@@ -261,22 +341,13 @@ run() {
     _emit "$1" "$2" "$tag"
 }
 
-# short reason for a failed check: the first line that looks like a problem, else the first line
-why() {
-    local l
-    if [ "$TIMED_OUT" -eq 1 ]; then printf 'timed out after %ss, result unknown' "$LAST_DL"; return; fi
-    l="$(printf '%s\n' "$out" | grep -m1 -E "WARNING|CRITICAL|^LOW|^HIGH|MISSING|^LARGE|^OLD|^SLOW|^REVIEW|NOT |NO FIREWALL|FAILED|failed|missing|error|degraded|timed out" )"
-    [ -n "$l" ] || l="$(printf '%s\n' "$out" | grep -m1 .)"
-    printf '%s' "${l:-no output (exit code $rc)}" | cut -c1-110
-}
-
-# runq "desc" 'command' 'test' "ok message"
-# The test is evaluated with $out and $rc; it may set MSG. True = healthy: one OK line only.
-# False = needs attention: full output is kept and the check is listed in the summary.
+# runq "desc" c_fn t_fn "ok message"
+# t_fn is called with $out and $rc; it may set MSG / WHYMSG. Healthy = one OK line only.
+# Needs attention = full output is kept and the check is listed in the summary.
 runq() {
     _exec "$1" "$2"
-    MSG=""
-    if [ "$FULL" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ] && eval "$3"; then
+    MSG=""; WHYMSG=""
+    if [ "$FULL" -eq 0 ] && [ "$TIMED_OUT" -eq 0 ] && "$3"; then
         OK_N=$((OK_N + 1))
         { echo; echo "--- $1"; echo "OK: ${MSG:-$4}"; } >> "$RAW"
     else
@@ -294,20 +365,8 @@ runq() {
 }
 
 # same, but as root (non-interactive, uses the cached sudo)
-srun() {
-    if [ "$HAVE_SUDO" -eq 1 ]; then
-        EXEC_GRACE=15 run "$1" "sudo -n $SUDO_ENV timeout -k 5 $(_dl) bash -c $(printf '%q' "$2")"
-    else
-        run "$1 (skipped, no sudo)" "echo SKIPPED: needs sudo"
-    fi
-}
-srunq() {
-    if [ "$HAVE_SUDO" -eq 1 ]; then
-        EXEC_GRACE=15 runq "$1" "sudo -n $SUDO_ENV timeout -k 5 $(_dl) bash -c $(printf '%q' "$2")" "$3" "$4"
-    else
-        run "$1 (skipped, no sudo)" "echo SKIPPED: needs sudo"
-    fi
-}
+srun()  { if [ "$HAVE_SUDO" -eq 1 ]; then ROOT=1 run  "$@"; else _note "$1 (skipped, no sudo)" "SKIPPED: needs sudo"; fi; }
+srunq() { if [ "$HAVE_SUDO" -eq 1 ]; then ROOT=1 runq "$@"; else _note "$1 (skipped, no sudo)" "SKIPPED: needs sudo"; fi; }
 
 # netrunq: runq for checks that need the internet. Each gets up to DL_NET seconds, but all of them together
 # at most NET_BUDGET (10 minutes by default): a slow link still works, a dead one cannot stall the report.
@@ -316,11 +375,11 @@ srunq() {
 netrunq() {
     local left=$((NET_BUDGET - NET_USED)) t0=$SECONDS d
     if [ "${NET_OFFLINE_OK:-0}" -ne 1 ] && ! net_up; then
-        run "$1 (skipped, offline)" "echo SKIPPED: no default route, so the internet is not reachable"
+        _note "$1 (skipped, offline)" "SKIPPED: no default route, so the internet is not reachable"
         return
     fi
     if [ "$left" -lt "$NET_MIN" ]; then
-        run "$1 (skipped, internet time used up)" "echo SKIPPED: all internet checks together may take ${NET_BUDGET}s at most, and that is used up"
+        _note "$1 (skipped, internet time used up)" "SKIPPED: all internet checks together may take ${NET_BUDGET}s at most, and that is used up"
         return
     fi
     d=$DL_NET; [ "$left" -lt "$d" ] && d=$left
@@ -328,7 +387,19 @@ netrunq() {
     NET_USED=$((NET_USED + SECONDS - t0))
 }
 
-# --- known upstream issue: systemd 262 NvPCR units fail when the booted UKI carries no PCR public key
+# ---------- ready-made verdicts (t_*) ----------
+t_empty()     { [ -z "$out" ]; }
+t_none()      { [ "$out" = none ]; }
+t_rc0()       { [ "$rc" -eq 0 ]; }
+t_no_review() { ! grep -q "^REVIEW" <<<"$out"; }
+
+# several output lines as one line: "a;b;c" -> "a, b, c"
+join_lines() { printf '%s\n' "$1" | tr '\n' ';' | sed 's/;$//; s/;/, /g'; }
+
+# =====================================================================================
+# 7. KNOWN UPSTREAM ISSUE (detected once, used by several checks)
+# =====================================================================================
+# systemd 262 NvPCR units fail when the booted UKI carries no PCR public key
 # (systemd#43848; fix proposed in systemd#43948). Harmless without TPM disk unlock/attestation.
 # Detected only when EXACTLY those units failed and no PCR public key exists, so any other failure still shows.
 KNOWN_TPM=0
@@ -340,9 +411,865 @@ if [ -n "$_fl" ] && ! printf '%s\n' "$_fl" | grep -qvE '^(systemd-pcrlogin@[0-9]
 fi
 if [ "$KNOWN_TPM" -eq 1 ]; then TPMFILT='NvPCR|Early TPM SRK Setup'; else TPMFILT='@@never-matches@@'; fi
 THR0="$(cat /sys/devices/system/cpu/cpu0/thermal_throttle/package_throttle_count 2>/dev/null || echo 0)"
-export KNOWN_TPM TPMFILT THR0
-# sudo resets the environment, so hand the filter variables to root-run checks explicitly
-SUDO_ENV="env $(printf '%q' "TPMFILT=$TPMFILT") $(printf '%q' "KNOWN_TPM=$KNOWN_TPM")"
+export KNOWN_TPM TPMFILT THR0 BENIGN_RE
+# sudo resets the environment, so hand the variables to root-run checks explicitly
+SUDO_ENV="env $(printf '%q' "TPMFILT=$TPMFILT") $(printf '%q' "KNOWN_TPM=$KNOWN_TPM") $(printf '%q' "BENIGN_RE=$BENIGN_RE")"
+
+# =====================================================================================
+# 8. CHECK LIBRARY (grouped like the report below)
+# =====================================================================================
+
+# ---------- helpers shared by c_* functions ----------
+# "1min 3.2s" / "850ms" -> seconds
+h_tosec() {
+    echo "$1" | awk '{ t=0; for (i=1; i<=NF; i++) { v=$i; if (v ~ /min$/) { sub(/min$/, "", v); t+=v*60 } else if (v ~ /ms$/) { sub(/ms$/, "", v); t+=v/1000 } else if (v ~ /us$/) { sub(/us$/, "", v); t+=v/1000000 } else if (v ~ /h$/) { sub(/h$/, "", v); t+=v*3600 } else if (v ~ /s$/) { sub(/s$/, "", v); t+=v } } printf "%.1f", t }'
+}
+# whole days since the last full system upgrade (-Syu) in pacman.log; prints nothing if unknown
+h_days_since_upgrade() {
+    local t s
+    t=$(grep "starting full system upgrade" /var/log/pacman.log 2>/dev/null | tail -1 | cut -c2-25)
+    [ -n "$t" ] || return 0
+    s=$(date -d "$t" +%s 2>/dev/null) || return 0
+    echo $(( ( $(date +%s) - s ) / 86400 ))
+}
+# "2026-11-20T10:00:00+0500" -> "2026-11-20 10:00 PKT (4 days ago)"
+h_fmt_when() {
+    [ -n "$1" ] || { echo "not found"; return; }
+    echo "$(date -d "$1" "+%Y-%m-%d %H:%M %Z") ($(( ( $(date +%s) - $(date -d "$1" +%s) ) / 86400 )) days ago)"
+}
+
+# ---------- 1. OS, kernel, session ----------
+c_os_kernel() {
+    echo "$(. /etc/os-release; echo $PRETTY_NAME), kernel $(uname -r), uptime: $(uptime -p)"
+    pacman -Q linux linux-lts linux-zen linux-hardened 2>/dev/null | tr "\n" ";"
+    echo
+}
+
+c_session() {
+    local dm
+    echo "session=${XDG_SESSION_TYPE:-unset} desktop=${XDG_CURRENT_DESKTOP:-unset} wayland=${WAYLAND_DISPLAY:-unset}"
+    echo "packages: $(pacman -Qq 2>/dev/null | grep -E "^(niri|quickshell|dms|dgop|matugen|greetd|xwayland-satellite)" | xargs -r pacman -Q 2>/dev/null | tr "\n" ";")"
+    dm=$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '$1 ~ /^(greetd|sddm|gdm|lightdm|lxdm|plasmalogin|ly)(@.*)?\.service$/ {print $1}' | tr "\n" " ")
+    echo "display manager: ${dm:-none found}"
+}
+
+c_helper_tools() {
+    local t c p
+    for t in smartctl:smartmontools sensors:lm_sensors upower:upower checkupdates:pacman-contrib fwupdmgr:fwupd vainfo:libva-utils snapper:snapper btrfs:btrfs-progs lsusb:usbutils bluetoothctl:bluez-utils niri:niri powerprofilesctl:power-profiles-daemon nmcli:networkmanager; do
+        c=${t%%:*}; p=${t##*:}
+        command -v "$c" >/dev/null 2>&1 || echo "MISSING  $c   (sudo pacman -S $p)"
+    done
+}
+
+c_kernel_installed() {
+    local k
+    k=$(uname -r)
+    if [ -d "/usr/lib/modules/$k" ]; then
+        echo "modules for $k present"
+    else
+        echo "REVIEW: modules for the running kernel ($k) are gone: it was upgraded since this boot. Reboot soon; until then USB, Wi-Fi, Bluetooth and new mounts may fail to load drivers"
+    fi
+}
+
+c_install_dates() {
+    pacman -Qi linux linux-lts systemd bluez bluez-utils linux-firmware linux-firmware-intel intel-ucode mesa networkmanager niri quickshell greetd power-profiles-daemon plymouth 2>/dev/null | grep -E "^(Name|Version|Install Date)" | paste - - -
+}
+c_cmdline() { cat /proc/cmdline; }
+
+# ---------- 2. Niri, shell and greeter ----------
+c_niri_version() {
+    local i o c l
+    i=$(pacman -Qq 2>/dev/null | grep -E "^niri(-git|-bin)?$" | xargs -r pacman -Q 2>/dev/null)
+    echo "installed: ${i:-NOT INSTALLED}"
+    if [ -z "$NIRI_SOCKET" ]; then
+        echo "(not run from inside the niri session, so the running version cannot be compared)"
+    else
+        o=$(niri msg version 2>&1); echo "$o"
+        c=$(echo "$o" | sed -n "s/^Compositor version: *//p")
+        l=$(echo "$o" | sed -n "s/^CLI version: *//p")
+        [ -n "$c" ] && [ -n "$l" ] && [ "$c" != "$l" ] && echo "REVIEW: the running compositor ($c) differs from the installed niri ($l): log out and back in to load the update"
+    fi
+    true
+}
+t_niri_version() { MSG="$(head -1 <<<"$out")"; ! grep -qE "NOT INSTALLED|^REVIEW" <<<"$out"; }
+
+c_niri_config() {
+    if command -v niri >/dev/null 2>&1; then
+        niri validate 2>&1 | tail -15
+        exit "${PIPESTATUS[0]}"
+    else
+        echo "niri not installed"; exit 1
+    fi
+}
+
+c_dms() {
+    local p
+    p=$(pgrep -x "quickshell|qs" | head -1)
+    echo "quickshell process: ${p:-none}${p:+ ($(ps -o comm= -p "$p"))}; dms.service (user): $(systemctl --user is-active dms.service 2>&1)"
+    pacman -Qq 2>/dev/null | grep -E "^(dms|quickshell|dgop|dsearch|matugen)" | xargs -r pacman -Q 2>/dev/null | sed "s/^/pkg: /"
+}
+t_dms() { MSG="shell is running ($(head -1 <<<"$out" | sed "s/;.*//"))"; grep -qE "quickshell process: [0-9]+" <<<"$out"; }
+
+c_greeter() {
+    local dm
+    echo "greetd.service: enabled=$(systemctl is-enabled greetd 2>&1) active=$(systemctl is-active greetd 2>&1)"
+    echo "greeter command: $(grep -E "^command" /etc/greetd/config.toml 2>&1 | head -1)"
+    for dm in sddm gdm lightdm lxdm plasmalogin ly; do
+        systemctl is-enabled --quiet $dm 2>/dev/null && echo "REVIEW: $dm is also enabled; only one display manager should be (sudo systemctl disable $dm)"
+    done
+    pacman -Qq 2>/dev/null | grep -E "greeter" | xargs -r pacman -Q 2>/dev/null | sed "s/^/pkg: /"
+    true
+}
+t_greeter() {
+    local c
+    c=$(sed -nE "s/.*dms-greeter .*--command ([A-Za-z]+).*/\1/p" <<<"$out" | head -1)
+    MSG="greetd enabled and active, dms-greeter -> ${c:-compositor}"
+    grep -q "enabled=enabled active=active" <<<"$out" && grep -q "^greeter command:.*dms-greeter" <<<"$out" && ! grep -q "^REVIEW" <<<"$out"
+}
+
+c_portals() {
+    local p w
+    for p in xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk; do
+        pacman -Q $p >/dev/null 2>&1 || {
+            case $p in
+                xdg-desktop-portal-gnome) w="screen sharing and screenshots (niri: required for screencasting)";;
+                xdg-desktop-portal-gtk)   w="file pickers and the fallback portals";;
+                *)                        w="the portal framework";;
+            esac
+            echo "MISSING  $p  (niri uses it for $w: sudo pacman -S $p)"
+        }
+    done
+    { pacman -Q gnome-keyring >/dev/null 2>&1 || busctl --user list --no-pager 2>/dev/null | grep -q org.freedesktop.secrets || busctl --user list --activatable --no-pager 2>/dev/null | grep -q org.freedesktop.secrets; } \
+        || echo "MISSING  a Secret Service provider (the Secret portal needs one: sudo pacman -S gnome-keyring, or run KeePassXC as provider)"
+    [ -e /usr/share/xdg-desktop-portal/niri-portals.conf ] || echo "MISSING  niri-portals.conf (shipped by the niri package; reinstall niri)"
+    true
+}
+t_portals() {
+    MSG="portals and a Secret Service provider present, $(command -v xwayland-satellite >/dev/null && echo "Xwayland support installed" || echo "no xwayland-satellite (optional, needed for X11-only apps)")"
+    ! grep -q "^MISSING" <<<"$out"
+}
+
+c_audio() {
+    local u s
+    for u in pipewire.socket pipewire-pulse.socket wireplumber.service; do
+        s=$(systemctl --user is-active $u 2>&1)
+        [ "$s" = active ] || echo "NOT active: $u ($s)"
+    done
+    true
+}
+
+# ---------- 3. Boot time ----------
+c_boot_time() {
+    local o h f l
+    o=$(systemd-analyze | head -2); echo "$o"
+    h=$(echo "$o" | head -1)
+    f=$(h_tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(firmware\).*/\2/p")")
+    l=$(h_tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(loader\).*/\2/p")")
+    awk -v f="${f:-0}" -v l="${l:-0}" 'BEGIN{ if (f>10) print "SLOW firmware phase (>10s): look at BIOS Fast Boot / POST settings"; if (l>3.5) print "SLOW loader phase (>3.5s): check UKI size on the ESP, loader.conf timeout, TPM measurement of the UKI" }'
+}
+t_boot_time() { MSG="$(head -1 <<<"$out" | sed "s/^Startup finished in //")"; grep -q "^Startup finished" <<<"$out" && ! grep -q "^SLOW" <<<"$out"; }
+
+c_slow_units() {
+    local cc l u
+    cc=$(systemd-analyze critical-chain --no-pager 2>/dev/null)
+    systemd-analyze blame --no-pager | grep -E "^ *[0-9.]+(s|min) " | head -8 | while read -r l; do
+        u=${l##* }
+        if echo "$cc" | grep -qF -- "$u"; then echo "$l   [on the critical path: delays boot]"; else echo "$l   [runs in parallel: does not delay boot]"; fi
+    done
+}
+t_slow_units() {
+    if [ -z "$out" ]; then MSG="no unit slower than 1s"; return 0; fi
+    MSG="$(wc -l <<<"$out") unit(s) over 1s, none on the critical path (parallel)"
+    ! grep -q "on the critical path" <<<"$out"
+}
+
+c_bootloader()  { bootctl status 2>&1 | grep -E "Secure Boot:|TPM2 Support:|Product:|Current Entry:|Default Entry:" | sort -u; }
+c_loader_conf() { cat "$(bootctl --print-esp-path 2>/dev/null)/loader/loader.conf" 2>&1; }
+
+c_esp() {
+    local esp p
+    esp=$(bootctl --print-esp-path 2>/dev/null)
+    echo "ESP at $esp: $(df -h --output=used,size,pcent "$esp" | tail -1)"
+    ls -lh "$esp/EFI/Linux/" 2>&1 | tail -n +2 | awk '{print $5, $6, $7, $8, $9}'
+    p=$(df --output=pcent "$esp" | tail -1 | tr -dc 0-9)
+    [ "${p:-0}" -ge 80 ] && echo "LOW SPACE on the ESP: old UKIs or fallbacks may need cleaning"
+    true
+}
+t_esp() { ! grep -q "^LOW SPACE" <<<"$out"; }
+
+c_bootloader_update() {
+    local esp a b
+    esp=$(bootctl --print-esp-path 2>/dev/null)
+    a=$(grep -a -o "LoaderInfo: systemd-boot [^ ]*" /usr/lib/systemd/boot/efi/systemd-bootx64.efi 2>/dev/null | head -1 | sed "s/LoaderInfo: //")
+    b=$(grep -a -o "LoaderInfo: systemd-boot [^ ]*" "$esp/EFI/systemd/systemd-bootx64.efi" 2>/dev/null | head -1 | sed "s/LoaderInfo: //")
+    echo "on the ESP: ${b:-unknown}; shipped by systemd: ${a:-unknown}; systemd-boot-update.service: $(systemctl is-enabled systemd-boot-update.service 2>&1)"
+    [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ] && echo "REVIEW: the ESP loader differs from the one systemd ships. Update it with: sudo bootctl update (or enable systemd-boot-update.service to do it every boot; the Arch Wiki documents both)"
+    true
+}
+t_bootloader_update() { MSG="$(head -1 <<<"$out")"; ! grep -q "^REVIEW" <<<"$out"; }
+
+c_plymouth() {
+    local h
+    if pacman -Q plymouth >/dev/null 2>&1; then
+        echo "$(pacman -Q plymouth), theme: $(plymouth-set-default-theme 2>&1)"
+        h=$(cat /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null | grep -E "^HOOKS")
+        echo "$h"
+        echo "$h" | grep -q plymouth || echo "MISSING plymouth in mkinitcpio HOOKS: the splash cannot show (add it after base/udev or systemd, then: sudo mkinitcpio -P)"
+        grep -qw splash /proc/cmdline || echo "MISSING splash on the kernel command line: add quiet splash to /etc/kernel/cmdline, then: sudo mkinitcpio -P"
+    else
+        echo "plymouth is not installed (optional)"
+    fi
+}
+t_plymouth() {
+    if grep -q "not installed" <<<"$out"; then MSG="not installed (optional)"; return 0; fi
+    ! grep -q "^MISSING" <<<"$out"
+}
+
+# ---------- 4. Shutdown time (estimated) ----------
+c_stop_timeouts() {
+    journalctl -b -1 --no-pager | grep -E "State .(stop-sigterm|stop-sigkill|stop-watchdog). timed out|stop job is running|Failed with result .timeout.|Killing\." | cut -c1-200 || true
+}
+c_shutdown_pauses() { # START_TS comes from the environment
+    local r
+    r=$(journalctl -b -1 -o short-unix --no-pager | awk -v s="$START_TS" '$1+0>=s+0 { if (pt!="" && $1-pt>=5) printf "%d s pause\n   before: %s\n   after:  %s\n", $1-pt, substr(pl,1,150), substr($0,1,150); pt=$1; pl=$0 }' | head -12)
+    if [ -n "$r" ]; then echo "$r"; else echo "(no pause of 5 s or more found)"; fi
+}
+
+# systemd has no direct shutdown-duration metric. Estimate: first shutdown-ish
+# line in the previous boot's journal -> last line written.
+shutdown_section() {
+    local PREV_LOG PREV_RC END_TS DUR
+    SHUT_BAD=0; START_TS=""
+    if [ "$IS_TTY" -eq 1 ]; then
+        printf '\r\033[K%s[%2d/%d]%s %s %s> Reading previous boot journal%s' "$C_DIM" "$CUR_N" "$TOTAL" "$C_OFF" "$CUR_TITLE" "$C_DIM" "$C_OFF"
+    fi
+    # same pattern as _exec: output goes to a file (a straggler cannot hold a pipe open) and we wait in the
+    # background, so the deadline holds and Ctrl+C works at once
+    timeout -k 5 "$DL_SLOW" journalctl -b -1 -o short-unix --no-pager < /dev/null > "$CHK" 2>/dev/null &
+    TPID=$!
+    wait "$TPID"; PREV_RC=$?
+    TPID=""
+    PREV_LOG="$(cat "$CHK")"
+    if [ "$PREV_RC" -eq 124 ] || [ "$PREV_RC" -eq 137 ]; then
+        [ "$FULL" -eq 0 ] && { BAD+=("Shutdown duration"); WHY+=("timed out after ${DL_SLOW}s reading the previous boot journal, result unknown"); }
+        printf '\n--- Shutdown duration  [CHECK]\nTimed out after %ss while reading the previous boot journal: the shutdown time and stop-timeout checks were skipped.\n' "$DL_SLOW" >> "$RAW"
+        return
+    fi
+    if [ -z "$PREV_LOG" ]; then
+        printf '\n--- Shutdown duration\nNo previous boot in journal (journal may not be persistent).\n' >> "$RAW"
+        return
+    fi
+    START_TS="$(echo "$PREV_LOG" | grep -E "Stopped target (Graphical|Multi-User)|Starting systemd-poweroff|Starting systemd-reboot|Shutting down|System is (powering off|rebooting)" | head -1 | awk '{print $1}')"
+    END_TS="$(echo "$PREV_LOG" | tail -1 | awk '{print $1}')"
+    DUR=""
+    if [ -n "$START_TS" ] && [ -n "$END_TS" ]; then DUR="$(awk -v s="$START_TS" -v e="$END_TS" 'BEGIN{printf "%d", e-s}')"; fi
+    if [ -z "$DUR" ]; then
+        printf '\n--- Shutdown duration\nCould not determine the shutdown window from the previous boot.\n' >> "$RAW"
+    elif [ "$DUR" -lt 2 ]; then
+        printf '\n--- Shutdown duration\nCould not measure: the window found in the previous boot is only %ss, which cannot be real\n(the journal lacks the early "Stopped target" lines, or the boot ended abruptly). Last lines of that boot:\n' "$DUR" >> "$RAW"
+        journalctl -b -1 --no-pager -n 8 -o short 2>/dev/null | cut -c1-200 >> "$RAW"
+    elif [ "$DUR" -le 20 ] && [ "$FULL" -eq 0 ]; then
+        OK_N=$((OK_N + 1))
+        printf '\n--- Shutdown duration\nOK: the previous shutdown took about %ss (healthy is under ~15s)\n' "$DUR" >> "$RAW"
+    else
+        SHUT_BAD=1
+        if [ "$DUR" -gt 20 ] && [ "$FULL" -eq 0 ]; then BAD+=("Shutdown duration"); WHY+=("took about ${DUR}s (healthy is under ~15s)"); fi
+        printf '\n--- Shutdown duration%s\nEstimated: %ss (under ~10-15s is healthy; much longer usually means a stop job timed out)\n' "$([ "$DUR" -gt 20 ] && [ "$FULL" -eq 0 ] && echo '  [CHECK]')" "$DUR" >> "$RAW"
+    fi
+    CHECK_DL=$DL_SLOW runq "Units that hit the stop timeout last shutdown" c_stop_timeouts t_empty "no unit hit its stop timeout"
+    if { [ "$SHUT_BAD" -eq 1 ] || [ -n "$out" ]; } && [ "$SUMONLY" -eq 0 ] && [ -n "$START_TS" ]; then
+        export START_TS
+        CHECK_DL=$DL_SLOW run "Longest pauses during the previous shutdown (5 s or more; the line BEFORE a pause is what was being waited for)" c_shutdown_pauses
+    fi
+}
+
+# ---------- 5. Services and errors ----------
+c_system_state() { systemctl is-system-running; }
+t_system_state() {
+    if [ "$out" = degraded ] && [ "$KNOWN_TPM" -eq 1 ]; then MSG="degraded, only because of the known systemd-262 NvPCR units (systemd#43848)"; return 0; fi
+    [ "$out" = running ]
+}
+
+c_failed_units() {
+    systemctl --failed --plain --no-legend 2>&1
+    systemctl --user --failed --plain --no-legend 2>&1 | sed "s/^/(user) /"
+}
+t_failed_units() {
+    [ -z "$out" ] && return 0
+    if [ "$KNOWN_TPM" -eq 1 ]; then
+        MSG="only the 3 known systemd-262 NvPCR units failed (upstream bug systemd#43848: UKI has no PCR public key; harmless without TPM disk unlock; fix proposed in systemd#43948, so watch for a systemd update; optional interim: mask them)"
+        return 0
+    fi
+    return 1
+}
+
+c_failed_why() {
+    local u
+    for u in $(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | head -8); do
+        echo "== $u"; journalctl -u "$u" -b -n 4 --no-pager -o cat 2>&1 | cut -c1-200
+    done
+    for u in $(systemctl --user --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | head -5); do
+        echo "== (user) $u"; journalctl --user -u "$u" -b -n 4 --no-pager -o cat 2>&1 | cut -c1-200
+    done
+}
+
+c_tpm_status() {
+    echo "tpm devices: $(ls /sys/class/tpm 2>&1 | tr "\n" " ")"
+    echo "tpm major version: $(cat /sys/class/tpm/tpm0/tpm_version_major 2>&1)"
+    systemd-analyze has-tpm2 2>&1 | head -12
+    echo "--- nvpcr definitions shipped:"; ls /usr/lib/nvpcr/ /etc/nvpcr/ 2>&1
+    echo "--- packages:"; pacman -Q tpm2-tss systemd 2>&1 | grep -v ^warning
+}
+c_tpm_dmesg() { dmesg | grep -iE "tpm|tcg" | head -15; }
+
+c_dbus_activation() {
+    local b l e s
+    for b in 0 -1; do
+        l=$(journalctl -b $b -p 3 --no-pager 2>/dev/null | grep -E "Activation request for" | cut -c1-160)
+        e=$(journalctl -b $b -n 1 -o short-unix --no-pager -q 2>/dev/null | cut -d. -f1)
+        if [ "$b" = -1 ] && [ -n "$e" ]; then
+            # nm_dispatcher refused in the last 2 minutes of the previous boot = shutdown, not a fault
+            s=$(journalctl -b $b -p 3 --since "@$((e - 120))" --no-pager 2>/dev/null | grep -E "Activation request for .org.freedesktop.nm_dispatcher" | cut -c1-160)
+            [ -n "$s" ] && l=$(printf "%s\n" "$l" | grep -vxFf <(printf "%s\n" "$s"))
+        fi
+        systemctl is-enabled --quiet bluetooth 2>/dev/null || l=$(echo "$l" | grep -v "org.bluez")
+        l=$(echo "$l" | head -6)
+        [ -n "$l" ] && { echo "boot $b:"; echo "$l"; }
+    done
+    true
+}
+
+c_errors_boot() {
+    journalctl -p 3 -b --no-pager -o short | grep -vE "^-- " | grep -vE "$BENIGN_RE" | grep -vE "$TPMFILT" | cut -c1-220 | tail -25
+}
+c_errors_kernel() {
+    dmesg --level=err,crit,alert,emerg | grep -vE "$BENIGN_RE" | grep -vE "$TPMFILT" | tail -25
+}
+
+c_coredumps() {
+    local bs n o
+    bs=$(date -d "-$(cut -d. -f1 /proc/uptime) seconds" "+%Y-%m-%d %H:%M:%S")
+    n=$(coredumpctl list --no-pager --no-legend --since "$bs" 2>/dev/null | grep -c .)
+    if [ "$n" -gt 0 ]; then
+        echo "$n crash(es) since this boot started:"
+        coredumpctl list --no-pager --no-legend --since "$bs" 2>/dev/null | tail -6
+    fi
+    o=$(coredumpctl list --no-pager --no-legend --since "7 days ago" --until "$bs" 2>/dev/null | grep .)
+    if [ -n "$o" ]; then
+        echo "$(echo "$o" | wc -l) earlier crash(es) in the last 7 days (before this boot), newest 4:"
+        echo "$o" | tail -4
+    fi
+    true
+}
+t_coredumps() {
+    grep -q "since this boot started" <<<"$out" && return 1
+    [ -n "$out" ] && MSG="none this boot; $(head -1 <<<"$out" | cut -d" " -f1) earlier crash(es) in the last 7 days (run --full to list them)"
+    return 0
+}
+c_newest_crash() {
+    local p
+    p=$(coredumpctl list --no-pager --no-legend 2>/dev/null | tail -1 | awk '{for(i=1;i<=NF;i++) if($i ~ /^SIG/){print $(i-3); exit}}')
+    if [ -n "$p" ]; then
+        coredumpctl info --no-pager "$p" 2>&1 | grep -E "Timestamp|Command Line|Signal|Package|Message|^ +#[0-9]+ " | cut -c1-180 | head -20
+    else
+        echo "could not read the newest crash entry"
+    fi
+}
+
+# Known fault signatures per boot, plus boots that did not end cleanly (clean_end=NO).
+c_boot_problems() {
+    local b j wf ga i2 bh bs tp ce
+    for b in 0 -1 -2 -3 -4 -5 -6 -7; do
+        j=$(journalctl -b $b --no-pager 2>/dev/null); [ -z "$j" ] && continue
+        wf=$(echo "$j" | grep -cE "iwlwifi.*(SW reset|Microcode SW error)")
+        ga=$(echo "$j" | grep -c "Atomic update failure")
+        i2=$(echo "$j" | grep -c "i2c_designware.*timed out")
+        bh=$(echo "$j" | grep -E "Bluetooth: hci[0-9]+: .*(failed|tx timeout)" | grep -vcF "Reading supported features failed (-16)")
+        bs=$(echo "$j" | grep -cE "bluetooth.service: .*timed out")
+        tp=$(echo "$j" | grep -c "Failed to start Early TPM SRK Setup"); [ "$KNOWN_TPM" = 1 ] && tp=0
+        ce=$(echo "$j" | tail -40 | grep -qE "Journal stopped|Unmounted /|Reached target .*(Shutdown|Power-Off|Reboot)|systemd-shutdown" && echo yes || echo NO)
+        if [ $((wf+ga+i2+bh+bs+tp)) -gt 0 ] || { [ "$b" != 0 ] && [ "$ce" = NO ]; }; then
+            echo "boot $b: wifi_fw_crash=$wf i915_atomic_err=$ga i2c_timeout=$i2 bt_hci_err=$bh bt_stop_timeout=$bs tpm_fail=$tp clean_end=$ce"
+            echo "   started: $(echo "$j" | grep -m1 -vE "^-- " | cut -c1-15)   last line: $(echo "$j" | tail -1 | cut -c1-120)"
+        fi
+    done
+}
+
+# Error messages seen in 2+ of the last 7 boots. Digits become "#" so that times and ids do not hide repeats.
+c_recurring_errors() {
+    local n=0 tmp b res
+    tmp=$(mktemp)
+    for b in 0 -1 -2 -3 -4 -5 -6; do
+        journalctl -b $b -n 1 --no-pager -q >/dev/null 2>&1 || continue
+        n=$((n+1))
+        journalctl -b $b -p 3 --no-pager -o short 2>/dev/null \
+            | sed -E "s/^[A-Z][a-z]{2} +[0-9]+ [0-9:]{8} [^ ]+ //; s/\[[0-9]+\]//g; s/0x[0-9a-fA-F]+/0xN/g; s/[0-9]+/#/g" \
+            | grep -vE "^[[:space:]]|^--|^$" \
+            | grep -vE "$BENIGN_RE|Activation request for .org.freedesktop.nm_dispatcher" \
+            | grep -vE "$TPMFILT" | cut -c1-170 | sort -u | awk -v b=$b '{print b "@@" $0}' >> "$tmp"
+    done
+    res=$(awk -F"@@" '{c[$2]++; if ($1==0) now[$2]=1} END{for (k in c) if (c[k]>=2) printf "%d %s %s\n", c[k], (now[k] ? "[now] " : "[gone]"), k}' "$tmp" | sort -rn | head -14)
+    rm -f "$tmp"
+    if [ -n "$res" ]; then
+        echo "boots analysed: $n (count = boots it appeared in; [now] = also in this boot, [gone] = absent this boot; digits shown as #)"
+        echo "$res"
+    fi
+}
+t_recurring_errors() {
+    [ -z "$out" ] && return 0
+    grep -q "\[now\]" <<<"$out" && return 1
+    MSG="only history: $(grep -c "\[gone\]" <<<"$out") message(s) recurred in earlier boots but are absent this boot (fixed?); run --full to list them"
+    return 0
+}
+
+# ---------- 6. CPU, thermals, throttling ----------
+c_cpu() {
+    local c=/sys/devices/system/cpu/cpu0/cpufreq pl1 pl2
+    pl1=$(( $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
+    pl2=$(( $(cat /sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))
+    lscpu | sed -n "s/^Model name: *//p"
+    echo "governor/driver: $(cat $c/scaling_governor 2>&1) / $(cat $c/scaling_driver 2>&1)"
+    echo "power profile: $(powerprofilesctl get 2>/dev/null || echo none)"
+    echo "PL1/PL2: ${pl1}W / ${pl2}W"
+    awk '/cpu MHz/{s+=$4; if(min==""||$4<min)min=$4; if($4>max)max=$4; n++} END{if(n) printf "%d threads, MHz min %d / avg %d / max %d\n", n, min, s/n, max}' /proc/cpuinfo
+    echo "limits kHz: min $(cat $c/scaling_min_freq 2>&1) / max $(cat $c/scaling_max_freq 2>&1) (hardware max $(cat $c/cpuinfo_max_freq 2>&1)); no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>&1); EPP=$(cat $c/energy_performance_preference 2>&1)"
+    echo "AC online: $(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1) (1 = plugged in); an idle snapshot shows idle clocks, re-run during load to judge speed"
+}
+
+c_ucode() {
+    pacman -Q intel-ucode 2>&1 | grep -v "^warning"
+    journalctl -k -b --no-pager | grep -i "microcode: Current revision" | cut -c1-120
+}
+t_ucode() { grep -q "Current revision" <<<"$out" && ! grep -q "was not found" <<<"$out"; }
+
+c_temps() { sensors 2>/dev/null | grep -E "Package id 0|Composite|^fan1"; }
+t_temps() {
+    local t
+    t=$(grep -oE "Package id 0: +\+[0-9]+" <<<"$out" | grep -oE "[0-9]+$")
+    MSG="CPU package ${t}C"
+    [ -n "$t" ] && [ "$t" -lt 85 ]
+}
+c_temps_sysfs() {
+    local z
+    for z in /sys/class/thermal/thermal_zone*; do echo "$(cat $z/type): $(( $(cat $z/temp) / 1000 ))C"; done
+}
+
+c_throttling() {
+    local t=/sys/devices/system/cpu/cpu0/thermal_throttle p
+    p=$(cat $t/package_throttle_count 2>/dev/null || echo 0)
+    echo "package_throttle_count=$p core_throttle_count=$(cat $t/core_throttle_count 2>/dev/null || echo 0) package_power_limit_count=$(cat $t/package_power_limit_count 2>/dev/null || echo n/a) since boot ($(awk '{printf "%.1f", $1/3600}' /proc/uptime) h up)"
+    echo "during this report: +$((p - ${THR0:-$p}))"
+    journalctl -k -b --no-pager | grep -iE "throttl|PROCHOT" | grep -v e1000e | tail -5
+}
+t_throttling() {
+    local d
+    d=$(sed -n "s/^during this report: +//p" <<<"$out")
+    MSG="$(head -1 <<<"$out"); none during this report"
+    [ "${d:-0}" -eq 0 ] && ! grep -qE "^[A-Z][a-z]{2} +[0-9]+ [0-9:]{8} " <<<"$out"
+}
+c_top_cpu() { ps -eo pid,comm,%cpu,%mem --sort=-%cpu | grep -v " ps " | head -8; }
+
+# ---------- 7. Memory and swap ----------
+c_memory() {
+    free -m | awk '/Mem:/{pct=$7*100/$2; printf "%d of %d MiB used, %d MiB available (%d%%)\n", $3, $2, $7, pct; if(pct<15) print "LOW: little memory available"} /Swap:/{if($2>0){sp=$3*100/$2; printf "swap %d of %d MiB used\n", $3, $2; if(sp>50) print "HIGH: swap is more than half used"} else print "LOW: no swap configured"}'
+}
+t_memory() { MSG="$(join_lines "$out")"; ! grep -qE "^(LOW|HIGH)" <<<"$out"; }
+c_zram() {
+    zramctl --noheadings -o NAME,ALGORITHM,DISKSIZE,DATA,COMPR 2>&1
+    swapon --noheadings --show=NAME,PRIO 2>&1 | sed "s/^/swap: /"
+}
+c_oom() { journalctl -k --no-pager | grep -iE "out of memory|oom-kill|killed process" | tail -5 || true; }
+c_top_mem() { ps -eo pid,comm,%mem,rss --sort=-%mem | head -8; }
+
+# ---------- 8. Storage ----------
+c_disk_usage() { df -h --output=target,size,used,pcent / /boot /home 2>&1; }
+t_disk_usage() {
+    MSG="$(tail -n +2 <<<"$out" | awk '{printf "%s %s used; ", $1, $4}')"
+    ! grep -qE "(8[5-9]|9[0-9]|100)%" <<<"$out"
+}
+
+c_smart() {
+    local s q du ph
+    s=$(smartctl -a /dev/nvme0n1)
+    echo "$s" | grep -E "Model Number|Critical Warning|^Temperature|Available Spare:|Percentage Used|Data Units Written|Power On Hours|Unsafe Shutdowns|Media and Data Integrity|Error Information Log Entries"
+    q=$(echo "$s" | grep -cE "Model Number:.*BC501")
+    echo "$s" | awk -v q="$q" -F: '/^Available Spare:/{v=$2; gsub(/[^0-9]/,"",v); if (v+0<100) print "WARNING: available spare fell to " v "%: the drive is remapping worn blocks. Back up and plan a replacement."} /Percentage Used/{v=$2; gsub(/[^0-9]/,"",v); if (q>0) { if (v+0>=70) print "NOTE: the drive reports " v "% wear, but the BC501 family is known to over-report it; judged by Available Spare, media errors and Critical Warning instead." } else if (v+0>=90) print "CRITICAL: " v "% of rated endurance used. Back up now and replace the drive."; else if (v+0>=70) print "WARNING: " v "% of rated endurance used. Keep a real backup (snapshots are not backups) and plan a replacement."}'
+    du=$(echo "$s" | sed -nE "s/^Data Units Written: +([0-9,]+).*/\1/p" | tr -d ,)
+    ph=$(echo "$s" | sed -nE "s/^Power On Hours: +([0-9,]+).*/\1/p" | tr -d ,)
+    [ -n "$du" ] && [ "${ph:-0}" -gt 0 ] && echo "lifetime average: $(( du * 512000 / ph / 1000000 )) MB written per power-on hour (includes any previous OS/owner)"
+    true
+}
+t_smart() {
+    if grep -q "^NOTE" <<<"$out"; then
+        MSG="$(grep -m1 "^Percentage Used" <<<"$out" | tr -s " ") reported, but the BC501 over-reports it; spare, media errors and critical warning are clean"
+    fi
+    ! grep -qE "^(WARNING|CRITICAL)" <<<"$out" && grep -qE "Critical Warning: +0x00" <<<"$out" && grep -qE "Media and Data Integrity Errors: +0$" <<<"$out"
+}
+c_smart_missing() { echo "not installed"; }
+
+c_btrfs() {
+    local e
+    e=$(btrfs device stats / | grep -vE " 0$")
+    [ -n "$e" ] && { echo "DEVICE ERRORS:"; echo "$e"; }
+    btrfs scrub status / | grep -E "Scrub started|Status:|Error summary"
+    btrfs filesystem usage / | grep -E "Free \(estimated\)"
+}
+t_btrfs() { ! grep -q "DEVICE ERRORS" <<<"$out" && grep -q "Error summary: *no errors found" <<<"$out"; }
+
+c_timers() {
+    local t w
+    t=$(systemctl list-timers --all --no-pager 2>/dev/null)
+    for w in fstrim paccache; do
+        [ "$w" = fstrim ] && findmnt -no OPTIONS / | grep -q "discard=async" && continue
+        echo "$t" | grep -q "$w" || echo "missing timer: $w (sudo systemctl enable --now $w.timer; paccache.timer comes with pacman-contrib)"
+    done
+    command -v snapper >/dev/null && {
+        echo "$t" | grep -q snapper-timeline || echo "missing timer: snapper-timeline"
+        echo "$t" | grep -q snapper-cleanup  || echo "missing timer: snapper-cleanup"
+    }
+    if findmnt -n -o FSTYPE / | grep -q btrfs && ! echo "$t" | grep -q btrfs-scrub; then
+        echo "missing timer: btrfs-scrub (enable with: sudo systemctl enable --now btrfs-scrub@-.timer)"
+    fi
+}
+
+c_snapper() {
+    local c
+    for c in $(snapper list-configs | awk -F"│" 'NR>2{gsub(/ /,"",$1); print $1}'); do
+        echo "$c: $(( $(snapper -c $c list | tail -n +3 | wc -l) )) snapshots, newest: $(snapper -c $c list | tail -1 | awk -F"│" '{print $4}' | sed 's/^ *//; s/ *$//')"
+    done
+}
+c_snapper_missing() { echo "not installed"; }
+
+c_pkg_cache() {
+    local c j
+    c=$(du -sk /var/cache/pacman/pkg 2>/dev/null | cut -f1)
+    echo "pacman cache: $(( ${c:-0} / 1024 )) MiB"
+    [ "${c:-0}" -gt 10485760 ] && echo "LARGE pacman cache: run paccache -r"
+    j=$(journalctl --disk-usage | grep -oE "[0-9.]+[KMGT]" | tail -1)
+    echo "journal: $j"
+    case $j in *G|*T) echo "LARGE journal: consider SystemMaxUse= in /etc/systemd/journald.conf.d/";; esac
+}
+t_pkg_cache() { MSG="$(join_lines "$out")"; ! grep -q "^LARGE" <<<"$out"; }
+
+c_home_sizes()  { du -h --max-depth=1 "$HOME" 2>/dev/null | sort -rh | head -10; }
+c_root_mount()  { findmnt -no OPTIONS /; }
+
+# ---------- 9. Battery and power ----------
+c_battery() { upower -i $(upower -e | grep BAT) | grep -E "state|percentage|capacity:" | sed "s/^ *//"; }
+t_battery() {
+    local c
+    c=$(grep -oE "capacity: +[0-9]+" <<<"$out" | grep -oE "[0-9]+$")
+    MSG="battery holds ${c}% of design capacity"
+    [ -n "$c" ] && [ "$c" -ge 80 ]
+}
+c_battery_sysfs() { cat /sys/class/power_supply/BAT0/{status,capacity,energy_full,energy_full_design,cycle_count} 2>/dev/null; }
+
+c_power_daemons() {
+    local a="" u
+    for u in tlp power-profiles-daemon thermald; do systemctl is-active --quiet $u && a="$a $u"; done
+    echo "active:${a:- none}"
+    case "$a" in
+        *tlp*power-profiles-daemon*|*power-profiles-daemon*tlp*) echo "REVIEW: tlp and power-profiles-daemon are both active (they fight over the same settings; keep one)";;
+        *tlp*|*power-profiles-daemon*) ;;
+        *) echo "REVIEW: no power management daemon is active (the DMS power menu and profile switching need power-profiles-daemon)";;
+    esac
+}
+t_power_daemons() { MSG="$(head -1 <<<"$out")"; ! grep -q "^REVIEW" <<<"$out"; }
+
+# ---------- 10. GPU and graphics ----------
+c_gpu() {
+    lspci | grep -iE "vga|display" | cut -d: -f3 | sed "s/^ *//"
+    echo "kernel driver: $(lsmod | grep -oE "^(i915|xe) " | head -1)"
+    vainfo 2>/dev/null | grep "Driver version" | sed "s/vainfo: //" || echo "vainfo not installed (sudo pacman -S libva-utils)"
+}
+
+# ---------- 11. Network ----------
+c_connectivity() {
+    nmcli -t -f CONNECTIVITY general 2>&1
+    nmcli -t -f DEVICE,TYPE,STATE device 2>&1 | grep -E ":(connected|connecting)" | grep -v "^lo:" | sed "s/^/up: /"
+}
+t_connectivity() { MSG="internet reachable, $(grep -c "^up:" <<<"$out") active device(s)"; [ "$(head -1 <<<"$out")" = full ]; }
+
+c_dns() {
+    echo "systemd-resolved: $(systemctl is-active systemd-resolved 2>&1); /etc/resolv.conf: $([ -L /etc/resolv.conf ] && echo "symlink to $(readlink -f /etc/resolv.conf)" || echo "regular file"); nameservers: $(grep -c "^nameserver" /etc/resolv.conf)"
+    getent hosts archlinux.org >/dev/null && echo "lookup works" || echo "lookup FAILED"
+}
+t_dns() { MSG="$(head -1 <<<"$out")"; grep -q "lookup works" <<<"$out"; }
+
+c_bluetooth() {
+    local en ac adapter n o
+    en=$(systemctl is-enabled bluetooth 2>&1); ac=$(systemctl is-active bluetooth 2>&1)
+    adapter=$(ls /sys/class/bluetooth 2>/dev/null | tr "\n" " ")
+    echo "service: $ac, unit file: $en"
+    echo "adapter present in kernel: ${adapter:-none}"
+    echo "rfkill: $(rfkill list bluetooth 2>&1 | grep -E "Soft blocked" | tr -s " " | tr "\n" ";")"
+    n=$(journalctl -k -b --no-pager | grep -E "Bluetooth: hci[0-9]+: .*(failed|error|tx timeout)" | grep -vcF "Reading supported features failed (-16)")
+    echo "kernel errors this boot (harmless Intel -16 feature query excluded): $n"
+    case "$en/$ac" in
+        disabled/inactive|masked/inactive|static/inactive) echo "OFF BY CHOICE";;
+        *)
+            if [ -z "$adapter" ]; then
+                echo "NO ADAPTER: Bluetooth may be disabled in BIOS/UEFI; if intentional, disable bluetooth.service"
+            else
+                o=$(timeout 8 bluetoothctl show 2>&1)
+                echo "controller: $(echo "$o" | grep -E "Powered:" | tr -s " " | head -1)"
+                [ -z "$(echo "$o" | grep Powered)" ] && echo "controller: NOT ANSWERING"
+            fi;;
+    esac
+}
+t_bluetooth() {
+    if grep -q "OFF BY CHOICE" <<<"$out"; then
+        MSG="service disabled by choice ($(head -1 <<<"$out"))"
+        grep -q "errors this boot[^:]*: 0$" <<<"$out"
+    elif grep -q "NO ADAPTER" <<<"$out"; then
+        WHYMSG="NO ADAPTER: service enabled but no adapter detected (BIOS/UEFI switch? else disable bluetooth.service)"
+        return 1
+    else
+        MSG="controller powered on, no kernel errors this boot"
+        grep -q "Powered: yes" <<<"$out" && grep -q "errors this boot[^:]*: 0$" <<<"$out"
+    fi
+}
+# shown when Bluetooth is not healthy (or in --full)
+c_bt_radio() {
+    local f d
+    rfkill list all 2>&1
+    echo "--- saved rfkill state (1 = blocked at next boot):"
+    for f in /var/lib/systemd/rfkill/*; do [ -e "$f" ] && echo "$(basename "$f"): $(cat "$f")"; done
+    echo "--- packages:"; pacman -Q bluez bluez-utils linux-firmware linux-firmware-intel 2>&1 | grep -v ^warning
+    echo "--- Intel BT firmware files present:"; ls /usr/lib/firmware/intel/ 2>&1 | grep -E "^ibt-" | head -20
+    echo "--- btusb autosuspend: $(cat /sys/module/btusb/parameters/enable_autosuspend 2>&1)"
+    lsusb 2>/dev/null | grep -iE "8087:|bluetooth" || echo "no Bluetooth USB device is enumerated right now"
+    for d in /sys/bus/usb/devices/*; do
+        [ "$(cat $d/idVendor 2>/dev/null)" = "8087" ] && echo "$(basename $d) power/control=$(cat $d/power/control 2>&1) runtime_status=$(cat $d/power/runtime_status 2>&1)"
+    done
+    true
+}
+c_bt_kernel_log() { journalctl -k -b --no-pager | grep -iE "bluetooth|btusb|ibt-" | cut -c1-200 | head -40; }
+c_bt_daemon_log() {
+    journalctl -u bluetooth -b -n 12 --no-pager -o cat 2>&1 | cut -c1-200
+    echo "--- previous boot:"
+    journalctl -u bluetooth -b -1 -n 12 --no-pager -o cat 2>&1 | cut -c1-200
+}
+c_nm_dispatcher() {
+    echo "enabled: $(systemctl is-enabled NetworkManager-dispatcher.service 2>&1)  active: $(systemctl is-active NetworkManager-dispatcher.service 2>&1)"
+    journalctl -u NetworkManager-dispatcher -b -n 8 --no-pager -o cat 2>&1 | cut -c1-200
+}
+
+# ---------- 12. Updates and packages ----------
+c_repo_updates() {
+    local o r
+    if ! command -v checkupdates >/dev/null; then echo "checkupdates missing (sudo pacman -S pacman-contrib)"; return; fi
+    o=$(checkupdates 2>&1); r=$?
+    case $r in
+        2) echo "No repo updates available" ;;
+        0) printf "%s\n" "$o" | head -15; echo "($(printf "%s\n" "$o" | grep -c .) pending; apply with: sudo pacman -Syu)" ;;
+        *) echo "checkupdates failed (exit $r): $o" | head -5 ;;
+    esac
+}
+# Pending updates are only a problem when the system has not had a full upgrade for UPDATE_AGE_DAYS.
+# (pacman.log tells when the last -Syu ran; nothing is stored by this script.)
+t_repo_updates() {
+    local n days
+    if grep -q "No repo updates available" <<<"$out"; then MSG="no repo updates available"; return 0; fi
+    n=$(sed -nE 's/^\(([0-9]+) pending;.*/\1/p' <<<"$out")
+    [ -n "$n" ] || return 1                 # checkupdates failed or is missing
+    days=$(h_days_since_upgrade)
+    if [ -z "$days" ]; then MSG="$n repo update(s) pending (no full upgrade found in pacman.log, age unknown)"; return 0; fi
+    if [ "$days" -ge "$UPDATE_AGE_DAYS" ]; then
+        WHYMSG="$n repo update(s) pending; last full upgrade ${days} days ago (apply with: sudo pacman -Syu)"
+        return 1
+    fi
+    MSG="$n repo update(s) available; last full upgrade ${days} day(s) ago (attention after ${UPDATE_AGE_DAYS})"
+}
+
+c_aur_updates() {
+    if command -v paru >/dev/null; then paru -Qua 2>&1 | head -50
+    elif command -v yay >/dev/null; then yay -Qua 2>&1 | head -50
+    fi
+}
+t_aur_updates() {
+    if [ -z "$out" ]; then MSG="none pending (or no AUR helper)"; return 0; fi
+    if grep -qiE '^(error|warning)|failed' <<<"$out"; then WHYMSG="AUR helper reported a problem: $(head -1 <<<"$out")"; return 1; fi
+    MSG="$(wc -l <<<"$out") AUR update(s) available (informational): $(awk '{print $1}' <<<"$out" | head -5 | tr '\n' ' ')"
+}
+
+c_flatpak_updates() {
+    local o r
+    if command -v flatpak >/dev/null; then
+        o=$(flatpak remote-ls --updates 2>&1); r=$?
+        [ -n "$o" ] && echo "$o" | head -50
+        [ "$r" -ne 0 ] && echo "(flatpak exit $r)"
+    fi
+    true
+}
+t_flatpak_updates() {
+    if [ -z "$out" ]; then MSG="no updates pending (or Flatpak not installed)"; return 0; fi
+    if grep -q "(flatpak exit" <<<"$out"; then WHYMSG="flatpak could not list updates: $(head -1 <<<"$out")"; return 1; fi
+    MSG="$(wc -l <<<"$out") Flatpak update(s) available (informational)"
+}
+
+c_last_upgrade() {
+    echo "last full upgrade: $(h_fmt_when "$(grep "starting full system upgrade" /var/log/pacman.log 2>/dev/null | tail -1 | cut -c2-25)")"
+    echo "pacman.log starts:  $(h_fmt_when "$(head -1 /var/log/pacman.log 2>&1 | cut -c2-25)") (a very recent date here usually means a fresh install)"
+}
+
+c_pkg_db()  { pacman -Dk 2>&1 | tail -10; }
+t_pkg_db()  { grep -q "No database errors" <<<"$out"; }
+
+c_altered_files() {
+    local all bad gen real
+    all=$(pacman -Qkk 2>&1)
+    bad=$(echo "$all" | grep -E "Size mismatch|checksum mismatch|No such file" | grep -v "^backup file")
+    gen="plugins\.dat|giomodule\.cache|loaders\.cache|immodules\.cache|gschemas\.compiled|/graphviz/config"
+    real=$(echo "$bad" | grep -vE "$gen" | grep .)
+    if [ -n "$real" ]; then echo "$real" | head -30; else echo "none"; fi
+}
+
+c_pacnew() {
+    local f
+    f=$(find /etc -xdev \( -name "*.pacnew" -o -name "*.pacsave" \) 2>/dev/null)
+    if [ -n "$f" ]; then echo "$f" | head -20; echo "(review with: sudo pacdiff)"; else echo "none"; fi
+}
+
+c_orphans() { pacman -Qdtq 2>&1 | head -30; }
+
+c_mirrorlist() {
+    local now m d
+    now=$(date +%s); m=$(stat -c %Y /etc/pacman.d/mirrorlist 2>/dev/null || echo $now); d=$(( (now - m) / 86400 ))
+    echo "mirrorlist last changed $d days ago"
+    [ "$d" -gt 90 ] && echo "OLD: refresh it (rate-mirrors or reflector)"
+    true
+}
+t_mirrorlist() { MSG="$(head -1 <<<"$out")"; ! grep -q "^OLD" <<<"$out"; }
+
+c_sync_db() {
+    local r
+    for r in $(grep -E "^\[" /etc/pacman.conf | tr -d "[]" | grep -vx options); do
+        [ -f /var/lib/pacman/sync/$r.db ] || echo "MISSING  $r  (run: sudo pacman -Syu, never -Sy alone)"
+    done
+}
+c_foreign_pkgs() { pacman -Qm 2>&1 | head -30; }
+
+# ---------- 13. Security basics ----------
+c_firewall() {
+    local z sv x
+    if systemctl is-active --quiet firewalld; then
+        z=$(firewall-cmd --get-default-zone); sv=$(firewall-cmd --zone=$z --list-services)
+        echo "firewalld active, zone $z, services: $sv"
+        x=$(echo $sv | tr " " "\n" | grep -vxE "dhcpv6-client|ssh|mdns|kdeconnect|samba-client" | tr "\n" " ")
+        [ -n "$x" ] && echo "REVIEW: allowed beyond the usual client set: ${x}(drop what you do not run: sudo firewall-cmd --permanent --zone=$z --remove-service=NAME && sudo firewall-cmd --reload)"
+    elif systemctl is-active --quiet ufw; then
+        echo "ufw active"; ufw status | head -5
+    elif nft list ruleset 2>/dev/null | grep -q chain; then
+        echo "nftables rules loaded (no firewalld/ufw)"
+    else
+        echo "NO FIREWALL ACTIVE (Arch ships none by default)"
+    fi
+}
+t_firewall() { MSG="$out"; ! grep -qE "NO FIREWALL|^REVIEW" <<<"$out"; }
+
+# informational: whether a listener is reachable depends on the firewall
+c_listeners() {
+    local o
+    o=$(ss -tulnpH | grep -vE "127\.0\.0\.|\[::1\]|%lo" | awk '{print $1, $5, $7}' | head -15)
+    echo "${o:-(none)}"
+}
+
+# ---------- 14. Firmware ----------
+c_bios() { echo "BIOS $(cat /sys/class/dmi/id/bios_version 2>/dev/null) ($(cat /sys/class/dmi/id/bios_date 2>/dev/null))"; }
+c_fwupd() { fwupdmgr get-updates --no-unreported-check 2>&1 | head -20; }
+t_fwupd() {
+    grep -qE "No updates available|No updatable devices|no available firmware updates" <<<"$out" \
+        && ! grep -qE "New version|Upgrade available|^Devices with firmware updates" <<<"$out"
+}
+
+# =====================================================================================
+# 9. PRIVACY MASKING (runs on the temp file, then the clean copy is saved)
+# =====================================================================================
+N_IP4=0; N_IP6=0; N_MAC=0; N_NAME=0; N_SER=0; N_UUID=0
+
+# unique matches, longest first (so 192.168.1.10 is replaced before 192.168.1.1)
+uniq_matches() { # file, ERE
+    grep -oiE "$2" "$1" | sort -u | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-
+}
+esc_re() { printf '%s' "$1" | sed -e 's/[]\/$*.^[(){}+?|]/\\&/g'; }
+redact_literal() { # file, literal, label, [nob = no word boundaries]
+    local e; e="$(esc_re "$2")"
+    if [ "$4" = "nob" ]; then
+        sed -E -i "s/${e}/$3/g" "$1"
+    else
+        sed -E -i "s/\\b${e}\\b/$3/g" "$1"
+    fi
+}
+
+mask_report() {
+    local L=() i H MID REALNAME
+
+    # MAC addresses
+    mapfile -t L < <(uniq_matches "$RAW" '\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b')
+    for i in "${!L[@]}"; do sed -E -i "s/${L[$i]}/MAC-ADDR-$((i+1))/Ig" "$RAW"; done
+    N_MAC=${#L[@]}
+
+    # Private / link-local IPv4
+    mapfile -t L < <(uniq_matches "$RAW" '\b(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+|169\.254\.[0-9]+\.[0-9]+)\b')
+    for i in "${!L[@]}"; do redact_literal "$RAW" "${L[$i]}" "LAN-IP-$((i+1))"; done
+    N_IP4=${#L[@]}
+
+    # IPv6: link-local, unique-local, global
+    mapfile -t L < <(uniq_matches "$RAW" '\b(fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})(:[0-9a-f]{0,4}){2,7}')
+    for i in "${!L[@]}"; do redact_literal "$RAW" "${L[$i]}" "IPV6-ADDR-$((i+1))" nob; done
+    N_IP6=${#L[@]}
+
+    # Hostname (skip generic defaults, masking those would damage normal text)
+    for H in "$(hostname 2>/dev/null)" "$(hostnamectl hostname 2>/dev/null)" "$(hostnamectl --static 2>/dev/null)"; do
+        case "$H" in ""|fedora|archlinux|arch|archiso|localhost|localhost.localdomain) continue ;; esac
+        if grep -qF -- "$H" "$RAW"; then redact_literal "$RAW" "$H" "HOSTNAME"; N_NAME=$((N_NAME+1)); fi
+    done
+
+    # Username and real name
+    if [ -n "$USER" ] && [ "$USER" != "root" ]; then
+        sed -E -i "s#/home/$(esc_re "$USER")(/|\\b)#/home/USER\\1#g" "$RAW"
+        # systemd-escaped paths, e.g. app-\x2fhome\x2fNAME\x2f...
+        sed -E -i "s#(home\\\\x2f)$(esc_re "$USER")#\\1USER#g" "$RAW"
+        if [ "${#USER}" -ge 4 ] && grep -qw -- "$USER" "$RAW"; then
+            redact_literal "$RAW" "$USER" "USER"; N_NAME=$((N_NAME+1))
+        fi
+        REALNAME="$(getent passwd "$USER" | cut -d: -f5 | cut -d, -f1)"
+        if [ "${#REALNAME}" -ge 3 ] && grep -qF -- "$REALNAME" "$RAW"; then
+            redact_literal "$RAW" "$REALNAME" "REAL-NAME" nob; N_NAME=$((N_NAME+1))
+        fi
+    fi
+
+    # Saved Wi-Fi / VPN profile names
+    if have nmcli; then
+        mapfile -t L < <(nmcli -t -f NAME connection show 2>/dev/null | sed 's/\\:/:/g' | awk 'length($0)>=4' \
+            | grep -vE '^(Wired connection [0-9]+|lo|docker[0-9]*|virbr[0-9]*|br-.*)$' | sort -u)
+        for i in "${!L[@]}"; do
+            if grep -qF -- "${L[$i]}" "$RAW"; then
+                redact_literal "$RAW" "${L[$i]}" "NET-NAME-$((i+1))" nob; N_NAME=$((N_NAME+1))
+            fi
+        done
+    fi
+
+    # Serial numbers / service tags
+    N_SER=$(grep -ciE '^[[:space:]]*(serial number|serial|service tag)[[:space:]]*:' "$RAW")
+    sed -E -i 's/^([[:space:]]*(serial number|serial|service tag)[[:space:]]*:[[:space:]]*).*/\1[REDACTED]/I' "$RAW"
+
+    # Machine ID and filesystem/partition UUIDs
+    MID="$(cat /etc/machine-id 2>/dev/null)"
+    if [ -n "$MID" ] && grep -qF -- "$MID" "$RAW"; then
+        redact_literal "$RAW" "$MID" "MACHINE-ID" nob; N_NAME=$((N_NAME+1))
+    fi
+    mapfile -t L < <(uniq_matches "$RAW" '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b')
+    for i in "${!L[@]}"; do sed -E -i "s/${L[$i]}/UUID-$((i+1))/Ig" "$RAW"; done
+    N_UUID=${#L[@]}
+}
+
+# =====================================================================================
+# 10. THE REPORT: every section and check, in order
+# =====================================================================================
+# The h_* helpers are copied into every check, so collect their text now (all definitions are above).
+HELPER_DEFS="$(declare -f $(compgen -A function h_))"
 
 {
     echo "SYSTEM CHECK REPORT"
@@ -363,189 +1290,153 @@ SUDO_ENV="env $(printf '%q' "TPMFILT=$TPMFILT") $(printf '%q' "KNOWN_TPM=$KNOWN_
 
 # ===============================================================
 section "OS, kernel, session"
-run  "OS and running kernel" 'echo "$(. /etc/os-release; echo $PRETTY_NAME), kernel $(uname -r), uptime: $(uptime -p)"; pacman -Q linux linux-lts linux-zen linux-hardened 2>/dev/null | tr "\n" ";"; echo'
-run  "Desktop session" 'echo "session=${XDG_SESSION_TYPE:-unset} desktop=${XDG_CURRENT_DESKTOP:-unset} wayland=${WAYLAND_DISPLAY:-unset}"; echo "packages: $(pacman -Qq 2>/dev/null | grep -E "^(niri|quickshell|dms|dgop|matugen|greetd|xwayland-satellite)" | xargs -r pacman -Q 2>/dev/null | tr "\n" ";")"; dm=$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk "\$1 ~ /^(greetd|sddm|gdm|lightdm|lxdm|plasmalogin|ly)(@.*)?\.service\$/ {print \$1}" | tr "\n" " "); echo "display manager: ${dm:-none found}"'
-runq "Helper tools" 'for t in smartctl:smartmontools sensors:lm_sensors upower:upower checkupdates:pacman-contrib fwupdmgr:fwupd vainfo:libva-utils snapper:snapper btrfs:btrfs-progs lsusb:usbutils bluetoothctl:bluez-utils niri:niri powerprofilesctl:power-profiles-daemon nmcli:networkmanager; do c=${t%%:*}; p=${t##*:}; command -v $c >/dev/null 2>&1 || echo "MISSING  $c   (sudo pacman -S $p)"; done' '[ -z "$out" ]' "all helper tools installed"
-runq "Running kernel is still installed" 'k=$(uname -r); if [ -d "/usr/lib/modules/$k" ]; then echo "modules for $k present"; else echo "REVIEW: modules for the running kernel ($k) are gone: it was upgraded since this boot. Reboot soon; until then USB, Wi-Fi, Bluetooth and new mounts may fail to load drivers"; fi' '! echo "$out" | grep -q "^REVIEW"' "no kernel upgrade is waiting for a reboot"
+run  "OS and running kernel" c_os_kernel
+run  "Desktop session" c_session
+runq "Helper tools" c_helper_tools t_empty "all helper tools installed"
+runq "Running kernel is still installed" c_kernel_installed t_no_review "no kernel upgrade is waiting for a reboot"
 if [ "$FULL" -eq 1 ]; then
-run  "Install dates of kernel/systemd/bluez/firmware (dates when a problem began)" 'pacman -Qi linux linux-lts systemd bluez bluez-utils linux-firmware linux-firmware-intel intel-ucode mesa networkmanager niri quickshell greetd power-profiles-daemon plymouth 2>/dev/null | grep -E "^(Name|Version|Install Date)" | paste - - -'
-run  "Kernel command line" 'cat /proc/cmdline'
+    run "Install dates of kernel/systemd/bluez/firmware (dates when a problem began)" c_install_dates
+    run "Kernel command line" c_cmdline
 fi
 
 # ===============================================================
 section "Niri, shell and greeter"
-runq "Niri compositor (installed vs running)" 'i=$(pacman -Qq 2>/dev/null | grep -E "^niri(-git|-bin)?$" | xargs -r pacman -Q 2>/dev/null); echo "installed: ${i:-NOT INSTALLED}"; if [ -z "$NIRI_SOCKET" ]; then echo "(not run from inside the niri session, so the running version cannot be compared)"; else o=$(niri msg version 2>&1); echo "$o"; c=$(echo "$o" | sed -n "s/^Compositor version: *//p"); l=$(echo "$o" | sed -n "s/^CLI version: *//p"); [ -n "$c" ] && [ -n "$l" ] && [ "$c" != "$l" ] && echo "REVIEW: the running compositor ($c) differs from the installed niri ($l): log out and back in to load the update"; fi; true' 'MSG="$(echo "$out" | head -1)"; ! echo "$out" | grep -qE "NOT INSTALLED|^REVIEW"' ""
-runq "Niri config validates" 'if command -v niri >/dev/null 2>&1; then niri validate 2>&1 | tail -15; exit ${PIPESTATUS[0]}; else echo "niri not installed"; exit 1; fi' '[ "$rc" -eq 0 ]' "config.kdl (and DMS includes) parse without errors"
-runq "Dank Material Shell (quickshell)" 'p=$(pgrep -x "quickshell|qs" | head -1); echo "quickshell process: ${p:-none}${p:+ ($(ps -o comm= -p $p))}; dms.service (user): $(systemctl --user is-active dms.service 2>&1)"; pacman -Qq 2>/dev/null | grep -E "^(dms|quickshell|dgop|dsearch|matugen)" | xargs -r pacman -Q 2>/dev/null | sed "s/^/pkg: /"' 'MSG="shell is running ($(echo "$out" | head -1 | sed "s/;.*//"))"; echo "$out" | grep -qE "quickshell process: [0-9]+"' ""
-runq "Greeter (greetd + dms-greeter)" 'echo "greetd.service: enabled=$(systemctl is-enabled greetd 2>&1) active=$(systemctl is-active greetd 2>&1)"; echo "greeter command: $(grep -E "^command" /etc/greetd/config.toml 2>&1 | head -1)"; for dm in sddm gdm lightdm lxdm plasmalogin ly; do systemctl is-enabled --quiet $dm 2>/dev/null && echo "REVIEW: $dm is also enabled; only one display manager should be (sudo systemctl disable $dm)"; done; pacman -Qq 2>/dev/null | grep -E "greeter" | xargs -r pacman -Q 2>/dev/null | sed "s/^/pkg: /"; true' 'c=$(echo "$out" | sed -nE "s/.*dms-greeter .*--command ([A-Za-z]+).*/\1/p" | head -1); MSG="greetd enabled and active, dms-greeter -> ${c:-compositor}"; echo "$out" | grep -q "enabled=enabled active=active" && echo "$out" | grep -q "^greeter command:.*dms-greeter" && ! echo "$out" | grep -q "^REVIEW"' ""
-runq "Wayland desktop plumbing (portals, keyring, Xwayland)" 'for p in xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk; do pacman -Q $p >/dev/null 2>&1 || { case $p in xdg-desktop-portal-gnome) w="screen sharing and screenshots (niri: required for screencasting)";; xdg-desktop-portal-gtk) w="file pickers and the fallback portals";; *) w="the portal framework";; esac; echo "MISSING  $p  (niri uses it for $w: sudo pacman -S $p)"; }; done; { pacman -Q gnome-keyring >/dev/null 2>&1 || busctl --user list --no-pager 2>/dev/null | grep -q org.freedesktop.secrets || busctl --user list --activatable --no-pager 2>/dev/null | grep -q org.freedesktop.secrets; } || echo "MISSING  a Secret Service provider (the Secret portal needs one: sudo pacman -S gnome-keyring, or run KeePassXC as provider)"; [ -e /usr/share/xdg-desktop-portal/niri-portals.conf ] || echo "MISSING  niri-portals.conf (shipped by the niri package; reinstall niri)"; true' 'MSG="portals and a Secret Service provider present, $(command -v xwayland-satellite >/dev/null && echo "Xwayland support installed" || echo "no xwayland-satellite (optional, needed for X11-only apps)")"; ! echo "$out" | grep -q "^MISSING"' ""
-runq "Audio (PipeWire user services)" 'for u in pipewire.socket pipewire-pulse.socket wireplumber.service; do s=$(systemctl --user is-active $u 2>&1); [ "$s" = active ] || echo "NOT active: $u ($s)"; done; true' '[ -z "$out" ]' "pipewire, pipewire-pulse and wireplumber are active"
+runq "Niri compositor (installed vs running)" c_niri_version t_niri_version ""
+runq "Niri config validates" c_niri_config t_rc0 "config.kdl (and DMS includes) parse without errors"
+runq "Dank Material Shell (quickshell)" c_dms t_dms ""
+runq "Greeter (greetd + dms-greeter)" c_greeter t_greeter ""
+runq "Wayland desktop plumbing (portals, keyring, Xwayland)" c_portals t_portals ""
+runq "Audio (PipeWire user services)" c_audio t_empty "pipewire, pipewire-pulse and wireplumber are active"
 
 # ===============================================================
 section "Boot time"
-runq "Boot time" 'o=$(systemd-analyze | head -2); echo "$o"; h=$(echo "$o" | head -1); tosec() { echo "$1" | awk "{ t=0; for (i=1; i<=NF; i++) { v=\$i; if (v ~ /min\$/) { sub(/min\$/, \"\", v); t+=v*60 } else if (v ~ /ms\$/) { sub(/ms\$/, \"\", v); t+=v/1000 } else if (v ~ /us\$/) { sub(/us\$/, \"\", v); t+=v/1000000 } else if (v ~ /h\$/) { sub(/h\$/, \"\", v); t+=v*3600 } else if (v ~ /s\$/) { sub(/s\$/, \"\", v); t+=v } } printf \"%.1f\", t }"; }; f=$(tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(firmware\).*/\2/p")"); l=$(tosec "$(echo "$h" | sed -nE "s/.*( in | \+ )([^+]*) \(loader\).*/\2/p")"); awk -v f="${f:-0}" -v l="${l:-0}" "BEGIN{ if (f>10) print \"SLOW firmware phase (>10s): look at BIOS Fast Boot / POST settings\"; if (l>3.5) print \"SLOW loader phase (>3.5s): check UKI size on the ESP, loader.conf timeout, TPM measurement of the UKI\" }"' 'MSG="$(echo "$out" | head -1 | sed "s/^Startup finished in //")"; echo "$out" | grep -q "^Startup finished" && ! echo "$out" | grep -q "^SLOW"' ""
-runq "Slow units at boot (1 s or more)" 'cc=$(systemd-analyze critical-chain --no-pager 2>/dev/null); systemd-analyze blame --no-pager | grep -E "^ *[0-9.]+(s|min) " | head -8 | while read -r l; do u=${l##* }; if echo "$cc" | grep -qF -- "$u"; then echo "$l   [on the critical path: delays boot]"; else echo "$l   [runs in parallel: does not delay boot]"; fi; done' 'if [ -z "$out" ]; then MSG="no unit slower than 1s"; true; else MSG="$(echo "$out" | wc -l) unit(s) over 1s, none on the critical path (parallel)"; ! echo "$out" | grep -q "on the critical path"; fi' ""
-srun "Boot loader and firmware" 'bootctl status 2>&1 | grep -E "Secure Boot:|TPM2 Support:|Product:|Current Entry:|Default Entry:" | sort -u'
-srun "loader.conf (menu timeout counts towards boot time)" 'cat "$(bootctl --print-esp-path 2>/dev/null)/loader/loader.conf" 2>&1'
-srunq "ESP space and UKIs" 'esp=$(bootctl --print-esp-path 2>/dev/null); echo "ESP at $esp: $(df -h --output=used,size,pcent "$esp" | tail -1)"; ls -lh "$esp/EFI/Linux/" 2>&1 | tail -n +2 | awk "{print \$5, \$6, \$7, \$8, \$9}"; p=$(df --output=pcent "$esp" | tail -1 | tr -dc 0-9); [ "${p:-0}" -ge 80 ] && echo "LOW SPACE on the ESP: old UKIs or fallbacks may need cleaning"; true' '! echo "$out" | grep -q "^LOW SPACE"' "enough free space, UKIs present"
-srunq "Boot loader up to date (ESP copy vs the one systemd ships)" 'esp=$(bootctl --print-esp-path 2>/dev/null); a=$(grep -a -o "LoaderInfo: systemd-boot [^ ]*" /usr/lib/systemd/boot/efi/systemd-bootx64.efi 2>/dev/null | head -1 | sed "s/LoaderInfo: //"); b=$(grep -a -o "LoaderInfo: systemd-boot [^ ]*" "$esp/EFI/systemd/systemd-bootx64.efi" 2>/dev/null | head -1 | sed "s/LoaderInfo: //"); echo "on the ESP: ${b:-unknown}; shipped by systemd: ${a:-unknown}; systemd-boot-update.service: $(systemctl is-enabled systemd-boot-update.service 2>&1)"; [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ] && echo "REVIEW: the ESP loader differs from the one systemd ships. Update it with: sudo bootctl update (or enable systemd-boot-update.service to do it every boot; the Arch Wiki documents both)"; true' 'MSG="$(echo "$out" | head -1)"; ! echo "$out" | grep -q "^REVIEW"' ""
-runq "Plymouth (splash wiring)" 'if pacman -Q plymouth >/dev/null 2>&1; then echo "$(pacman -Q plymouth), theme: $(plymouth-set-default-theme 2>&1)"; h=$(cat /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf 2>/dev/null | grep -E "^HOOKS"); echo "$h"; echo "$h" | grep -q plymouth || echo "MISSING plymouth in mkinitcpio HOOKS: the splash cannot show (add it after base/udev or systemd, then: sudo mkinitcpio -P)"; grep -qw splash /proc/cmdline || echo "MISSING splash on the kernel command line: add quiet splash to /etc/kernel/cmdline, then: sudo mkinitcpio -P"; else echo "plymouth is not installed (optional)"; fi' 'if echo "$out" | grep -q "not installed"; then MSG="not installed (optional)"; true; else ! echo "$out" | grep -q "^MISSING"; fi' "plymouth installed, hook and splash parameter present"
+runq "Boot time" c_boot_time t_boot_time ""
+runq "Slow units at boot (1 s or more)" c_slow_units t_slow_units ""
+srun "Boot loader and firmware" c_bootloader
+srun "loader.conf (menu timeout counts towards boot time)" c_loader_conf
+srunq "ESP space and UKIs" c_esp t_esp "enough free space, UKIs present"
+srunq "Boot loader up to date (ESP copy vs the one systemd ships)" c_bootloader_update t_bootloader_update ""
+runq "Plymouth (splash wiring)" c_plymouth t_plymouth "plymouth installed, hook and splash parameter present"
 
 # ===============================================================
 section "Shutdown time (estimated)"
-# systemd has no direct shutdown-duration metric. Estimate: first shutdown-ish
-# line in the previous boot's journal -> last line written.
-if [ "$IS_TTY" -eq 1 ]; then
-    printf '\r\033[K%s[%2d/%d]%s %s %s> Reading previous boot journal%s' "$C_DIM" "$CUR_N" "$TOTAL" "$C_OFF" "$CUR_TITLE" "$C_DIM" "$C_OFF"
-fi
-# same pattern as _exec: output goes to a file (a straggler cannot hold a pipe open) and we wait in the
-# background, so the deadline holds and Ctrl+C works at once
-timeout -k 5 "$DL_SLOW" journalctl -b -1 -o short-unix --no-pager < /dev/null > "$CHK" 2>/dev/null &
-TPID=$!
-wait "$TPID"; PREV_RC=$?
-TPID=""
-PREV_LOG="$(cat "$CHK")"
-SHUT_BAD=0
-if [ "$PREV_RC" -eq 124 ] || [ "$PREV_RC" -eq 137 ]; then
-    [ "$FULL" -eq 0 ] && { BAD+=("Shutdown duration"); WHY+=("timed out after ${DL_SLOW}s reading the previous boot journal, result unknown"); }
-    printf '\n--- Shutdown duration  [CHECK]\nTimed out after %ss while reading the previous boot journal: the shutdown time and stop-timeout checks were skipped.\n' "$DL_SLOW" >> "$RAW"
-elif [ -z "$PREV_LOG" ]; then
-    printf '\n--- Shutdown duration\nNo previous boot in journal (journal may not be persistent).\n' >> "$RAW"
-else
-    START_TS="$(echo "$PREV_LOG" | grep -E "Stopped target (Graphical|Multi-User)|Starting systemd-poweroff|Starting systemd-reboot|Shutting down|System is (powering off|rebooting)" | head -1 | awk '{print $1}')"
-    END_TS="$(echo "$PREV_LOG" | tail -1 | awk '{print $1}')"
-    DUR=""
-    if [ -n "$START_TS" ] && [ -n "$END_TS" ]; then DUR="$(awk -v s="$START_TS" -v e="$END_TS" 'BEGIN{printf "%d", e-s}')"; fi
-    if [ -z "$DUR" ]; then
-        printf '\n--- Shutdown duration\nCould not determine the shutdown window from the previous boot.\n' >> "$RAW"
-    elif [ "$DUR" -lt 2 ]; then
-        printf '\n--- Shutdown duration\nCould not measure: the window found in the previous boot is only %ss, which cannot be real\n(the journal lacks the early "Stopped target" lines, or the boot ended abruptly). Last lines of that boot:\n' "$DUR" >> "$RAW"
-        journalctl -b -1 --no-pager -n 8 -o short 2>/dev/null | cut -c1-200 >> "$RAW"
-    elif [ "$DUR" -le 20 ] && [ "$FULL" -eq 0 ]; then
-        OK_N=$((OK_N + 1))
-        printf '\n--- Shutdown duration\nOK: the previous shutdown took about %ss (healthy is under ~15s)\n' "$DUR" >> "$RAW"
-    else
-        SHUT_BAD=1
-        if [ "$DUR" -gt 20 ] && [ "$FULL" -eq 0 ]; then BAD+=("Shutdown duration"); WHY+=("took about ${DUR}s (healthy is under ~15s)"); fi
-        printf '\n--- Shutdown duration%s\nEstimated: %ss (under ~10-15s is healthy; much longer usually means a stop job timed out)\n' "$([ "$DUR" -gt 20 ] && [ "$FULL" -eq 0 ] && echo '  [CHECK]')" "$DUR" >> "$RAW"
-    fi
-    CHECK_DL=$DL_SLOW runq "Units that hit the stop timeout last shutdown" 'journalctl -b -1 --no-pager | grep -E "State .(stop-sigterm|stop-sigkill|stop-watchdog). timed out|stop job is running|Failed with result .timeout.|Killing\." | cut -c1-200 || true' '[ -z "$out" ]' "no unit hit its stop timeout"
-    if { [ "$SHUT_BAD" -eq 1 ] || [ -n "$out" ]; } && [ "$SUMONLY" -eq 0 ] && [ -n "$START_TS" ]; then
-        export START_TS
-        CHECK_DL=$DL_SLOW run "Longest pauses during the previous shutdown (5 s or more; the line BEFORE a pause is what was being waited for)" 'r=$(journalctl -b -1 -o short-unix --no-pager | awk -v s="$START_TS" "\$1+0>=s+0 { if (pt!=\"\" && \$1-pt>=5) printf \"%d s pause\n   before: %s\n   after:  %s\n\", \$1-pt, substr(pl,1,150), substr(\$0,1,150); pt=\$1; pl=\$0 }" | head -12); if [ -n "$r" ]; then echo "$r"; else echo "(no pause of 5 s or more found)"; fi'
-    fi
-fi
+shutdown_section
 
 # ===============================================================
 section "Services and errors"
-runq "System state" 'systemctl is-system-running' 'if [ "$out" = degraded ] && [ "$KNOWN_TPM" -eq 1 ]; then MSG="degraded, only because of the known systemd-262 NvPCR units (systemd#43848)"; true; else [ "$out" = running ]; fi' "running"
-runq "Failed units" 'systemctl --failed --plain --no-legend 2>&1; systemctl --user --failed --plain --no-legend 2>&1 | sed "s/^/(user) /"' 'if [ -z "$out" ]; then true; elif [ "$KNOWN_TPM" -eq 1 ]; then MSG="only the 3 known systemd-262 NvPCR units failed (upstream bug systemd#43848: UKI has no PCR public key; harmless without TPM disk unlock; fix proposed in systemd#43948, so watch for a systemd update; optional interim: mask them)"; true; else false; fi' "no failed system or user units"
+runq "System state" c_system_state t_system_state "running"
+runq "Failed units" c_failed_units t_failed_units "no failed system or user units"
 if { [ -n "$out" ] && [ "$SUMONLY" -eq 0 ] && [ "$KNOWN_TPM" -eq 0 ]; } || [ "$FULL" -eq 1 ]; then
-run  "Why those units failed (last log lines each)" 'for u in $(systemctl --failed --plain --no-legend 2>/dev/null | awk "{print \$1}" | head -8); do echo "== $u"; journalctl -u "$u" -b -n 4 --no-pager -o cat 2>&1 | cut -c1-200; done; for u in $(systemctl --user --failed --plain --no-legend 2>/dev/null | awk "{print \$1}" | head -5); do echo "== (user) $u"; journalctl --user -u "$u" -b -n 4 --no-pager -o cat 2>&1 | cut -c1-200; done'
+    run "Why those units failed (last log lines each)" c_failed_why
 fi
 if [ "$FULL" -eq 1 ] || { [ "$SUMONLY" -eq 0 ] && [ "$KNOWN_TPM" -eq 0 ] && systemctl --failed --plain --no-legend 2>/dev/null | grep -qiE "tpm|pcr"; }; then
-run  "TPM and NvPCR status" 'echo "tpm devices: $(ls /sys/class/tpm 2>&1 | tr "\n" " ")"; echo "tpm major version: $(cat /sys/class/tpm/tpm0/tpm_version_major 2>&1)"; systemd-analyze has-tpm2 2>&1 | head -12; echo "--- nvpcr definitions shipped:"; ls /usr/lib/nvpcr/ /etc/nvpcr/ 2>&1; echo "--- packages:"; pacman -Q tpm2-tss systemd 2>&1 | grep -v ^warning'
-srun "TPM kernel messages" 'dmesg | grep -iE "tpm|tcg" | head -15'
+    run  "TPM and NvPCR status" c_tpm_status
+    srun "TPM kernel messages" c_tpm_dmesg
 fi
-runq "D-Bus activation failures (this and previous boot)" 'for b in 0 -1; do l=$(journalctl -b $b -p 3 --no-pager 2>/dev/null | grep -E "Activation request for" | cut -c1-160); e=$(journalctl -b $b -n 1 -o short-unix --no-pager -q 2>/dev/null | cut -d. -f1); if [ "$b" = -1 ] && [ -n "$e" ]; then s=$(journalctl -b $b -p 3 --since "@$((e - 120))" --no-pager 2>/dev/null | grep -E "Activation request for .org.freedesktop.nm_dispatcher" | cut -c1-160); [ -n "$s" ] && l=$(printf "%s\n" "$l" | grep -vxFf <(printf "%s\n" "$s")); fi; systemctl is-enabled --quiet bluetooth 2>/dev/null || l=$(echo "$l" | grep -v "org.bluez"); l=$(echo "$l" | head -6); [ -n "$l" ] && { echo "boot $b:"; echo "$l"; }; done; true' '[ -z "$out" ]' "none (ignored as expected: org.bluez while bluetooth.service is disabled, nm_dispatcher refused during the last 2 minutes of the previous boot = shutdown)"
-runq "Errors this boot (known-benign messages hidden)" 'journalctl -p 3 -b --no-pager -o short | grep -vE "^-- " | grep -vE "SGX disabled|TDX not supported|multicast RX registrations|Touch jump|touchpad-jumping-cursors|libinput bug: invalid gesture event|log rate limit exceeded|text-to-speech plug-in|pam_unix\(sudo:auth\): (conversation failed|auth could not identify password)|Reading supported features failed \(-16\)|Error reading debug features|btd_adv_monitor_power_down" | grep -vE "$TPMFILT" | cut -c1-220 | tail -25' '[ -z "$out" ]' "only known-benign messages (SGX/TDX/touchpad/libinput notices, sudo -n probes, Intel BT feature query, bluez adv-monitor power-down notice, known TPM NvPCR bug)"
-srunq "Kernel errors (dmesg, known-benign hidden)" 'dmesg --level=err,crit,alert,emerg | grep -vE "SGX disabled|TDX not supported|Reading supported features failed \(-16\)|Error reading debug features" | grep -vE "$TPMFILT" | tail -25' '[ -z "$out" ]' "none"
-runq "Coredumps" 'bs=$(date -d "-$(cut -d. -f1 /proc/uptime) seconds" "+%Y-%m-%d %H:%M:%S"); n=$(coredumpctl list --no-pager --no-legend --since "$bs" 2>/dev/null | grep -c .); if [ "$n" -gt 0 ]; then echo "$n crash(es) since this boot started:"; coredumpctl list --no-pager --no-legend --since "$bs" 2>/dev/null | tail -6; fi; o=$(coredumpctl list --no-pager --no-legend --since "7 days ago" --until "$bs" 2>/dev/null | grep .); if [ -n "$o" ]; then echo "$(echo "$o" | wc -l) earlier crash(es) in the last 7 days (before this boot), newest 4:"; echo "$o" | tail -4; fi; true' 'if echo "$out" | grep -q "since this boot started"; then false; elif [ -n "$out" ]; then MSG="none this boot; $(echo "$out" | head -1 | cut -d" " -f1) earlier crash(es) in the last 7 days (run --full to list them)"; true; else true; fi' "none in the last 7 days"
-if [ -n "$out" ] && [ "$SUMONLY" -eq 0 ] && { [ "$FULL" -eq 1 ] || echo "$out" | grep -q "since this boot started"; }; then
-run  "Newest crash (details)" 'p=$(coredumpctl list --no-pager --no-legend 2>/dev/null | tail -1 | awk "{for(i=1;i<=NF;i++) if(\$i ~ /^SIG/){print \$(i-3); exit}}"); if [ -n "$p" ]; then coredumpctl info --no-pager "$p" 2>&1 | grep -E "Timestamp|Command Line|Signal|Package|Message|^ +#[0-9]+ " | cut -c1-180 | head -20; else echo "could not read the newest crash entry"; fi'
+runq "D-Bus activation failures (this and previous boot)" c_dbus_activation t_empty "none (ignored as expected: org.bluez while bluetooth.service is disabled, nm_dispatcher refused during the last 2 minutes of the previous boot = shutdown)"
+runq "Errors this boot (known-benign messages hidden)" c_errors_boot t_empty "no unexpected errors (known-benign messages from BENIGN_RE hidden, plus the known TPM NvPCR bug)"
+srunq "Kernel errors (dmesg, known-benign hidden)" c_errors_kernel t_empty "none"
+runq "Coredumps" c_coredumps t_coredumps "none in the last 7 days"
+if [ -n "$out" ] && [ "$SUMONLY" -eq 0 ] && { [ "$FULL" -eq 1 ] || grep -q "since this boot started" <<<"$out"; }; then
+    run "Newest crash (details)" c_newest_crash
 fi
-CHECK_DL=$DL_SLOW runq "Per-boot problems (last 8 boots; clean_end=NO is normal for boot 0)" 'for b in 0 -1 -2 -3 -4 -5 -6 -7; do j=$(journalctl -b $b --no-pager 2>/dev/null); [ -z "$j" ] && continue; wf=$(echo "$j" | grep -cE "iwlwifi.*(SW reset|Microcode SW error)"); ga=$(echo "$j" | grep -c "Atomic update failure"); i2=$(echo "$j" | grep -c "i2c_designware.*timed out"); bh=$(echo "$j" | grep -E "Bluetooth: hci[0-9]+: .*(failed|tx timeout)" | grep -vcF "Reading supported features failed (-16)"); bs=$(echo "$j" | grep -cE "bluetooth.service: .*timed out"); tp=$(echo "$j" | grep -c "Failed to start Early TPM SRK Setup"); [ "$KNOWN_TPM" = 1 ] && tp=0; ce=$(echo "$j" | tail -40 | grep -qE "Journal stopped|Unmounted /|Reached target .*(Shutdown|Power-Off|Reboot)|systemd-shutdown" && echo yes || echo NO); if [ $((wf+ga+i2+bh+bs+tp)) -gt 0 ] || { [ "$b" != 0 ] && [ "$ce" = NO ]; }; then echo "boot $b: wifi_fw_crash=$wf i915_atomic_err=$ga i2c_timeout=$i2 bt_hci_err=$bh bt_stop_timeout=$bs tpm_fail=$tp clean_end=$ce"; echo "   started: $(echo "$j" | grep -m1 -vE "^-- " | cut -c1-15)   last line: $(echo "$j" | tail -1 | cut -c1-120)"; fi; done' '[ -z "$out" ]' "no Wi-Fi/GPU/touchpad/Bluetooth/TPM errors or unclean shutdowns"
-CHECK_DL=$DL_SLOW runq "Recurring errors (seen in 2+ of the last 7 boots, known-benign hidden)" 'n=0; tmp=$(mktemp); for b in 0 -1 -2 -3 -4 -5 -6; do journalctl -b $b -n 1 --no-pager -q >/dev/null 2>&1 || continue; n=$((n+1)); journalctl -b $b -p 3 --no-pager -o short 2>/dev/null | sed -E "s/^[A-Z][a-z]{2} +[0-9]+ [0-9:]{8} [^ ]+ //; s/\[[0-9]+\]//g; s/0x[0-9a-fA-F]+/0xN/g; s/[0-9]+/#/g" | grep -vE "^[[:space:]]|^--|^$" | grep -vE "SGX disabled|TDX not supported|multicast RX registrations|Touch jump|libinput bug|log rate limit|text-to-speech|pam_unix.sudo:auth|Reading supported features failed|Error reading debug features|btd_adv_monitor_power_down|Activation request for .org.freedesktop.nm_dispatcher" | grep -vE "$TPMFILT" | cut -c1-170 | sort -u | awk -v b=$b "{print b \"@@\" \$0}" >> "$tmp"; done; res=$(awk -F"@@" "{c[\$2]++; if (\$1==0) now[\$2]=1} END{for (k in c) if (c[k]>=2) printf \"%d %s %s\n\", c[k], (now[k] ? \"[now] \" : \"[gone]\"), k}" "$tmp" | sort -rn | head -14); rm -f "$tmp"; if [ -n "$res" ]; then echo "boots analysed: $n (count = boots it appeared in; [now] = also in this boot, [gone] = absent this boot; digits shown as #)"; echo "$res"; fi' 'if [ -z "$out" ]; then true; elif echo "$out" | grep -q "\[now\]"; then false; else MSG="only history: $(echo "$out" | grep -c "\[gone\]") message(s) recurred in earlier boots but are absent this boot (fixed?); run --full to list them"; true; fi' "nothing recurring"
+CHECK_DL=$DL_SLOW runq "Per-boot problems (last 8 boots; clean_end=NO is normal for boot 0)" c_boot_problems t_empty "no Wi-Fi/GPU/touchpad/Bluetooth/TPM errors or unclean shutdowns"
+CHECK_DL=$DL_SLOW runq "Recurring errors (seen in 2+ of the last 7 boots, known-benign hidden)" c_recurring_errors t_recurring_errors "nothing recurring"
 
 # ===============================================================
 section "CPU, thermals, throttling"
-run  "CPU" 'echo "$(lscpu | sed -n "s/^Model name: *//p")"; echo "governor/driver: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>&1) / $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver 2>&1)"; echo "power profile: $(powerprofilesctl get 2>/dev/null || echo none)"; echo "PL1/PL2: $(( $(cat /sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))W / $(( $(cat /sys/class/powercap/intel-rapl:0/constraint_1_power_limit_uw 2>/dev/null || echo 0) / 1000000 ))W"; awk "/cpu MHz/{s+=\$4; if(min==\"\"||\$4<min)min=\$4; if(\$4>max)max=\$4; n++} END{if(n) printf \"%d threads, MHz min %d / avg %d / max %d\n\", n, min, s/n, max}" /proc/cpuinfo; c=/sys/devices/system/cpu/cpu0/cpufreq; echo "limits kHz: min $(cat $c/scaling_min_freq 2>&1) / max $(cat $c/scaling_max_freq 2>&1) (hardware max $(cat $c/cpuinfo_max_freq 2>&1)); no_turbo=$(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>&1); EPP=$(cat $c/energy_performance_preference 2>&1)"; echo "AC online: $(cat /sys/class/power_supply/A*/online 2>/dev/null | head -1) (1 = plugged in); an idle snapshot shows idle clocks, re-run during load to judge speed"'
-runq "Intel microcode" 'pacman -Q intel-ucode 2>&1 | grep -v "^warning"; journalctl -k -b --no-pager | grep -i "microcode: Current revision" | cut -c1-120' 'echo "$out" | grep -q "Current revision" && ! echo "$out" | grep -q "was not found"' "intel-ucode installed and loaded"
+run  "CPU" c_cpu
+runq "Intel microcode" c_ucode t_ucode "intel-ucode installed and loaded"
 if have sensors; then
-runq "Temperatures" 'sensors 2>/dev/null | grep -E "Package id 0|Composite|^fan1"' 't=$(echo "$out" | grep -oE "Package id 0: +\+[0-9]+" | grep -oE "[0-9]+$"); MSG="CPU package ${t}C"; [ -n "$t" ] && [ "$t" -lt 85 ]' ""
+    runq "Temperatures" c_temps t_temps ""
 else
-run  "Temperatures (lm_sensors missing: sudo pacman -S lm_sensors)" 'for z in /sys/class/thermal/thermal_zone*; do echo "$(cat $z/type): $(( $(cat $z/temp) / 1000 ))C"; done'
+    run  "Temperatures (lm_sensors missing: sudo pacman -S lm_sensors)" c_temps_sysfs
 fi
-runq "Throttling" 't=/sys/devices/system/cpu/cpu0/thermal_throttle; p=$(cat $t/package_throttle_count 2>/dev/null || echo 0); echo "package_throttle_count=$p core_throttle_count=$(cat $t/core_throttle_count 2>/dev/null || echo 0) package_power_limit_count=$(cat $t/package_power_limit_count 2>/dev/null || echo n/a) since boot ($(awk "{printf \"%.1f\", \$1/3600}" /proc/uptime) h up)"; echo "during this report: +$((p - ${THR0:-$p}))"; journalctl -k -b --no-pager | grep -iE "throttl|PROCHOT" | grep -v e1000e | tail -5' 'd=$(echo "$out" | sed -n "s/^during this report: +//p"); MSG="$(echo "$out" | head -1); none during this report"; [ "${d:-0}" -eq 0 ] && ! echo "$out" | grep -qE "^[A-Z][a-z]{2} +[0-9]+ [0-9:]{8} "' ""
-[ "$FULL" -eq 1 ] && run "Top CPU consumers" 'ps -eo pid,comm,%cpu,%mem --sort=-%cpu | grep -v " ps " | head -8'
+runq "Throttling" c_throttling t_throttling ""
+if [ "$FULL" -eq 1 ]; then run "Top CPU consumers" c_top_cpu; fi
 
 # ===============================================================
 section "Memory and swap"
-runq "Memory and swap" 'free -m | awk "/Mem:/{pct=\$7*100/\$2; printf \"%d of %d MiB used, %d MiB available (%d%%)\n\", \$3, \$2, \$7, pct; if(pct<15) print \"LOW: little memory available\"} /Swap:/{if(\$2>0){sp=\$3*100/\$2; printf \"swap %d of %d MiB used\n\", \$3, \$2; if(sp>50) print \"HIGH: swap is more than half used\"} else print \"LOW: no swap configured\"}"' 'MSG="$(echo "$out" | tr "\n" ";" | sed "s/;$//; s/;/, /g")"; ! echo "$out" | grep -qE "^(LOW|HIGH)"' ""
-run  "zram" 'zramctl --noheadings -o NAME,ALGORITHM,DISKSIZE,DATA,COMPR 2>&1; swapon --noheadings --show=NAME,PRIO 2>&1 | sed "s/^/swap: /"'
-runq "OOM kills" 'journalctl -k --no-pager | grep -iE "out of memory|oom-kill|killed process" | tail -5 || true' '[ -z "$out" ]' "none"
-[ "$FULL" -eq 1 ] && run "Top memory consumers" 'ps -eo pid,comm,%mem,rss --sort=-%mem | head -8'
+runq "Memory and swap" c_memory t_memory ""
+run  "zram" c_zram
+runq "OOM kills" c_oom t_empty "none"
+if [ "$FULL" -eq 1 ]; then run "Top memory consumers" c_top_mem; fi
 
 # ===============================================================
 section "Storage"
-runq "Disk usage" 'df -h --output=target,size,used,pcent / /boot /home 2>&1' 'MSG="$(echo "$out" | tail -n +2 | awk "{printf \"%s %s used; \", \$1, \$4}")"; ! echo "$out" | grep -qE "(8[5-9]|9[0-9]|100)%"' ""
+runq "Disk usage" c_disk_usage t_disk_usage ""
 if have smartctl; then
-srunq "NVMe SMART health" 's=$(smartctl -a /dev/nvme0n1); echo "$s" | grep -E "Model Number|Critical Warning|^Temperature|Available Spare:|Percentage Used|Data Units Written|Power On Hours|Unsafe Shutdowns|Media and Data Integrity|Error Information Log Entries"; q=$(echo "$s" | grep -cE "Model Number:.*BC501"); echo "$s" | awk -v q="$q" -F: "/^Available Spare:/{v=\$2; gsub(/[^0-9]/,\"\",v); if (v+0<100) print \"WARNING: available spare fell to \" v \"%: the drive is remapping worn blocks. Back up and plan a replacement.\"} /Percentage Used/{v=\$2; gsub(/[^0-9]/,\"\",v); if (q>0) { if (v+0>=70) print \"NOTE: the drive reports \" v \"% wear, but the BC501 family is known to over-report it; judged by Available Spare, media errors and Critical Warning instead.\" } else if (v+0>=90) print \"CRITICAL: \" v \"% of rated endurance used. Back up now and replace the drive.\"; else if (v+0>=70) print \"WARNING: \" v \"% of rated endurance used. Keep a real backup (snapshots are not backups) and plan a replacement.\"}"; du=$(echo "$s" | sed -nE "s/^Data Units Written: +([0-9,]+).*/\1/p" | tr -d ,); ph=$(echo "$s" | sed -nE "s/^Power On Hours: +([0-9,]+).*/\1/p" | tr -d ,); [ -n "$du" ] && [ "${ph:-0}" -gt 0 ] && echo "lifetime average: $(( du * 512000 / ph / 1000000 )) MB written per power-on hour (includes any previous OS/owner)"; true' 'if echo "$out" | grep -q "^NOTE"; then MSG="$(echo "$out" | grep -m1 "^Percentage Used" | tr -s " ") reported, but the BC501 over-reports it; spare, media errors and critical warning are clean"; fi; ! echo "$out" | grep -qE "^(WARNING|CRITICAL)" && echo "$out" | grep -qE "Critical Warning: +0x00" && echo "$out" | grep -qE "Media and Data Integrity Errors: +0$"' "no warnings, wear below 70%"
+    srunq "NVMe SMART health" c_smart t_smart "no warnings, wear below 70%"
 else
-run  "NVMe SMART (smartmontools missing: sudo pacman -S smartmontools)" 'echo "not installed"'
+    run "NVMe SMART (smartmontools missing: sudo pacman -S smartmontools)" c_smart_missing
 fi
 if have btrfs && findmnt -n -o FSTYPE / | grep -q btrfs; then
-srunq "Btrfs health (device errors, last scrub)" 'e=$(btrfs device stats / | grep -vE " 0$"); [ -n "$e" ] && { echo "DEVICE ERRORS:"; echo "$e"; }; btrfs scrub status / | grep -E "Scrub started|Status:|Error summary"; btrfs filesystem usage / | grep -E "Free \(estimated\)"' '! echo "$out" | grep -q "DEVICE ERRORS" && echo "$out" | grep -q "Error summary: *no errors found"' "no device errors, last scrub found no errors"
+    srunq "Btrfs health (device errors, last scrub)" c_btrfs t_btrfs "no device errors, last scrub found no errors"
 fi
-runq "Maintenance timers" 't=$(systemctl list-timers --all --no-pager 2>/dev/null); for w in fstrim paccache; do [ "$w" = fstrim ] && findmnt -no OPTIONS / | grep -q "discard=async" && continue; echo "$t" | grep -q "$w" || echo "missing timer: $w (sudo systemctl enable --now $w.timer; paccache.timer comes with pacman-contrib)"; done; command -v snapper >/dev/null && { echo "$t" | grep -q snapper-timeline || echo "missing timer: snapper-timeline"; echo "$t" | grep -q snapper-cleanup || echo "missing timer: snapper-cleanup"; }; if findmnt -n -o FSTYPE / | grep -q btrfs && ! echo "$t" | grep -q btrfs-scrub; then echo "missing timer: btrfs-scrub (enable with: sudo systemctl enable --now btrfs-scrub@-.timer)"; fi' '[ -z "$out" ]' "fstrim (or Btrfs discard=async), paccache, snapper and btrfs-scrub are covered"
+runq "Maintenance timers" c_timers t_empty "fstrim (or Btrfs discard=async), paccache, snapper and btrfs-scrub are covered"
 if have snapper; then
-CHECK_DL=$DL_SLOW srun "Snapper snapshots per config" 'for c in $(snapper list-configs | awk -F"│" "NR>2{gsub(/ /,\"\",\$1); print \$1}"); do echo "$c: $(( $(snapper -c $c list | tail -n +3 | wc -l) )) snapshots, newest: $(snapper -c $c list | tail -1 | awk -F"│" "{print \$4}" | sed "s/^ *//; s/ *\$//")"; done'
+    CHECK_DL=$DL_SLOW srun "Snapper snapshots per config" c_snapper
 else
-run  "Snapper (missing: sudo pacman -S snapper)" 'echo "not installed"'
+    run "Snapper (missing: sudo pacman -S snapper)" c_snapper_missing
 fi
-runq "Package cache and journal size" 'c=$(du -sk /var/cache/pacman/pkg 2>/dev/null | cut -f1); echo "pacman cache: $(( ${c:-0} / 1024 )) MiB"; [ "${c:-0}" -gt 10485760 ] && echo "LARGE pacman cache: run paccache -r"; j=$(journalctl --disk-usage | grep -oE "[0-9.]+[KMGT]" | tail -1); echo "journal: $j"; case $j in *G|*T) echo "LARGE journal: consider SystemMaxUse= in /etc/systemd/journald.conf.d/";; esac' 'MSG="$(echo "$out" | tr "\n" ";" | sed "s/;$//; s/;/, /g")"; ! echo "$out" | grep -q "^LARGE"' ""
-[ "$FULL" -eq 1 ] && CHECK_DL=$DL_SLOW run "Biggest home folders" 'du -h --max-depth=1 "$HOME" 2>/dev/null | sort -rh | head -10'
-[ "$FULL" -eq 1 ] && run "Root mount options" 'findmnt -no OPTIONS /'
+runq "Package cache and journal size" c_pkg_cache t_pkg_cache ""
+if [ "$FULL" -eq 1 ]; then
+    CHECK_DL=$DL_SLOW run "Biggest home folders" c_home_sizes
+    run "Root mount options" c_root_mount
+fi
 
 # ===============================================================
 section "Battery and power"
 if have upower; then
-runq "Battery health" 'upower -i $(upower -e | grep BAT) | grep -E "state|percentage|capacity:" | sed "s/^ *//"' 'c=$(echo "$out" | grep -oE "capacity: +[0-9]+" | grep -oE "[0-9]+$"); MSG="battery holds ${c}% of design capacity"; [ -n "$c" ] && [ "$c" -ge 80 ]' ""
+    runq "Battery health" c_battery t_battery ""
 else
-run  "Battery" 'cat /sys/class/power_supply/BAT0/{status,capacity,energy_full,energy_full_design,cycle_count} 2>/dev/null'
+    run  "Battery" c_battery_sysfs
 fi
-runq "Power daemons" 'a=""; for u in tlp power-profiles-daemon thermald; do systemctl is-active --quiet $u && a="$a $u"; done; echo "active:${a:- none}"; case "$a" in *tlp*power-profiles-daemon*|*power-profiles-daemon*tlp*) echo "REVIEW: tlp and power-profiles-daemon are both active (they fight over the same settings; keep one)";; *tlp*|*power-profiles-daemon*) ;; *) echo "REVIEW: no power management daemon is active (the DMS power menu and profile switching need power-profiles-daemon)";; esac' 'MSG="$(echo "$out" | head -1)"; ! echo "$out" | grep -q "^REVIEW"' ""
+runq "Power daemons" c_power_daemons t_power_daemons ""
 
 # ===============================================================
 section "GPU and graphics"
-run  "GPU and video acceleration" 'lspci | grep -iE "vga|display" | cut -d: -f3 | sed "s/^ *//"; echo "kernel driver: $(lsmod | grep -oE "^(i915|xe) " | head -1)"; vainfo 2>/dev/null | grep "Driver version" | sed "s/vainfo: //" || echo "vainfo not installed (sudo pacman -S libva-utils)"'
+run "GPU and video acceleration" c_gpu
 
 # ===============================================================
 section "Network"
-runq "Connectivity" 'nmcli -t -f CONNECTIVITY general 2>&1; nmcli -t -f DEVICE,TYPE,STATE device 2>&1 | grep -E ":(connected|connecting)" | grep -v "^lo:" | sed "s/^/up: /"' 'MSG="internet reachable, $(echo "$out" | grep -c "^up:") active device(s)"; [ "$(echo "$out" | head -1)" = full ]' ""
-runq "DNS" 'echo "systemd-resolved: $(systemctl is-active systemd-resolved 2>&1); /etc/resolv.conf: $([ -L /etc/resolv.conf ] && echo "symlink to $(readlink -f /etc/resolv.conf)" || echo "regular file"); nameservers: $(grep -c "^nameserver" /etc/resolv.conf)"; getent hosts archlinux.org >/dev/null && echo "lookup works" || echo "lookup FAILED"' 'MSG="$(echo "$out" | head -1)"; echo "$out" | grep -q "lookup works"' ""
-runq "Bluetooth" 'en=$(systemctl is-enabled bluetooth 2>&1); ac=$(systemctl is-active bluetooth 2>&1); echo "service: $ac, unit file: $en"; echo "adapter present in kernel: $(ls /sys/class/bluetooth 2>/dev/null | tr "\n" " ")"; echo "rfkill: $(rfkill list bluetooth 2>&1 | grep -E "Soft blocked" | tr -s " " | tr "\n" ";")"; n=$(journalctl -k -b --no-pager | grep -E "Bluetooth: hci[0-9]+: .*(failed|error|tx timeout)" | grep -vcF "Reading supported features failed (-16)"); echo "kernel errors this boot (harmless Intel -16 feature query excluded): $n"; case "$en/$ac" in disabled/inactive|masked/inactive|static/inactive) echo "OFF BY CHOICE";; *) o=$(timeout 8 bluetoothctl show 2>&1); echo "controller: $(echo "$o" | grep -E "Powered:" | tr -s " " | head -1)"; [ -z "$(echo "$o" | grep Powered)" ] && echo "controller: NOT ANSWERING or none";; esac' 'if echo "$out" | grep -q "OFF BY CHOICE"; then MSG="off by choice ($(echo "$out" | head -1)); the kernel still initialises the adapter at boot"; echo "$out" | grep -q "errors this boot[^:]*: 0$"; else MSG="controller powered on, no kernel errors this boot"; echo "$out" | grep -q "Powered: yes" && echo "$out" | grep -q "errors this boot[^:]*: 0$"; fi' ""
-if [ "$FULL" -eq 1 ] || { [ "$SUMONLY" -eq 0 ] && { ! echo "$out" | grep -qE "Powered: yes|OFF BY CHOICE" || echo "$out" | grep -qE "errors this boot[^:]*: [1-9]"; }; }; then
-run  "Bluetooth radio switches, firmware, USB power" 'rfkill list all 2>&1; echo "--- saved rfkill state (1 = blocked at next boot):"; for f in /var/lib/systemd/rfkill/*; do [ -e "$f" ] && echo "$(basename "$f"): $(cat "$f")"; done; echo "--- packages:"; pacman -Q bluez bluez-utils linux-firmware linux-firmware-intel 2>&1 | grep -v ^warning; echo "--- Intel BT firmware files present:"; ls /usr/lib/firmware/intel/ 2>&1 | grep -E "^ibt-" | head -20; echo "--- btusb autosuspend: $(cat /sys/module/btusb/parameters/enable_autosuspend 2>&1)"; lsusb 2>/dev/null | grep -iE "8087:|bluetooth" || echo "no Bluetooth USB device is enumerated right now"; for d in /sys/bus/usb/devices/*; do [ "$(cat $d/idVendor 2>/dev/null)" = "8087" ] && echo "$(basename $d) power/control=$(cat $d/power/control 2>&1) runtime_status=$(cat $d/power/runtime_status 2>&1)"; done; true'
-run  "Bluetooth kernel log (this boot)" 'journalctl -k -b --no-pager | grep -iE "bluetooth|btusb|ibt-" | cut -c1-200 | head -40'
-run  "bluetoothd log (this boot, then previous boot)" 'journalctl -u bluetooth -b -n 12 --no-pager -o cat 2>&1 | cut -c1-200; echo "--- previous boot:"; journalctl -u bluetooth -b -1 -n 12 --no-pager -o cat 2>&1 | cut -c1-200'
-run  "NetworkManager dispatcher (explains D-Bus activation failures)" 'echo "enabled: $(systemctl is-enabled NetworkManager-dispatcher.service 2>&1)  active: $(systemctl is-active NetworkManager-dispatcher.service 2>&1)"; journalctl -u NetworkManager-dispatcher -b -n 8 --no-pager -o cat 2>&1 | cut -c1-200'
+runq "Connectivity" c_connectivity t_connectivity ""
+runq "DNS" c_dns t_dns ""
+runq "Bluetooth" c_bluetooth t_bluetooth ""
+if [ "$FULL" -eq 1 ] || { [ "$SUMONLY" -eq 0 ] && { ! grep -qE "Powered: yes|OFF BY CHOICE" <<<"$out" || grep -qE "errors this boot[^:]*: [1-9]" <<<"$out"; }; }; then
+    run "Bluetooth radio switches, firmware, USB power" c_bt_radio
+    run "Bluetooth kernel log (this boot)" c_bt_kernel_log
+    run "bluetoothd log (this boot, then previous boot)" c_bt_daemon_log
+    run "NetworkManager dispatcher (explains D-Bus activation failures)" c_nm_dispatcher
 fi
 
 # ===============================================================
 section "Updates and packages"
-netrunq "Pending repo updates" 'if command -v checkupdates >/dev/null; then o=$(checkupdates 2>&1); r=$?; case $r in 2) ;; 0) echo "$o" | head -15; echo "($(echo "$o" | wc -l) pending; apply with: sudo pacman -Syu)";; *) echo "checkupdates failed (exit $r): $o" | head -5;; esac; else echo "checkupdates missing (sudo pacman -S pacman-contrib)"; fi' '[ -z "$out" ]' "system is up to date"
-netrunq "AUR updates" 'if command -v paru >/dev/null; then paru -Qua 2>&1 | head -15; elif command -v yay >/dev/null; then yay -Qua 2>&1 | head -15; fi' '[ -z "$out" ]' "none pending (or no AUR helper)"
-run  "Last full upgrade" 'f() { [ -n "$1" ] || { echo "not found"; return; }; echo "$(date -d "$1" "+%Y-%m-%d %H:%M %Z") ($(( ( $(date +%s) - $(date -d "$1" +%s) ) / 86400 )) days ago)"; }; echo "last full upgrade: $(f "$(grep "starting full system upgrade" /var/log/pacman.log 2>/dev/null | tail -1 | cut -c2-25)")"; echo "pacman.log starts:  $(f "$(head -1 /var/log/pacman.log 2>&1 | cut -c2-25)") (a very recent date here usually means a fresh install)"'
-runq "Dependency problems" 'pacman -Dk 2>&1 | tail -10' 'echo "$out" | grep -q "No database errors"' "package database consistent"
-CHECK_DL=$DL_SLOW srunq "Altered package files (checksum/size/missing; auto-generated caches ignored)" 'out=$(pacman -Qkk 2>&1); bad=$(echo "$out" | grep -E "Size mismatch|checksum mismatch|No such file" | grep -v "^backup file"); gen="plugins\.dat|giomodule\.cache|loaders\.cache|immodules\.cache|gschemas\.compiled|/graphviz/config"; real=$(echo "$bad" | grep -vE "$gen" | grep .); if [ -n "$real" ]; then echo "$real" | head -30; else echo "none"; fi' '[ "$out" = none ]' "all package files intact"
-srunq ".pacnew / .pacsave files waiting for review" 'f=$(find /etc -xdev \( -name "*.pacnew" -o -name "*.pacsave" \) 2>/dev/null); if [ -n "$f" ]; then echo "$f" | head -20; echo "(review with: sudo pacdiff)"; else echo "none"; fi' '[ "$out" = none ]' "none"
-runq "Orphans (preview only, nothing removed)" 'pacman -Qdtq 2>&1 | head -30' '[ -z "$out" ]' "none"
-runq "Mirrorlist age" 'now=$(date +%s); m=$(stat -c %Y /etc/pacman.d/mirrorlist 2>/dev/null || echo $now); d=$(( (now - m) / 86400 )); echo "mirrorlist last changed $d days ago"; [ "$d" -gt 90 ] && echo "OLD: refresh it (rate-mirrors or reflector)"; true' 'MSG="$(echo "$out" | head -1)"; ! echo "$out" | grep -q "^OLD"' ""
-runq "Sync database present for every enabled repo" 'for r in $(grep -E "^\[" /etc/pacman.conf | tr -d "[]" | grep -vx options); do [ -f /var/lib/pacman/sync/$r.db ] || echo "MISSING  $r  (run: sudo pacman -Syu, never -Sy alone)"; done' '[ -z "$out" ]' "every enabled repo has a sync database"
-netrunq "Flatpak updates" 'if command -v flatpak >/dev/null; then o=$(flatpak remote-ls --updates 2>&1); r=$?; [ -n "$o" ] && echo "$o" | head -10; [ "$r" -ne 0 ] && echo "(flatpak exit $r)"; fi; true' '[ -z "$out" ]' "no updates pending (or Flatpak not installed)"
-[ "$FULL" -eq 1 ] && run "Foreign/AUR packages installed" 'pacman -Qm 2>&1 | head -30'
+netrunq "Pending repo updates" c_repo_updates t_repo_updates ""
+netrunq "AUR updates" c_aur_updates t_aur_updates ""
+run  "Last full upgrade" c_last_upgrade
+runq "Dependency problems" c_pkg_db t_pkg_db "package database consistent"
+CHECK_DL=$DL_SLOW srunq "Altered package files (checksum/size/missing; auto-generated caches ignored)" c_altered_files t_none "all package files intact"
+srunq ".pacnew / .pacsave files waiting for review" c_pacnew t_none "none"
+runq "Orphans (preview only, nothing removed)" c_orphans t_empty "none"
+runq "Mirrorlist age" c_mirrorlist t_mirrorlist ""
+runq "Sync database present for every enabled repo" c_sync_db t_empty "every enabled repo has a sync database"
+netrunq "Flatpak updates" c_flatpak_updates t_flatpak_updates ""
+if [ "$FULL" -eq 1 ]; then run "Foreign/AUR packages installed" c_foreign_pkgs; fi
 
 # ===============================================================
 section "Security basics"
-srunq "Firewall" 'if systemctl is-active --quiet firewalld; then z=$(firewall-cmd --get-default-zone); sv=$(firewall-cmd --zone=$z --list-services); echo "firewalld active, zone $z, services: $sv"; x=$(echo $sv | tr " " "\n" | grep -vxE "dhcpv6-client|ssh|mdns|kdeconnect|samba-client" | tr "\n" " "); [ -n "$x" ] && echo "REVIEW: allowed beyond the usual client set: ${x}(drop what you do not run: sudo firewall-cmd --permanent --zone=$z --remove-service=NAME && sudo firewall-cmd --reload)"; elif systemctl is-active --quiet ufw; then echo "ufw active"; ufw status | head -5; elif nft list ruleset 2>/dev/null | grep -q chain; then echo "nftables rules loaded (no firewalld/ufw)"; else echo "NO FIREWALL ACTIVE (Arch ships none by default)"; fi' 'MSG="$out"; ! echo "$out" | grep -qE "NO FIREWALL|^REVIEW"' ""
-srunq "Listening beyond loopback" 'ss -tulnpH | grep -vE "127\.0\.0\.|\[::1\]|%lo" | awk "{print \$1, \$5, \$7}" | head -15' '[ -z "$out" ]' "nothing listens on the network"
+srunq "Firewall" c_firewall t_firewall ""
+srun  "Network listeners bound beyond loopback (informational; firewall determines reachability)" c_listeners
 
 # ===============================================================
 section "Firmware"
-run  "BIOS version" 'echo "BIOS $(cat /sys/class/dmi/id/bios_version 2>/dev/null) ($(cat /sys/class/dmi/id/bios_date 2>/dev/null))"'
-NET_OFFLINE_OK=1 netrunq "Firmware updates (fwupd)" 'fwupdmgr get-updates --no-unreported-check 2>&1 | head -20' 'echo "$out" | grep -qE "No updates available|No updatable devices|no available firmware updates" && ! echo "$out" | grep -qE "New version|Upgrade available|^Devices with firmware updates"' "no firmware updates available"
+run "BIOS version" c_bios
+NET_OFFLINE_OK=1 netrunq "Firmware updates (fwupd)" c_fwupd t_fwupd "no firmware updates available"
 
+# ===============================================================
+# 11. FINISH: summary, masking, save
+# ===============================================================
 section_end
 echo >> "$RAW"
 if [ "$NOISE" -gt 0 ]; then
@@ -554,7 +1445,7 @@ if [ "$NOISE" -gt 0 ]; then
 fi
 echo "END OF REPORT" >> "$RAW"
 
-# ---------- summary at the top of the report ----------
+# summary at the top of the report
 {
     if [ "$FULL" -eq 1 ]; then
         echo "SUMMARY: full mode, nothing was condensed. Read each section."
@@ -568,88 +1459,8 @@ echo "END OF REPORT" >> "$RAW"
 } > "$SUMF"
 sed -i -e '/^@@SUMMARY@@$/{' -e "r $SUMF" -e 'd' -e '}' "$RAW"
 
-# ===============================================================
-# Privacy masking: runs on the temp file, then the clean copy is saved
-# ===============================================================
 [ "$IS_TTY" -eq 1 ] && printf '%s[ *]%s Masking personal details\n' "$C_OK" "$C_OFF"
-
-N_IP4=0; N_IP6=0; N_MAC=0; N_NAME=0; N_SER=0; N_UUID=0
-L=()
-
-# unique matches, longest first (so 192.168.1.10 is replaced before 192.168.1.1)
-uniq_matches() { # file, ERE
-    grep -oiE "$2" "$1" | sort -u | awk '{print length, $0}' | sort -rn | cut -d' ' -f2-
-}
-
-esc_re() { printf '%s' "$1" | sed -e 's/[]\/$*.^[(){}+?|]/\\&/g'; }
-
-redact_literal() { # file, literal, label, [nob = no word boundaries]
-    local e; e="$(esc_re "$2")"
-    if [ "$4" = "nob" ]; then
-        sed -E -i "s/${e}/$3/g" "$1"
-    else
-        sed -E -i "s/\\b${e}\\b/$3/g" "$1"
-    fi
-}
-
-# MAC addresses
-mapfile -t L < <(uniq_matches "$RAW" '\b([0-9a-f]{2}:){5}[0-9a-f]{2}\b')
-for i in "${!L[@]}"; do sed -E -i "s/${L[$i]}/MAC-ADDR-$((i+1))/Ig" "$RAW"; done
-N_MAC=${#L[@]}
-
-# Private / link-local IPv4
-mapfile -t L < <(uniq_matches "$RAW" '\b(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+|169\.254\.[0-9]+\.[0-9]+)\b')
-for i in "${!L[@]}"; do redact_literal "$RAW" "${L[$i]}" "LAN-IP-$((i+1))"; done
-N_IP4=${#L[@]}
-
-# IPv6: link-local, unique-local, global
-mapfile -t L < <(uniq_matches "$RAW" '\b(fe80|f[cd][0-9a-f]{2}|[23][0-9a-f]{3})(:[0-9a-f]{0,4}){2,7}')
-for i in "${!L[@]}"; do redact_literal "$RAW" "${L[$i]}" "IPV6-ADDR-$((i+1))" nob; done
-N_IP6=${#L[@]}
-
-# Hostname (skip generic defaults, masking those would damage normal text)
-for H in "$(hostname 2>/dev/null)" "$(hostnamectl hostname 2>/dev/null)" "$(hostnamectl --static 2>/dev/null)"; do
-    case "$H" in ""|fedora|archlinux|arch|archiso|localhost|localhost.localdomain) continue ;; esac
-    if grep -qF -- "$H" "$RAW"; then redact_literal "$RAW" "$H" "HOSTNAME"; N_NAME=$((N_NAME+1)); fi
-done
-
-# Username and real name
-if [ -n "$USER" ] && [ "$USER" != "root" ]; then
-    sed -E -i "s#/home/$(esc_re "$USER")(/|\\b)#/home/USER\\1#g" "$RAW"
-    # systemd-escaped paths, e.g. app-\x2fhome\x2fNAME\x2f...
-    sed -E -i "s#(home\\\\x2f)$(esc_re "$USER")#\\1USER#g" "$RAW"
-    if [ "${#USER}" -ge 4 ] && grep -qw -- "$USER" "$RAW"; then
-        redact_literal "$RAW" "$USER" "USER"; N_NAME=$((N_NAME+1))
-    fi
-    REALNAME="$(getent passwd "$USER" | cut -d: -f5 | cut -d, -f1)"
-    if [ "${#REALNAME}" -ge 3 ] && grep -qF -- "$REALNAME" "$RAW"; then
-        redact_literal "$RAW" "$REALNAME" "REAL-NAME" nob; N_NAME=$((N_NAME+1))
-    fi
-fi
-
-# Saved Wi-Fi / VPN profile names
-if have nmcli; then
-    mapfile -t L < <(nmcli -t -f NAME connection show 2>/dev/null | sed 's/\\:/:/g' | awk 'length($0)>=4' \
-        | grep -vE '^(Wired connection [0-9]+|lo|docker[0-9]*|virbr[0-9]*|br-.*)$' | sort -u)
-    for i in "${!L[@]}"; do
-        if grep -qF -- "${L[$i]}" "$RAW"; then
-            redact_literal "$RAW" "${L[$i]}" "NET-NAME-$((i+1))" nob; N_NAME=$((N_NAME+1))
-        fi
-    done
-fi
-
-# Serial numbers / service tags
-N_SER=$(grep -ciE '^[[:space:]]*(serial number|serial|service tag)[[:space:]]*:' "$RAW")
-sed -E -i 's/^([[:space:]]*(serial number|serial|service tag)[[:space:]]*:[[:space:]]*).*/\1[REDACTED]/I' "$RAW"
-
-# Machine ID and filesystem/partition UUIDs
-MID="$(cat /etc/machine-id 2>/dev/null)"
-if [ -n "$MID" ] && grep -qF -- "$MID" "$RAW"; then
-    redact_literal "$RAW" "$MID" "MACHINE-ID" nob; N_NAME=$((N_NAME+1))
-fi
-mapfile -t L < <(uniq_matches "$RAW" '\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b')
-for i in "${!L[@]}"; do sed -E -i "s/${L[$i]}/UUID-$((i+1))/Ig" "$RAW"; done
-N_UUID=${#L[@]}
+mask_report
 
 # Save the clean copy
 cp "$RAW" "$OUT"
